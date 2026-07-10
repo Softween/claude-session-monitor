@@ -1,0 +1,345 @@
+{
+  "name": "claude-session-monitor",
+  "displayName": "Claude Session Monitor",
+  "description": "Live monitor for all your Claude Code sessions: which is working, which is waiting for you, which hit a limit, plus per-session CPU/RAM and 5h/7d usage limits.",
+  "version": "1.7.1",
+  "publisher": "softween",
+  "license": "MIT",
+  "icon": "icon.png",
+  "homepage": "https://github.com/Softween/claude-session-monitor#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Softween/claude-session-monitor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Softween/claude-session-monitor/issues"
+  },
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "keywords": [
+    "claude",
+    "claude code",
+    "anthropic",
+    "sessions",
+    "usage",
+    "rate limit",
+    "monitor",
+    "status bar",
+    "ai"
+  ],
+  "galleryBanner": {
+    "color": "#0d1117",
+    "theme": "dark"
+  },
+  "qna": "marketplace",
+  "pricing": "Free",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "claudeSessionMonitor",
+          "title": "Claude Sessions",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "claudeSessionMonitor": [
+        {
+          "id": "claudeSessionMonitor.view",
+          "name": "Sessions"
+        },
+        {
+          "id": "claudeSessionMonitor.limits",
+          "name": "Usage limits",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "claudeSessionMonitor.refresh",
+        "title": "Claude Sessions: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "claudeSessionMonitor.focus",
+        "title": "Claude Sessions: Open Panel"
+      },
+      {
+        "command": "claudeSessionMonitor.openTranscript",
+        "title": "Claude Sessions: Open Transcript"
+      },
+      {
+        "command": "claudeSessionMonitor.toggleWorkspaceOnly",
+        "title": "Claude Sessions: This Workspace Only",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "claudeSessionMonitor.toggleNeedsYouOnly",
+        "title": "Claude Sessions: Needs-You Only",
+        "icon": "$(bell)"
+      },
+      {
+        "command": "claudeSessionMonitor.clearEnded",
+        "title": "Claude Sessions: Clear Ended",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "claudeSessionMonitor.removeSession",
+        "title": "Remove from list",
+        "icon": "$(close)"
+      },
+      {
+        "command": "claudeSessionMonitor.resumeAll",
+        "title": "Claude Sessions: Resume All (staggered)",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "claudeSessionMonitor.stopResumeAll",
+        "title": "Claude Sessions: Stop Resume Sweep",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "claudeSessionMonitor.dumpTabs",
+        "title": "Claude Sessions: Dump Open Tabs (debug)"
+      },
+      {
+        "command": "claudeSessionMonitor.focusNextNeedsYou",
+        "title": "Claude Sessions: Focus Next Needs-You",
+        "icon": "$(arrow-right)"
+      },
+      {
+        "command": "claudeSessionMonitor.copySessionId",
+        "title": "Copy Session ID"
+      },
+      {
+        "command": "claudeSessionMonitor.revealCwd",
+        "title": "Reveal Working Folder"
+      },
+      {
+        "command": "claudeSessionMonitor.killProcess",
+        "title": "Kill Process (SIGTERM)"
+      },
+      {
+        "command": "claudeSessionMonitor.refreshUsage",
+        "title": "Claude Sessions: Refresh Usage Limits",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "claudeSessionMonitor.resumeAll",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "navigation@0"
+        },
+        {
+          "command": "claudeSessionMonitor.toggleNeedsYouOnly",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claudeSessionMonitor.toggleWorkspaceOnly",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "navigation@2"
+        },
+        {
+          "command": "claudeSessionMonitor.refresh",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "navigation@3"
+        },
+        {
+          "command": "claudeSessionMonitor.clearEnded",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "navigation@4"
+        },
+        {
+          "command": "claudeSessionMonitor.stopResumeAll",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "overflow"
+        },
+        {
+          "command": "claudeSessionMonitor.dumpTabs",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "overflow"
+        },
+        {
+          "command": "claudeSessionMonitor.focusNextNeedsYou",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "overflow"
+        },
+        {
+          "command": "claudeSessionMonitor.refreshUsage",
+          "when": "view == claudeSessionMonitor.limits",
+          "group": "navigation@0"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "claudeSessionMonitor.openTranscript",
+          "when": "view == claudeSessionMonitor.view && viewItem =~ /session/",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeSessionMonitor.removeSession",
+          "when": "view == claudeSessionMonitor.view && viewItem == session-ended",
+          "group": "inline@2"
+        },
+        {
+          "command": "claudeSessionMonitor.copySessionId",
+          "when": "view == claudeSessionMonitor.view && viewItem =~ /session/",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "claudeSessionMonitor.revealCwd",
+          "when": "view == claudeSessionMonitor.view && viewItem =~ /session/",
+          "group": "1_actions@2"
+        },
+        {
+          "command": "claudeSessionMonitor.killProcess",
+          "when": "view == claudeSessionMonitor.view && viewItem =~ /session/",
+          "group": "9_danger@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Claude Session Monitor",
+      "properties": {
+        "claudeSessionMonitor.notifyOnWaiting": {
+          "type": "boolean",
+          "default": true,
+          "description": "Notify when a session starts waiting for permission/input."
+        },
+        "claudeSessionMonitor.notifyOnLimited": {
+          "type": "boolean",
+          "default": true,
+          "description": "Notify when a session hits a session/rate limit."
+        },
+        "claudeSessionMonitor.notifyOnDone": {
+          "type": "boolean",
+          "default": false,
+          "description": "Notify when a session finishes its turn (your turn)."
+        },
+        "claudeSessionMonitor.usagePollSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 5,
+          "description": "How often to refresh official account usage limits from Anthropic, in seconds. The poll is shared across ALL VS Code windows (single-flight through a snapshot file), and a 429 triggers an exponential backoff every window honors."
+        },
+        "claudeSessionMonitor.usageWarnPercent": {
+          "type": "number",
+          "default": 85,
+          "description": "Warn (toast + native notification) when any usage gauge (5h, 7d, per-model) reaches this percent. 0 disables."
+        },
+        "claudeSessionMonitor.pollIntervalMs": {
+          "type": "number",
+          "default": 1500,
+          "minimum": 500,
+          "description": "Status refresh interval (ms)."
+        },
+        "claudeSessionMonitor.recentScanMaxAgeHours": {
+          "type": "number",
+          "default": 6,
+          "description": "Show sessions that were active within the last N hours."
+        },
+        "claudeSessionMonitor.showEnded": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show ended (closed) sessions. Off by default: when a session's tab is closed it is removed from the list."
+        },
+        "claudeSessionMonitor.hideEndedAfterMinutes": {
+          "type": "number",
+          "default": 30,
+          "description": "When showEnded is on, hide ended sessions older than this (minutes)."
+        },
+        "claudeSessionMonitor.workspaceOnly": {
+          "type": "boolean",
+          "default": false,
+          "description": "Only show sessions belonging to this VS Code workspace."
+        },
+        "claudeSessionMonitor.nativeNotifications": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a native macOS notification on limit/waiting transitions (even when VS Code is not focused)."
+        },
+        "claudeSessionMonitor.stuckAlertMinutes": {
+          "type": "number",
+          "default": 5,
+          "description": "Alert when a working session stays silent this many minutes (0 = off)."
+        },
+        "claudeSessionMonitor.resourceSampleMs": {
+          "type": "number",
+          "default": 3000,
+          "description": "CPU/RAM sampling interval (ms)."
+        },
+        "claudeSessionMonitor.cpuHogThreshold": {
+          "type": "number",
+          "default": 60,
+          "description": "Sessions above this CPU% are flagged with a flame icon."
+        },
+        "claudeSessionMonitor.resumeStaggerSeconds": {
+          "type": "number",
+          "default": 60,
+          "description": "Seconds between sessions during a staggered resume sweep (avoids hitting the rate limit by resuming all at once)."
+        },
+        "claudeSessionMonitor.resumeAutoType": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-type the resume prompt and press Enter via macOS keystrokes (needs Accessibility permission for VS Code). If off, the sweep just focuses each session and you press Enter."
+        },
+        "claudeSessionMonitor.resumePrompt": {
+          "type": "string",
+          "default": "resume",
+          "description": "Text typed into each session during a resume sweep."
+        },
+        "claudeSessionMonitor.autoResumeAfterReset": {
+          "type": "boolean",
+          "default": false,
+          "description": "When sessions hit the usage limit (or the 5h window is at 99%+), automatically run the staggered resume sweep ~90s after the window resets."
+        },
+        "claudeSessionMonitor.idleRamWarnMb": {
+          "type": "number",
+          "default": 2000,
+          "description": "Warn when idle sessions (waiting / your-turn, silent >1h) together hold more than this much RAM (MB). 0 disables."
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "claudeSessionMonitor.focusNextNeedsYou",
+        "key": "ctrl+alt+n",
+        "mac": "cmd+alt+n"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
+    "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
+    "verify": "esbuild src/verify.ts --bundle --platform=node --format=cjs --outfile=dist/verify.cjs && node dist/verify.cjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "vscode:prepublish": "npm run build",
+    "package": "vsce package --allow-missing-repository --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.84.0",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.4.0",
+    "vitest": "^2.1.8",
+    "@vitest/coverage-v8": "^2.1.8"
+  }
+}

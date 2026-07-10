@@ -1,0 +1,17 @@
+.vscode/**
+.github/**
+src/**
+scripts/**
+media/hero.png
+media/hero.svg
+media/icon-marketplace.svg
+docs/**
+node_modules/**
+dist/verify.cjs
+**/*.ts
+**/*.map
+tsconfig.json
+.gitignore
+.git/**
+*.vsix
+CONTRIBUTING.md

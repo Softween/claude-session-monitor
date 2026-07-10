@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 700" font-family="-apple-system, 'Segoe UI', Roboto, sans-serif">
+  <rect x="0.5" y="0.5" width="459" height="699" rx="16" fill="#0d1117" stroke="#21262d"/>
+
+  <text x="20" y="34" fill="#7d8590" font-size="12" font-weight="700" letter-spacing="1.2">CLAUDE SESSIONS</text>
+  <text x="20" y="62" fill="#8b949e" font-size="12">total load: CPU 12% · 1.4GB</text>
+
+  <!-- Your turn -->
+  <circle cx="24" cy="88" r="5" fill="#58a6ff"/>
+  <text x="38" y="92" fill="#e6edf3" font-size="13" font-weight="600">Your turn (2)</text>
+  <text x="44" y="120" fill="#e6edf3" font-size="13">Refactor auth middleware<tspan fill="#8b949e" font-size="11">   your turn · 1m · my-app</tspan></text>
+  <text x="44" y="146" fill="#e6edf3" font-size="13">Update API docs<tspan fill="#8b949e" font-size="11">   your turn · 4m · my-app</tspan></text>
+
+  <!-- Working -->
+  <circle cx="24" cy="174" r="5" fill="#3fb950"/>
+  <text x="38" y="178" fill="#e6edf3" font-size="13" font-weight="600">Working (1)</text>
+  <text x="44" y="206" fill="#e6edf3" font-size="13">Generate test fixtures<tspan fill="#8b949e" font-size="11">   working · CPU 22% · 240MB</tspan></text>
+
+  <!-- Limited -->
+  <circle cx="24" cy="234" r="5" fill="#f85149"/>
+  <text x="38" y="238" fill="#e6edf3" font-size="13" font-weight="600">Limited (1)</text>
+  <text x="44" y="266" fill="#e6edf3" font-size="13">Bulk data import<tspan fill="#8b949e" font-size="11">   rate limited · resets 2h 10m</tspan></text>
+
+  <line x1="20" y1="294" x2="440" y2="294" stroke="#21262d"/>
+  <text x="20" y="320" fill="#7d8590" font-size="12" font-weight="700" letter-spacing="1.2">USAGE LIMITS</text>
+
+  <!-- Session 5h -->
+  <text x="20" y="350" fill="#e6edf3" font-size="13" font-weight="600">Session (5h)</text>
+  <text x="440" y="350" fill="#e6edf3" font-size="13" text-anchor="end">0% used</text>
+  <g transform="translate(20,360)">
+    <rect x="0"   width="39" height="8" rx="2" fill="#30363d"/><rect x="42"  width="39" height="8" rx="2" fill="#30363d"/>
+    <rect x="84"  width="39" height="8" rx="2" fill="#30363d"/><rect x="126" width="39" height="8" rx="2" fill="#30363d"/>
+    <rect x="168" width="39" height="8" rx="2" fill="#30363d"/><rect x="210" width="39" height="8" rx="2" fill="#30363d"/>
+    <rect x="252" width="39" height="8" rx="2" fill="#30363d"/><rect x="294" width="39" height="8" rx="2" fill="#30363d"/>
+    <rect x="336" width="39" height="8" rx="2" fill="#30363d"/><rect x="378" width="39" height="8" rx="2" fill="#30363d"/>
+  </g>
+  <text x="20" y="388" fill="#8b949e" font-size="11"><tspan fill="#3fb950" font-weight="700">100% left</tspan></text>
+
+  <!-- Weekly 7d -->
+  <text x="20" y="416" fill="#e6edf3" font-size="13" font-weight="600">Weekly (7d)</text>
+  <text x="440" y="416" fill="#e6edf3" font-size="13" text-anchor="end">41% used</text>
+  <g transform="translate(20,426)">
+    <rect x="0"   width="39" height="8" rx="2" fill="#d29922"/><rect x="42"  width="39" height="8" rx="2" fill="#d29922"/>
+    <rect x="84"  width="39" height="8" rx="2" fill="#d29922"/><rect x="126" width="39" height="8" rx="2" fill="#d29922"/>
+    <rect x="168" width="39" height="8" rx="2" fill="#30363d"/><rect x="210" width="39" height="8" rx="2" fill="#30363d"/>
+    <rect x="252" width="39" height="8" rx="2" fill="#30363d"/><rect x="294" width="39" height="8" rx="2" fill="#30363d"/>
+    <rect x="336" width="39" height="8" rx="2" fill="#30363d"/><rect x="378" width="39" height="8" rx="2" fill="#30363d"/>
+  </g>
+  <text x="20" y="454" fill="#8b949e" font-size="11"><tspan fill="#e6edf3" font-weight="700">59% left</tspan> · resets in 3d 4h</text>
+
+  <!-- Weekly Sonnet -->
+  <text x="20" y="482" fill="#e6edf3" font-size="13" font-weight="600">Weekly · Sonnet</text>
+  <text x="440" y="482" fill="#e6edf3" font-size="13" text-anchor="end">11% used</text>
+  <g transform="translate(20,492)">
+    <rect x="0"   width="39" height="8" rx="2" fill="#3fb950"/><rect x="42"  width="39" height="8" rx="2" fill="#30363d"/>
+    <rect x="84"  width="39" height="8" rx="2" fill="#30363d"/><rect x="126" width="39" height="8" rx="2" fill="#30363d"/>
+    <rect x="168" width="39" height="8" rx="2" fill="#30363d"/><rect x="210" width="39" height="8" rx="2" fill="#30363d"/>
+    <rect x="252" width="39" height="8" rx="2" fill="#30363d"/><rect x="294" width="39" height="8" rx="2" fill="#30363d"/>
+    <rect x="336" width="39" height="8" rx="2" fill="#30363d"/><rect x="378" width="39" height="8" rx="2" fill="#30363d"/>
+  </g>
+  <text x="20" y="520" fill="#8b949e" font-size="11"><tspan fill="#e6edf3" font-weight="700">89% left</tspan> · resets in 3d 4h</text>
+  <text x="20" y="540" fill="#6e7681" font-size="10">official account usage · updated 12s ago</text>
+
+  <!-- Token usage -->
+  <text x="20" y="566" fill="#7d8590" font-size="11" font-weight="700">Token usage (in + out + cache-write)</text>
+  <text x="20" y="588" fill="#e6edf3" font-size="12">Last 5h</text><text x="440" y="588" fill="#e6edf3" font-size="12" text-anchor="end">6.4M</text>
+  <text x="20" y="606" fill="#e6edf3" font-size="12">Last 7d</text><text x="440" y="606" fill="#e6edf3" font-size="12" text-anchor="end">120M</text>
+  <g transform="translate(20,620)" fill="#58a6ff">
+    <rect x="0" y="30" width="6" height="10"/><rect x="10" y="34" width="6" height="6"/><rect x="20" y="20" width="6" height="20"/>
+    <rect x="40" y="26" width="6" height="14"/><rect x="50" y="32" width="6" height="8"/><rect x="60" y="14" width="6" height="26"/>
+    <rect x="70" y="6" width="6" height="34"/><rect x="80" y="22" width="6" height="18"/><rect x="100" y="10" width="6" height="30"/>
+    <rect x="120" y="28" width="6" height="12"/><rect x="160" y="2" width="6" height="38"/><rect x="170" y="30" width="6" height="10"/>
+    <rect x="210" y="24" width="6" height="16"/><rect x="220" y="18" width="6" height="22"/><rect x="260" y="8" width="6" height="32"/>
+    <rect x="300" y="34" width="6" height="6"/><rect x="340" y="16" width="6" height="24"/><rect x="350" y="36" width="6" height="4"/>
+  </g>
+  <text x="20" y="682" fill="#6e7681" font-size="10">hourly, last 48h</text>
+</svg>

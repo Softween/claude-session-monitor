@@ -1074,7 +1074,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const c = cfg();
       const stagger = Math.max(5, c.get<number>("resumeStaggerSeconds", 60));
       const auto = c.get<boolean>("resumeAutoType", true);
-      const prompt = c.get<string>("resumePrompt", "resume");
+      // Collapse newlines so a single resumePrompt value can never encode more
+      // than one Return keystroke (osascript `keystroke` submits on each \n).
+      const prompt = c.get<string>("resumePrompt", "resume").replace(/[\r\n]+/g, " ").slice(0, 500);
       let i = 0;
       let typed = 0;
       let skipped = 0;

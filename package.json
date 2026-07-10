@@ -17,6 +17,17 @@
   "engines": {
     "vscode": "^1.84.0"
   },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "In untrusted workspaces the auto-resume settings (resumePrompt, resumeAutoType, autoResumeAfterReset) are ignored, so a workspace cannot make the extension type text into your editor.",
+      "restrictedConfigurations": [
+        "claudeSessionMonitor.resumePrompt",
+        "claudeSessionMonitor.resumeAutoType",
+        "claudeSessionMonitor.autoResumeAfterReset"
+      ]
+    }
+  },
   "categories": [
     "Visualization",
     "Other"

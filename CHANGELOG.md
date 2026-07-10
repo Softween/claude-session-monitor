@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows
 ## 1.7.1
 
 - Fixed: the "Claude: usage high" notification repeated on every poll (roughly once a minute) instead of firing once. The dedup key depended on a gauge's reset timestamp, which drifts a few hundred ms each poll, so the guard never matched. Dedup is now keyed on the gauge alone and re-arms only after usage drops 5% below the threshold (hysteresis).
+- Hardened: the auto-resume settings (`resumePrompt`, `resumeAutoType`, `autoResumeAfterReset`) are now restricted in untrusted workspaces, so opening an untrusted folder can no longer make the extension type text into your editor. `resumePrompt` newlines are collapsed so a value can never encode extra Return keystrokes.
 - Hardened: the session-monitor hook validates the session id before using it as a filename (rejects path separators and traversal). Dev toolchain (vitest, esbuild) updated to clear all `npm audit` advisories. The extension ships with zero runtime dependencies.
 
 ## 1.7.0

@@ -19,6 +19,7 @@ extension from the transcript instead.
 """
 import sys
 import os
+import re
 import json
 import time
 import subprocess
@@ -94,6 +95,11 @@ def main() -> None:
     session_id = data.get("session_id") or "unknown"
     if session_id == "unknown":
         # Without a session id we cannot key the status file usefully.
+        return
+
+    # session_id becomes a filename below; reject anything that could escape the
+    # monitor directory (path traversal / separators). Real ids are UUIDs.
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", session_id) or session_id in (".", ".."):
         return
 
     # Skip claude-mem observer / SDK-subagent sessions: they are not user tabs

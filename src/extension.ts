@@ -1160,12 +1160,30 @@ export function activate(ctx: vscode.ExtensionContext): void {
         if (resumeActive) resumeTimer = setTimeout(runOne, stagger * 1000);
       };
 
-      vscode.window.showInformationMessage(
-        auto
-          ? `Claude Sessions: auto-resuming ${queue.length} sessions, one every ${stagger}s (typing "${prompt}" + Enter). Leave VS Code frontmost.`
-          : `Claude Sessions: resuming ${queue.length} sessions, one every ${stagger}s. Press Enter in each.`,
-      );
-      void runOne();
+      if (auto) {
+        // Defense in depth: keystrokes land in whatever has OS keyboard focus,
+        // and the tab-active check cannot guarantee focus is the Claude input
+        // (it may be a terminal, search box, etc.). Require one explicit
+        // confirmation before any unattended typing begins this sweep.
+        vscode.window
+          .showWarningMessage(
+            `Claude Sessions: about to type "${prompt}" + Enter into the focused editor for ${queue.length} session(s), one every ${stagger}s. Put your cursor in the Claude input and keep VS Code frontmost.`,
+            { modal: true },
+            "Start typing",
+          )
+          .then((choice) => {
+            if (choice !== "Start typing") {
+              stopResume();
+              return;
+            }
+            void runOne();
+          });
+      } else {
+        vscode.window.showInformationMessage(
+          `Claude Sessions: resuming ${queue.length} sessions, one every ${stagger}s. Press Enter in each.`,
+        );
+        void runOne();
+      }
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.openTranscript", (arg?: SessionView | Node) =>
       openTranscript(arg),

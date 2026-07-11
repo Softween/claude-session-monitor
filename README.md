@@ -4,8 +4,8 @@
 
 **See every Claude Code session at a glance — which is working, which is waiting for you, which hit a limit — plus per-session CPU/RAM and your real 5h / 7d usage budget.**
 
-[![Marketplace](https://img.shields.io/visual-studio-marketplace/v/softween.claude-session-monitor?label=Marketplace&color=3794ff)](https://marketplace.visualstudio.com/items?itemName=softween.claude-session-monitor)
-[![Installs](https://img.shields.io/visual-studio-marketplace/i/softween.claude-session-monitor?color=3fb950)](https://marketplace.visualstudio.com/items?itemName=softween.claude-session-monitor)
+[![Marketplace](https://img.shields.io/visual-studio-marketplace/v/softween.claude-code-session-monitor?label=Marketplace&color=3794ff)](https://marketplace.visualstudio.com/items?itemName=softween.claude-code-session-monitor)
+[![Installs](https://img.shields.io/visual-studio-marketplace/i/softween.claude-code-session-monitor?color=3fb950)](https://marketplace.visualstudio.com/items?itemName=softween.claude-code-session-monitor)
 [![CI](https://github.com/Softween/claude-session-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/Softween/claude-session-monitor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -47,7 +47,7 @@ Claude Session Monitor puts all of that in one Activity Bar panel, live.
 Search **"Claude Session Monitor"** in the Extensions view, or:
 
 ```bash
-code --install-extension softween.claude-session-monitor
+code --install-extension softween.claude-code-session-monitor
 ```
 
 ### Hook layer (one command)

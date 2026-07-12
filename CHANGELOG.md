@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 1.7.2
+
+- Added: each session row now shows the model and reasoning effort it is running, e.g. `your turn · Opus 4 8 · xhigh · 1m · glossgo-be`. The model is read per-session from the newest assistant line in that session's transcript (so a session on Fable and one on Opus are told apart), and the effort is the global `effortLevel` from `~/.claude/settings.json`. Both also appear in the row tooltip (`model:` / `effort:` lines). Sessions with no model line yet simply omit the badge.
+
 ## 1.7.1
 
 - Fixed: the "Claude: usage high" notification repeated on every poll (roughly once a minute) instead of firing once. The dedup key depended on a gauge's reset timestamp, which drifts a few hundred ms each poll, so the guard never matched. Dedup is now keyed on the gauge alone and re-arms only after usage drops 5% below the threshold (hysteresis).

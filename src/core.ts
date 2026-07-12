@@ -22,6 +22,7 @@ import * as path from "path";
 export const HOME = os.homedir();
 export const MONITOR_DIR = path.join(HOME, ".claude", "session-monitor");
 export const PROJECTS_DIR = path.join(HOME, ".claude", "projects");
+export const SETTINGS_FILE = path.join(HOME, ".claude", "settings.json");
 
 const MAX_TAIL = 512 * 1024; // bytes of transcript tail to read
 const MAX_TAIL_GROW = 4 * 1024 * 1024; // grown window when a huge last line hides the conv line
@@ -77,6 +78,7 @@ export interface TxInfo {
   mtimeMs: number;
   sizeBytes: number;
   cwd?: string;
+  model?: string; // model id of the newest assistant line (message.model)
 }
 
 export interface SessionView {
@@ -96,6 +98,8 @@ export interface SessionView {
   entrypoint?: string;
   pid?: number;
   stale: boolean;
+  model?: string; // model id in use (from the newest assistant transcript line)
+  effort?: string; // reasoning effort level (global effortLevel from settings.json)
 }
 
 export const BUCKET_ORDER: Record<Bucket, number> = {
@@ -129,6 +133,21 @@ export function readHookStatuses(dir = MONITOR_DIR): Map<string, HookStatus> {
     }
   }
   return map;
+}
+
+/**
+ * Read the global reasoning-effort level from ~/.claude/settings.json.
+ * Effort is a global Claude Code setting (there is no per-session effort in the
+ * transcript or hook files), so every live session shares this value.
+ */
+export function readGlobalEffort(file = SETTINGS_FILE): string | undefined {
+  try {
+    const v = JSON.parse(fs.readFileSync(file, "utf8"));
+    const e = (v as { effortLevel?: unknown } | null)?.effortLevel;
+    return typeof e === "string" && e.trim() ? e.trim() : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +281,11 @@ function parseWindow(file: string, stat: fs.Stats, maxBytes: number): TxInfo {
     if (ts <= 0) continue;
     if (ts > info.activityTs) info.activityTs = ts;
 
+    if (type === "assistant" && typeof obj.message?.model === "string" && obj.message.model.trim()) {
+      // Append-only transcript -> the last assistant line carries the current model.
+      info.model = obj.message.model.trim();
+    }
+
     if (type === "user" || type === "assistant") {
       // Last writer wins, EXCEPT a same-second tie must not clear an api_error limit
       // (e.g. a user line written in the same second as a 429 would hide the limit).
@@ -309,6 +333,7 @@ export function parseTranscriptTail(file: string, prev?: TxInfo): TxInfo {
 export interface ResolveOpts {
   now: number; // epoch seconds
   txPath?: string; // fallback transcript path (when no hook file)
+  effort?: string; // global reasoning-effort level (same for every session)
 }
 
 function resolve(
@@ -329,6 +354,8 @@ function resolve(
   const cwdLabel = cwd ? path.basename(cwd) : undefined;
   const transcriptPath = hook?.transcript_path || opts.txPath;
   const entrypoint = tx?.entrypoint;
+  const model = tx?.model;
+  const effort = opts.effort;
 
   let bucket: Bucket = "unknown";
   let sub = "unknown";
@@ -412,6 +439,8 @@ function resolve(
   const tipLines = [
     title,
     `status: ${sub}`,
+    model ? `model: ${model}` : "",
+    effort ? `effort: ${effort}` : "",
     cwd ? `cwd: ${cwd}` : "",
     entrypoint ? `source: ${entrypoint}` : "",
     hook?.permission_mode ? `mode: ${hook.permission_mode}` : "",
@@ -438,6 +467,8 @@ function resolve(
     entrypoint,
     pid: hook?.pid,
     stale,
+    model,
+    effort,
   };
 }
 
@@ -556,6 +587,7 @@ export interface CollectOpts {
   workspaceCwd?: string; // when set, only sessions under this cwd
   hookStatuses?: Map<string, HookStatus>; // injectable for tests; default readHookStatuses()
   showEnded?: boolean; // default false: closed/ended sessions are hidden entirely
+  globalEffort?: string; // injectable for tests; default readGlobalEffort()
 }
 
 function entrypointAllowed(ep: string | undefined, allowed: string[]): boolean {
@@ -569,6 +601,7 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
   const hooks = opts.hookStatuses ?? readHookStatuses();
   const txCache = opts.txCache ?? new Map<string, TxInfo>();
   const allowed = opts.allowedEntrypoints ?? DEFAULT_ENTRYPOINTS;
+  const effort = opts.globalEffort ?? readGlobalEffort();
 
   const candidates = new Map<string, string | undefined>();
   for (const [sid, h] of hooks) candidates.set(sid, h.transcript_path);
@@ -592,7 +625,7 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
     const cwd = hook?.cwd || tx?.cwd;
     if (cwd && dirExcluded(cwd)) continue;
 
-    const view = resolve(sid, hook, tx, { now, txPath });
+    const view = resolve(sid, hook, tx, { now, txPath, effort });
     views.push(view);
   }
 

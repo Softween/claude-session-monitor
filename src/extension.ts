@@ -56,6 +56,7 @@ import {
   computeBurnEta,
   estimateCostUsd,
   shortModelName,
+  modelEffortLabel,
   fmtTokensCompact,
   nextUsageBackoffSec,
   type BurnEta,
@@ -164,6 +165,8 @@ class SessionTree implements vscode.TreeDataProvider<Node> {
 
       const res = this.resOf(v);
       const segs = [v.sub];
+      const modelBadge = modelEffortLabel(v.model, v.effort);
+      if (modelBadge) segs.push(modelBadge);
       if (v.detail) segs.push(v.detail);
       if (res) {
         const hog = res.cpu >= this.hogThreshold();

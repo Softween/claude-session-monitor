@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, truncateTitle, TITLE_MAX, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, fmtTokensCompact, nextUsageBackoffSec } from "../src/view";
+import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, truncateTitle, TITLE_MAX, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, modelEffortLabel, fmtTokensCompact, nextUsageBackoffSec } from "../src/view";
 import type { SessionView } from "../src/core";
 
 const v = (bucket: SessionView["bucket"], sub: string): SessionView =>
@@ -199,6 +199,23 @@ describe("estimateCostUsd / shortModelName", () => {
     expect(shortModelName("claude-fable-5")).toBe("Fable 5");
     expect(shortModelName("claude-haiku-4-5-20251001")).toBe("Haiku 4 5");
     expect(shortModelName("unknown")).toBe("Unknown");
+  });
+});
+
+describe("shortEffort / modelEffortLabel", () => {
+  it("compacts known effort levels and passes unknowns through", () => {
+    expect(shortEffort("medium")).toBe("med");
+    expect(shortEffort("xhigh")).toBe("xhigh");
+    expect(shortEffort("HIGH")).toBe("high");
+    expect(shortEffort("weird")).toBe("weird");
+    expect(shortEffort(undefined)).toBeUndefined();
+    expect(shortEffort("")).toBeUndefined();
+  });
+  it("combines model and effort, or returns whichever half is known", () => {
+    expect(modelEffortLabel("claude-opus-4-8", "xhigh")).toBe("Opus 4 8 · xhigh");
+    expect(modelEffortLabel("claude-fable-5", undefined)).toBe("Fable 5");
+    expect(modelEffortLabel(undefined, "medium")).toBe("med");
+    expect(modelEffortLabel(undefined, undefined)).toBeUndefined();
   });
 });
 

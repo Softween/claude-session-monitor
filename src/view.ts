@@ -208,6 +208,33 @@ export function estimateCostUsd(m: ModelStat, modelId: string): number | null {
   return (m.inTok * p.inUsd + m.outTok * p.outUsd + m.cwTok * p.inUsd * 1.25) / 1e6;
 }
 
+/** Compact reasoning-effort label, e.g. "medium" -> "med". Passes unknowns through. */
+export function shortEffort(effort: string | undefined): string | undefined {
+  if (!effort) return undefined;
+  const s = effort.trim().toLowerCase();
+  if (!s) return undefined;
+  const map: Record<string, string> = {
+    minimal: "min",
+    low: "low",
+    medium: "med",
+    high: "high",
+    xhigh: "xhigh",
+    max: "max",
+  };
+  return map[s] ?? s;
+}
+
+/**
+ * One-segment "model · effort" badge for a session row, e.g. "Opus 4.8 · xhigh".
+ * Returns whichever half is known, or undefined when neither is.
+ */
+export function modelEffortLabel(modelId: string | undefined, effort: string | undefined): string | undefined {
+  const m = modelId ? shortModelName(modelId) : undefined;
+  const e = shortEffort(effort);
+  if (m && e) return `${m} · ${e}`;
+  return m ?? e;
+}
+
 /** "claude-fable-5" -> "Fable 5", "claude-haiku-4-5-20251001" -> "Haiku 4 5". */
 export function shortModelName(id: string): string {
   const base = id

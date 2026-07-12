@@ -9,6 +9,7 @@ import {
   humanizeAge,
   parseTranscriptTail,
   collectSessions,
+  readGlobalEffort,
   countBuckets,
   scanTokenUsage,
   readLimits,
@@ -167,6 +168,16 @@ describe("parseTranscriptTail", () => {
     const tx = parseTranscriptTail(path.join(tmp, "nope.jsonl"));
     expect(tx.convKind).toBe("none");
   });
+
+  it("captures the model from the newest assistant line", () => {
+    const p = writeTranscript("model.jsonl", [
+      { type: "assistant", message: { content: [{ type: "text", text: "a" }], stop_reason: "end_turn", model: "claude-sonnet-5" }, timestamp: iso(NOW - 30) },
+      { type: "user", message: { content: [{ type: "text", text: "next" }] }, timestamp: iso(NOW - 20) },
+      { type: "assistant", message: { content: [{ type: "text", text: "b" }], stop_reason: "end_turn", model: "claude-opus-4-8" }, timestamp: iso(NOW - 10) },
+    ]);
+    const tx = parseTranscriptTail(p);
+    expect(tx.model).toBe("claude-opus-4-8");
+  });
 });
 
 // --- collectSessions (bucket resolution) ------------------------------------
@@ -241,6 +252,38 @@ describe("collectSessions", () => {
     const st = fs.statSync(p);
     const views = run([], [{ sessionId: "f", path: p, mtimeMs: st.mtimeMs }]);
     expect(views.find((v) => v.sessionId === "f")?.title).toBe("Discovered");
+  });
+});
+
+describe("readGlobalEffort / effort + model surfacing", () => {
+  it("reads effortLevel from a settings.json, tolerating missing/broken files", () => {
+    const good = path.join(tmp, "settings.json");
+    fs.writeFileSync(good, JSON.stringify({ effortLevel: "xhigh", other: 1 }));
+    expect(readGlobalEffort(good)).toBe("xhigh");
+
+    const empty = path.join(tmp, "settings-empty.json");
+    fs.writeFileSync(empty, JSON.stringify({ theme: "dark" }));
+    expect(readGlobalEffort(empty)).toBeUndefined();
+
+    fs.writeFileSync(good, "{ not json");
+    expect(readGlobalEffort(good)).toBeUndefined();
+    expect(readGlobalEffort(path.join(tmp, "nope.json"))).toBeUndefined();
+  });
+
+  it("surfaces the transcript model and the injected global effort onto the view", () => {
+    const p = writeTranscript("me.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 20) },
+      { type: "assistant", message: { content: [{ type: "text", text: "a" }], stop_reason: "end_turn", model: "claude-opus-4-8" }, timestamp: iso(NOW - 10) },
+    ]);
+    const map = new Map<string, HookStatus>([
+      ["m", { session_id: "m", state: "idle", ts: NOW - 9, cwd: "/repo", transcript_path: p }],
+    ]);
+    const views = collectSessions({ now: NOW, hookStatuses: map, extraTranscripts: [], maxAgeSec: 24 * 3600, globalEffort: "high" });
+    const v = views.find((x) => x.sessionId === "m");
+    expect(v?.model).toBe("claude-opus-4-8");
+    expect(v?.effort).toBe("high");
+    expect(v?.tooltip).toContain("model: claude-opus-4-8");
+    expect(v?.tooltip).toContain("effort: high");
   });
 });
 

@@ -281,9 +281,13 @@ function parseWindow(file: string, stat: fs.Stats, maxBytes: number): TxInfo {
     if (ts <= 0) continue;
     if (ts > info.activityTs) info.activityTs = ts;
 
-    if (type === "assistant" && typeof obj.message?.model === "string" && obj.message.model.trim()) {
+    if (type === "assistant" && typeof obj.message?.model === "string") {
       // Append-only transcript -> the last assistant line carries the current model.
-      info.model = obj.message.model.trim();
+      // Skip placeholder models like "<synthetic>": Claude Code stamps that on
+      // locally-injected messages (API-error notices, "out of credits", etc.),
+      // not real turns, so the badge should keep showing the last real model.
+      const m = obj.message.model.trim();
+      if (m && !m.startsWith("<")) info.model = m;
     }
 
     if (type === "user" || type === "assistant") {

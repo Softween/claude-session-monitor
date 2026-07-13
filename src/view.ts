@@ -225,24 +225,23 @@ export function shortEffort(effort: string | undefined): string | undefined {
 }
 
 /**
- * One-segment "model · effort" badge for a session row, e.g. "Opus 4.8 · xhigh".
- * Returns whichever half is known, or undefined when neither is.
+ * "claude-fable-5" -> "Fable 5", "claude-opus-4-8" -> "Opus 4.8",
+ * "claude-haiku-4-5-20251001" -> "Haiku 4.5". The leading word is the family;
+ * trailing numeric segments are the version and get joined with dots so
+ * "opus-4-8" reads as a version ("4.8"), not two separate numbers.
  */
-export function modelEffortLabel(modelId: string | undefined, effort: string | undefined): string | undefined {
-  const m = modelId ? shortModelName(modelId) : undefined;
-  const e = shortEffort(effort);
-  if (m && e) return `${m} · ${e}`;
-  return m ?? e;
-}
-
-/** "claude-fable-5" -> "Fable 5", "claude-haiku-4-5-20251001" -> "Haiku 4 5". */
 export function shortModelName(id: string): string {
   const base = id
     .replace(/^claude-/, "")
     .replace(/-\d{8}$/, "")
-    .replace(/-/g, " ")
     .trim();
-  return base ? base.charAt(0).toUpperCase() + base.slice(1) : id;
+  if (!base) return id;
+  const parts = base.split("-");
+  const family = parts[0].charAt(0).toUpperCase() + parts[0].slice(1);
+  const rest = parts.slice(1);
+  if (rest.length === 0) return family;
+  const sep = rest.every((p) => /^\d+$/.test(p)) ? "." : " ";
+  return `${family} ${rest.join(sep)}`;
 }
 
 /** Exponential 429 backoff: honor Retry-After, else double the previous, clamp [60, 900]. */

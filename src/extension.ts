@@ -56,7 +56,7 @@ import {
   computeBurnEta,
   estimateCostUsd,
   shortModelName,
-  modelEffortLabel,
+  shortEffort,
   fmtTokensCompact,
   nextUsageBackoffSec,
   type BurnEta,
@@ -165,8 +165,10 @@ class SessionTree implements vscode.TreeDataProvider<Node> {
 
       const res = this.resOf(v);
       const segs = [v.sub];
-      const modelBadge = modelEffortLabel(v.model, v.effort);
-      if (modelBadge) segs.push(modelBadge);
+      // Model varies per session, so it belongs on the row (right after status).
+      // Effort is a global setting shared by every session, so it is shown once
+      // in the view header (see updateAux) instead of repeated on each row.
+      if (v.model) segs.push(shortModelName(v.model));
       if (v.detail) segs.push(v.detail);
       if (res) {
         const hog = res.cpu >= this.hogThreshold();
@@ -1405,10 +1407,16 @@ function updateAux(
     ? { value: badge, tooltip: `${badge} session(s) waiting / limited` }
     : undefined;
 
+  // Effort is a global setting (same for every session), so state it once here
+  // rather than repeating it on each row. shortEffort compacts e.g. "medium".
+  const effort = shortEffort(views.find((v) => v.effort)?.effort);
+  const effortSeg = effort ? ` · effort ${effort}` : "";
   const filt = needsYouOnly ? "[needs-you only] " : "";
   treeView.message = totalRss
-    ? `${filt}total load: CPU ${Math.round(totalCpu)}% · ${fmtMb(totalRss)}`
-    : filt || undefined;
+    ? `${filt}total load: CPU ${Math.round(totalCpu)}% · ${fmtMb(totalRss)}${effortSeg}`
+    : effort
+      ? `${filt}effort ${effort}`
+      : filt || undefined;
 }
 
 // ---------------------------------------------------------------------------

@@ -178,6 +178,15 @@ describe("parseTranscriptTail", () => {
     const tx = parseTranscriptTail(p);
     expect(tx.model).toBe("claude-opus-4-8");
   });
+
+  it("ignores a '<synthetic>' model (locally-injected line) and keeps the last real one", () => {
+    const p = writeTranscript("synth.jsonl", [
+      { type: "assistant", message: { content: [{ type: "text", text: "real" }], stop_reason: "end_turn", model: "claude-opus-4-8" }, timestamp: iso(NOW - 20) },
+      { type: "assistant", message: { content: [{ type: "text", text: "API Error: Connection closed" }], stop_reason: "stop_sequence", model: "<synthetic>" }, timestamp: iso(NOW - 5) },
+    ]);
+    const tx = parseTranscriptTail(p);
+    expect(tx.model).toBe("claude-opus-4-8");
+  });
 });
 
 // --- collectSessions (bucket resolution) ------------------------------------

@@ -53,6 +53,7 @@ import {
   parsePsOutput,
   parseOfficialGauges,
   truncateTitle,
+  isRedundantSub,
   computeBurnEta,
   estimateCostUsd,
   shortModelName,
@@ -164,10 +165,15 @@ class SessionTree implements vscode.TreeDataProvider<Node> {
       const item = new vscode.TreeItem(truncateTitle(v.title), vscode.TreeItemCollapsibleState.None);
 
       const res = this.resOf(v);
-      const segs = [v.sub];
-      // Model varies per session, so it belongs on the row (right after status).
-      // Effort is a global setting shared by every session, so it is shown once
-      // in the view header (see updateAux) instead of repeated on each row.
+      // Horizontal space is scarce on a narrow panel, so the row description is
+      // kept lean and priority-ordered (survivors of a right-edge truncation
+      // come first):
+      //   1. sub-status ONLY when it adds info the group header/icon does not
+      //   2. model (varies per session — the thing the user most wants to see)
+      //   3. detail (age · cwd), then CPU/RAM, then the token-hog marker.
+      // Effort is global (same for every session) so it lives in the view header.
+      const segs: string[] = [];
+      if (!isRedundantSub(v.sub)) segs.push(v.sub);
       if (v.model) segs.push(shortModelName(v.model));
       if (v.detail) segs.push(v.detail);
       if (res) {

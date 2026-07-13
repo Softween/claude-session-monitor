@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 1.7.4
+
+- Tuned the row layout for narrow side panels, where long rows were cut off before the model was visible:
+  - The per-row status word is dropped when it just restates the group header (every row under "Your turn" no longer repeats "your turn", every row under "Working" no longer repeats "working"). Informative statuses (`working (stalled?)`, `session limit`, `rate limited`, `API error`) are still shown.
+  - The model is now first in the row description, so it survives a right-edge truncation: `resume · Opus 4.8 · 10m · glossgo-be · CPU 5% · 375MB`.
+  - Session titles are truncated a bit shorter (24 chars) to leave room for the description; the full title stays in the tooltip.
+
 ## 1.7.3
 
 - Refined the model/effort display added in 1.7.2:

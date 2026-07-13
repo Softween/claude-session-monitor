@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, truncateTitle, TITLE_MAX, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, fmtTokensCompact, nextUsageBackoffSec } from "../src/view";
+import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, truncateTitle, TITLE_MAX, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec } from "../src/view";
 import type { SessionView } from "../src/core";
 
 const v = (bucket: SessionView["bucket"], sub: string): SessionView =>
@@ -212,6 +212,19 @@ describe("shortEffort", () => {
     expect(shortEffort("weird")).toBe("weird");
     expect(shortEffort(undefined)).toBeUndefined();
     expect(shortEffort("")).toBeUndefined();
+  });
+});
+
+describe("isRedundantSub", () => {
+  it("treats group-restating statuses as redundant, keeps informative ones", () => {
+    expect(isRedundantSub("your turn")).toBe(true);
+    expect(isRedundantSub("working")).toBe(true);
+    expect(isRedundantSub("waiting for you")).toBe(true);
+    expect(isRedundantSub("ended")).toBe(true);
+    expect(isRedundantSub("working (stalled?)")).toBe(false);
+    expect(isRedundantSub("session limit")).toBe(false);
+    expect(isRedundantSub("rate limited")).toBe(false);
+    expect(isRedundantSub("API error")).toBe(false);
   });
 });
 

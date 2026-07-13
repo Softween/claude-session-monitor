@@ -63,15 +63,27 @@ export function fmtMb(mb: number): string {
 }
 
 /**
- * Max characters of a session title shown in the tree row. Longer titles are
- * cut with an ellipsis so the description (state · CPU · RAM) stays readable;
+ * Max characters of a session title shown in the tree row. Kept short so that on
+ * a narrow side panel the description after it (model · age · cwd) still fits;
  * the full title lives in the tooltip.
  */
-export const TITLE_MAX = 32;
+export const TITLE_MAX = 24;
 
 export function truncateTitle(s: string, max = TITLE_MAX): string {
   const t = s.trim();
   return t.length > max ? t.slice(0, max - 1).trimEnd() + "…" : t;
+}
+
+/**
+ * Sub-status labels that merely restate the group header (and the row icon), so
+ * printing them on the row wastes width. Dropped from the row description; the
+ * exceptional subs ("working (stalled?)", "session limit", "API error", ...)
+ * still show because they carry information the group header does not.
+ */
+const REDUNDANT_SUBS = new Set(["working", "your turn", "waiting for you", "ended", "unknown"]);
+
+export function isRedundantSub(sub: string): boolean {
+  return REDUNDANT_SUBS.has(sub.trim().toLowerCase());
 }
 
 /** Clamp an already-percent-scale value to [0, 100]. */

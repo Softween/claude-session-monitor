@@ -28,6 +28,7 @@ import {
   appendLimitsHistory,
   pruneLimitsHistory,
   parseResetToEpoch,
+  formatReset,
   scanTokenUsage,
   humanizeAge,
   readOfficialSnapshot,
@@ -65,6 +66,7 @@ import {
   shortEffort,
   fmtTokensCompact,
   nextUsageBackoffSec,
+  padFixed,
   accountPillLabels,
   filterHistoryForAccount,
   topSessionRows,
@@ -183,7 +185,10 @@ class SessionTree implements vscode.TreeDataProvider<Node> {
       //   1. sub-status ONLY when it adds info the group header/icon does not
       //   2. 5h tokens + share of this machine's window (the limit pressure
       //      per chat — the thing the panel exists to make visible)
-      //   3. model, then detail (age · cwd), then CPU/RAM.
+      //   3. model, then age · cwd, then CPU/RAM last (it changes the fastest,
+      //      so at the end its updates cannot shift anything else).
+      // Every number is padFixed so a value changing width ("13s" -> "1m",
+      // "CPU 2%" -> "CPU 22%") does not make the rest of the row jump around.
       // Effort is global (same for every session) so it lives in the view header.
       const segs: string[] = [];
       if (!isRedundantSub(v.sub)) segs.push(v.sub);
@@ -191,13 +196,16 @@ class SessionTree implements vscode.TreeDataProvider<Node> {
       const share = tok && this.tot5h > 0 ? Math.round((tok / this.tot5h) * 100) : 0;
       if (tok && tok >= 10_000) {
         const hog = v.sessionId === this.tokenHogId ? "💸 " : "";
-        segs.push(`${hog}${fmtTokensCompact(tok)}${share >= 1 ? ` (${share}%)` : ""}`);
+        segs.push(`${hog}${padFixed(fmtTokensCompact(tok), 5)} (${padFixed(String(share), 2)}%)`);
       }
       if (v.model) segs.push(shortModelName(v.model));
-      if (v.detail) segs.push(v.detail);
+      if (v.resetText) segs.push(`reset ${formatReset(v.resetText, Date.now() / 1000)}`);
+      const age = v.lastActivityMs ? humanizeAge(Date.now() / 1000 - v.lastActivityMs / 1000) : "";
+      if (age) segs.push(padFixed(age, 3));
+      if (v.cwdLabel) segs.push(v.cwdLabel);
       if (res) {
         const hog = res.cpu >= this.hogThreshold();
-        segs.push(`${hog ? "🔥" : ""}CPU ${Math.round(res.cpu)}% · ${res.rssMb}MB`);
+        segs.push(`${hog ? "🔥" : ""}CPU ${padFixed(String(Math.round(res.cpu)), 3)}% · ${padFixed(fmtMb(res.rssMb), 5)}`);
       }
       item.description = segs.join(" · ");
 
@@ -1819,7 +1827,7 @@ function updateAux(
   const effortSeg = effort ? ` · effort ${effort}` : "";
   const filt = needsYouOnly ? "[needs-you only] " : "";
   treeView.message = totalRss
-    ? `${filt}total load: CPU ${Math.round(totalCpu)}% · ${fmtMb(totalRss)}${effortSeg}`
+    ? `${filt}total load: CPU ${padFixed(String(Math.round(totalCpu)), 3)}% · ${padFixed(fmtMb(totalRss), 5)}${effortSeg}`
     : effort
       ? `${filt}effort ${effort}`
       : filt || undefined;

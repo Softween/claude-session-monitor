@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 1.8.1
+
+- Stable session rows: every number in a row (5h tokens, share %, age, CPU%, RAM) is now padded to a fixed width with figure spaces, and the fastest-changing segment (CPU/RAM) moved to the end of the row — values update in place instead of making the whole row jump around. The panel header's total-load numbers got the same treatment.
+
 ## 1.8.0
 
 - **Multiple Claude accounts.** Switch Claude Code logins once and the panel remembers both accounts:

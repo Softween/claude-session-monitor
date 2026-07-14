@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, truncateTitle, TITLE_MAX, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec, accountPillLabels, filterHistoryForAccount, topSessionRows, padFixed } from "../src/view";
+import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec, accountPillLabels, filterHistoryForAccount, topSessionRows } from "../src/view";
 import type { SessionView } from "../src/core";
 
 const v = (bucket: SessionView["bucket"], sub: string): SessionView =>
@@ -76,21 +76,6 @@ describe("parsePsOutput", () => {
     expect(m.get(5678)).toEqual({ pid: 5678, cpu: 0, rssMb: 1 });
     expect(m.get(99)).toEqual({ pid: 99, cpu: 0, rssMb: 0 }); // NaN cpu/rss coerced to 0
     expect(m.size).toBe(3); // 2-token "garbage line" skipped
-  });
-});
-
-describe("truncateTitle", () => {
-  it("keeps short titles intact", () => {
-    expect(truncateTitle("short title")).toBe("short title");
-  });
-  it("cuts long titles at TITLE_MAX with ellipsis", () => {
-    const long = "Massive bitmesine harcama potansiyelini degerlendir ve raporla";
-    const out = truncateTitle(long);
-    expect(out.length).toBeLessThanOrEqual(TITLE_MAX);
-    expect(out.endsWith("…")).toBe(true);
-  });
-  it("trims whitespace before the ellipsis", () => {
-    expect(truncateTitle("a".repeat(30) + "  bcd", 32).endsWith(" …")).toBe(false);
   });
 });
 
@@ -294,15 +279,5 @@ describe("topSessionRows", () => {
     expect(rows).toHaveLength(6);
     expect(rows.every((r) => r.pct <= 100)).toBe(true);
     expect(rows.find((r) => r.tokens === 0)).toBeUndefined();
-  });
-});
-
-describe("padFixed", () => {
-  it("right-aligns with figure spaces and never truncates", () => {
-    expect(padFixed("1m", 3)).toBe(" 1m");
-    expect(padFixed("13s", 3)).toBe("13s");
-    expect(padFixed("2", 3)).toBe("  2");
-    expect(padFixed("12.30M", 5)).toBe("12.30M");
-    expect(padFixed("", 2)).toBe("  ");
   });
 });

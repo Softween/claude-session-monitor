@@ -23,8 +23,10 @@ Claude Session Monitor puts all of that in one Activity Bar panel, live.
 
 ## Features
 
-- **Live session list, grouped by state** — Limited / Waiting for you / Your turn /
-  Working / Ended. Titles match your tabs; updates in real time.
+- **Live session table, grouped by state** — Limited / Waiting for you / Your turn /
+  Working / Ended, rendered as a real data grid: fixed columns (session, 5h tokens,
+  share, model, dir, age, CPU, mem) with tabular numerals, so values update in place
+  instead of reflowing. Click a row to jump to its tab; hover for row actions.
 - **Per-session CPU% + RAM** — see exactly which session is hammering your machine,
   with a total at the top and a 🔥 on CPU hogs. *(macOS/Linux)*
 - **Official usage budget** — real **Session (5h)** and **Weekly (7d)** gauges with

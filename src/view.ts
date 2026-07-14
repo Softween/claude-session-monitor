@@ -23,15 +23,6 @@ export const GROUPS: GroupMeta[] = [
   { key: "unknown", label: "Unknown", icon: "question", color: "disabledForeground" },
 ];
 
-export const GROUP_INDEX: Record<GroupKey, number> = {
-  limited: 0,
-  waiting: 1,
-  done: 2,
-  working: 3,
-  ended: 4,
-  unknown: 5,
-};
-
 export const NEEDS_YOU: GroupKey[] = ["limited", "waiting", "done"];
 
 export function groupOf(v: SessionView): GroupKey {
@@ -60,34 +51,6 @@ export function normResetMs(r: unknown): number | null {
 
 export function fmtMb(mb: number): string {
   return mb >= 1024 ? `${(mb / 1024).toFixed(1)}GB` : `${mb}MB`;
-}
-
-// ---------------------------------------------------------------------------
-// Fixed-width row formatting. Tree rows re-render every few seconds, and any
-// value that changes width ("13s" -> "1m", "CPU 2%" -> "CPU 22%") shifts every
-// segment after it, which reads as the whole row dancing. Right-padding the
-// numbers with figure spaces (U+2007 — digit-width in UI fonts, and unlike
-// ASCII spaces never collapsed by the renderer) keeps each piece of data in a
-// stable place as its value changes.
-// ---------------------------------------------------------------------------
-
-export const FIGURE_SPACE = "\u2007";
-
-/** Right-align `s` to `width` characters using figure spaces. */
-export function padFixed(s: string, width: number): string {
-  return s.length >= width ? s : FIGURE_SPACE.repeat(width - s.length) + s;
-}
-
-/**
- * Max characters of a session title shown in the tree row. Kept short so that on
- * a narrow side panel the description after it (model · age · cwd) still fits;
- * the full title lives in the tooltip.
- */
-export const TITLE_MAX = 24;
-
-export function truncateTitle(s: string, max = TITLE_MAX): string {
-  const t = s.trim();
-  return t.length > max ? t.slice(0, max - 1).trimEnd() + "…" : t;
 }
 
 /**

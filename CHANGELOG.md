@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 1.9.0
+
+- **The session list is a real table now.** The Sessions view moved from a native tree to a data grid: fixed column tracks (state · session · 5h tok · % · model · dir · age · cpu · mem), all numerics in the editor's monospace with tabular figures and right alignment — values update strictly in place, nothing dances. Each row's token cell carries a hairline bar showing that chat's share of the machine's 5h total (the top consumer's bar is highlighted), CPU hogs tint red, stalled workers get a warning ring on their state dot, and low-priority columns collapse first on narrow panels.
+- Row interactions: click (or Enter) jumps to the session's tab; hover shows per-row actions (open transcript, kill process, remove ended). The needs-you Activity Bar badge and all title-bar buttons (Resume All, filters, Clear Ended) work as before.
+- Removed: the figure-space padding workaround from 1.8.1 (superseded by real columns) and the tree-only right-click menu (replaced by in-row actions).
+
 ## 1.8.1
 
 - Stable session rows: every number in a row (5h tokens, share %, age, CPU%, RAM) is now padded to a fixed width with figure spaces, and the fastest-changing segment (CPU/RAM) moved to the end of the row — values update in place instead of making the whole row jump around. The panel header's total-load numbers got the same treatment.

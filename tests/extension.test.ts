@@ -175,7 +175,8 @@ describe("extension activate()", () => {
     for (const c of REQUIRED_COMMANDS) {
       expect(ids).toContain(`claudeSessionMonitor.${c}`);
     }
-    expect(rec.treeViews).toHaveLength(1);
+    expect(rec.treeViews).toHaveLength(0); // the sessions list is a webview table now
+    expect(rec.webviews.some((w) => w.id === "claudeSessionMonitor.view")).toBe(true);
     expect(rec.webviews.some((w) => w.id === "claudeSessionMonitor.limits")).toBe(true);
     expect(rec.statusBars).toHaveLength(1);
   });

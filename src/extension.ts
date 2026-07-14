@@ -48,7 +48,6 @@ import {
 } from "./core";
 import {
   GROUPS,
-  GROUP_INDEX,
   NEEDS_YOU,
   groupOf,
   normPct,
@@ -58,7 +57,6 @@ import {
   labelsMatch,
   parsePsOutput,
   parseOfficialGauges,
-  truncateTitle,
   isRedundantSub,
   computeBurnEta,
   estimateCostUsd,
@@ -66,7 +64,6 @@ import {
   shortEffort,
   fmtTokensCompact,
   nextUsageBackoffSec,
-  padFixed,
   accountPillLabels,
   filterHistoryForAccount,
   topSessionRows,
@@ -74,7 +71,6 @@ import {
   type SessionTokenRow,
   type BurnEta,
   type GroupKey,
-  type GroupMeta,
   type OfficialGauge,
 } from "./view";
 
@@ -111,143 +107,219 @@ interface ResStat {
 }
 
 // ---------------------------------------------------------------------------
-// Tree
+// Sessions table webview
+//
+// The session list is a real data grid instead of a TreeView: TreeItems can
+// only render one free-flowing description string, so every value change made
+// the row reflow. Here each column is a fixed grid track, all numerics render
+// in the editor's monospace with tabular figures, and the fastest-changing
+// columns sit on the right — values update strictly in place.
 // ---------------------------------------------------------------------------
 
-type Node =
-  | { kind: "group"; group: GroupMeta; count: number }
-  | { kind: "session"; view: SessionView };
+interface SessionRow {
+  id: string;
+  title: string;
+  sub: string; // extra status ("" when it just restates the group)
+  reset: string; // formatted limit reset ("" when none)
+  tokens: string; // compact 5h tokens ("" below the 10k floor)
+  share: number; // 0-100 share of this machine's 5h token total
+  hog: boolean; // top 5h token consumer
+  model: string;
+  lastMs: number; // last activity epoch ms — age ticks client-side
+  dir: string;
+  cpu: number | null;
+  rssMb: number | null;
+  cpuHog: boolean;
+  stale: boolean; // "working" but silent — warning tint on the state dot
+  ended: boolean;
+  tip: string; // full tooltip (title, status, model, cwd, id, ...)
+}
 
-class SessionTree implements vscode.TreeDataProvider<Node> {
-  private _onDidChange = new vscode.EventEmitter<Node | undefined | void>();
-  readonly onDidChangeTreeData = this._onDidChange.event;
+interface SessionsPayload {
+  type: "update";
+  groups: { key: GroupKey; label: string; count: number; rows: SessionRow[] }[];
+  totalCpu: number | null;
+  totalRss: number | null;
+  effort: string; // "" when unknown
+  filter: string; // active list filter label, "" when none
+}
 
-  private grouped = new Map<GroupKey, SessionView[]>();
-  private tokenHogId: string | null = null;
-  private tok5h: Record<string, number> = {};
-  private tot5h = 0;
+class SessionsView implements vscode.WebviewViewProvider {
+  private view?: vscode.WebviewView;
+  private pending?: SessionsPayload;
 
-  constructor(
-    private readonly res: Map<number, ResStat>,
-    private readonly hogThreshold: () => number,
-  ) {}
+  constructor(private readonly onAction: (action: string, sessionId: string) => void) {}
 
-  setTokenInfo(hogId: string | null, tok5h: Record<string, number>, total5h: number): void {
-    this.tokenHogId = hogId;
-    this.tok5h = tok5h;
-    this.tot5h = total5h;
+  resolveWebviewView(view: vscode.WebviewView): void {
+    this.view = view;
+    view.webview.options = { enableScripts: true };
+    view.webview.html = sessionsHtml();
+    view.webview.onDidReceiveMessage((m) => {
+      if (m && typeof m.type === "string" && typeof m.id === "string") this.onAction(m.type, m.id);
+    });
+    if (this.pending) view.webview.postMessage(this.pending);
   }
 
-  setData(views: SessionView[]): void {
-    const g = new Map<GroupKey, SessionView[]>();
-    for (const v of views) {
-      const k = groupOf(v);
-      const arr = g.get(k) ?? [];
-      arr.push(v);
-      g.set(k, arr);
+  update(payload: SessionsPayload): void {
+    this.pending = payload;
+    this.view?.webview.postMessage(payload);
+  }
+
+  setBadge(value: number, tooltip: string): void {
+    if (this.view) this.view.badge = value > 0 ? { value, tooltip } : undefined;
+  }
+}
+
+function sessionsHtml(): string {
+  const nonce = nonceStr();
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: var(--vscode-font-family); font-size: 12px; color: var(--vscode-foreground); padding: 0; margin: 0; }
+  .num { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px;
+    font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  /* Column tracks — the single source of the table geometry. Order:
+     dot · title · 5h tok · share · model · dir · age · cpu · mem · actions */
+  :root { --cols: 14px minmax(40px,1fr) 62px 34px 60px 56px 30px 36px 46px 36px; }
+  @media (max-width: 469px) { :root { --cols: 14px minmax(40px,1fr) 62px 34px 60px 30px 36px 46px 36px; } .c-dir { display:none; } }
+  @media (max-width: 409px) { :root { --cols: 14px minmax(40px,1fr) 62px 34px 30px 36px 46px 36px; } .c-dir,.c-model { display:none; } }
+  @media (max-width: 349px) { :root { --cols: 14px minmax(40px,1fr) 62px 30px 36px 36px; } .c-dir,.c-model,.c-pct,.c-ram { display:none; } }
+  .meta { display:flex; gap:12px; padding:5px 10px 3px; font-size:10px;
+    color: var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; }
+  .meta b { font-weight:600; color: var(--vscode-foreground); }
+  .thead { position: sticky; top: 0; z-index: 2; display:grid; grid-template-columns: var(--cols);
+    gap: 0 6px; align-items:baseline; padding: 3px 10px; font-size: 9px; font-weight:600;
+    text-transform: uppercase; letter-spacing: .08em; color: var(--vscode-descriptionForeground);
+    background: var(--vscode-sideBar-background, var(--vscode-editor-background, #1e1e1e));
+    border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
+  .thead .num { font-family: inherit; font-size: 9px; }
+  .ghead { display:flex; align-items:center; gap:6px; padding: 7px 10px 2px; font-size:10px;
+    font-weight:700; text-transform: uppercase; letter-spacing:.06em; }
+  .gdot { width:8px; height:8px; border-radius:50%; flex:none; }
+  .gcount { font-weight:400; opacity:.6; }
+  .row { display:grid; grid-template-columns: var(--cols); gap: 0 6px; align-items:center;
+    padding: 3px 10px; cursor: pointer; border-radius: 3px; }
+  .row:hover { background: var(--vscode-list-hoverBackground, rgba(127,127,127,.12)); }
+  .row:focus { outline: 1px solid var(--vscode-focusBorder, #007fd4); outline-offset: -1px; }
+  .row.ended { opacity: .55; }
+  .dot { width:7px; height:7px; border-radius:50%; }
+  .dot.stale { box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-charts-yellow, #e6b800) 35%, transparent); }
+  .c-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .sub { color: var(--vscode-descriptionForeground); font-size: 11px; }
+  .c-model, .c-dir { overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    font-size:11px; color: var(--vscode-descriptionForeground); }
+  /* Signature: the token cell carries a hairline bar = this chat's share of the
+     machine's 5h total, so "who is eating the limit" reads as geometry. */
+  .c-tok { position: relative; padding-bottom: 3px; }
+  .tokbar { position:absolute; left:0; bottom:0; height:2px; border-radius:1px;
+    background: var(--vscode-charts-blue, #3794ff); opacity:.45; }
+  .tokbar.hog { background: var(--vscode-charts-yellow, #e6b800); opacity:.9; }
+  .c-cpu.hot { color: var(--vscode-charts-red, #f14c4c); font-weight:600; }
+  .c-act { display:flex; gap:2px; justify-content:flex-end; visibility:hidden; }
+  .row:hover .c-act, .row:focus-within .c-act { visibility:visible; }
+  .act { border:0; background:transparent; color: var(--vscode-descriptionForeground);
+    cursor:pointer; font-size:11px; line-height:1; padding:2px 3px; border-radius:3px; }
+  .act:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.25));
+    color: var(--vscode-foreground); }
+  .empty { padding: 14px 12px; color: var(--vscode-descriptionForeground); line-height:1.5; }
+  @media (prefers-reduced-motion: no-preference) { .tokbar { transition: width .5s ease; } }
+</style>
+</head>
+<body>
+  <div id="root"><div class="empty">No Claude Code sessions in the last few hours. Start one in a terminal or the Claude panel and it appears here live.</div></div>
+<script nonce="${nonce}">
+const vscodeApi = acquireVsCodeApi();
+const GCOLOR = {
+  limited: 'var(--vscode-charts-red, #f14c4c)',
+  waiting: 'var(--vscode-charts-yellow, #e6b800)',
+  done: 'var(--vscode-charts-blue, #3794ff)',
+  working: 'var(--vscode-charts-green, #4caf50)',
+  ended: 'var(--vscode-disabledForeground, #888)',
+  unknown: 'var(--vscode-disabledForeground, #888)'
+};
+let last = null;
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtAge(ms){
+  if(!ms) return '';
+  const s = Math.max(0, Math.round((Date.now()-ms)/1000));
+  if(s<60) return s+'s';
+  if(s<3600) return Math.floor(s/60)+'m';
+  if(s<172800) return Math.floor(s/3600)+'h';
+  return Math.floor(s/86400)+'d';
+}
+function render(){
+  if(!last) return;
+  const root = document.getElementById('root');
+  let h = '';
+  const metaBits = [];
+  if(last.totalCpu != null) metaBits.push('CPU <b class="num">'+last.totalCpu+'%</b>');
+  if(last.totalRss != null) metaBits.push('<b class="num">'+esc(fmtMb(last.totalRss))+'</b>');
+  if(last.effort) metaBits.push('effort '+esc(last.effort));
+  if(last.filter) metaBits.push('⧩ '+esc(last.filter));
+  if(metaBits.length) h += '<div class="meta"><span>'+metaBits.join('</span><span>')+'</span></div>';
+  if(!last.groups.length){
+    h += '<div class="empty">No Claude Code sessions in the last few hours. Start one in a terminal or the Claude panel and it appears here live.</div>';
+    root.innerHTML = h;
+    return;
+  }
+  h += '<div class="thead"><span></span><span>session</span><span class="num">5h tok</span>'
+    + '<span class="num c-pct">%</span><span class="c-model">model</span><span class="c-dir">dir</span>'
+    + '<span class="num">age</span><span class="num">cpu</span><span class="num c-ram">mem</span><span></span></div>';
+  for(const g of last.groups){
+    h += '<div class="ghead"><span class="gdot" style="background:'+GCOLOR[g.key]+'"></span>'
+      + esc(g.label)+' <span class="gcount">'+g.count+'</span></div>';
+    for(const r of g.rows){
+      const extra = [r.sub, r.reset ? ('reset '+r.reset) : ''].filter(Boolean).join(' · ');
+      h += '<div class="row'+(r.ended?' ended':'')+'" tabindex="0" data-id="'+esc(r.id)+'" title="'+esc(r.tip)+'">'
+        + '<span><span class="dot'+(r.stale?' stale':'')+'" style="background:'+GCOLOR[g.key]+'"></span></span>'
+        + '<span class="c-title">'+esc(r.title)+(extra?' <span class="sub">· '+esc(extra)+'</span>':'')+'</span>'
+        + '<span class="num c-tok">'+esc(r.tokens)
+        +   (r.tokens?'<i class="tokbar'+(r.hog?' hog':'')+'" style="width:'+Math.min(100,Math.max(2,r.share))+'%"></i>':'')
+        + '</span>'
+        + '<span class="num c-pct">'+(r.tokens && r.share>=1 ? r.share+'%' : '')+'</span>'
+        + '<span class="c-model" title="'+esc(r.model)+'">'+esc(r.model)+'</span>'
+        + '<span class="c-dir" title="'+esc(r.dir)+'">'+esc(r.dir)+'</span>'
+        + '<span class="num">'+fmtAge(r.lastMs)+'</span>'
+        + '<span class="num c-cpu'+(r.cpuHog?' hot':'')+'">'+(r.cpu!=null?r.cpu+'%':'')+'</span>'
+        + '<span class="num c-ram">'+(r.rssMb!=null?esc(fmtMb(r.rssMb)):'')+'</span>'
+        + '<span class="c-act">'
+        +   '<button class="act" data-act="transcript" title="Open transcript">▤</button>'
+        +   (r.ended
+              ? '<button class="act" data-act="remove" title="Remove from list">✕</button>'
+              : '<button class="act" data-act="kill" title="Kill process (SIGTERM)">⊘</button>')
+        + '</span>'
+        + '</div>';
     }
-    this.grouped = g;
-    this._onDidChange.fire();
   }
-
-  rerender(): void {
-    this._onDidChange.fire();
+  root.innerHTML = h;
+}
+function fmtMb(mb){ return mb >= 1024 ? (mb/1024).toFixed(1)+'GB' : mb+'MB'; }
+document.getElementById('root').addEventListener('click', (ev) => {
+  let el = ev.target;
+  while(el && el !== ev.currentTarget && !(el.classList && (el.classList.contains('act') || el.classList.contains('row')))) el = el.parentElement;
+  if(!el || el === ev.currentTarget) return;
+  if(el.classList.contains('act')){
+    const row = el.closest('.row');
+    if(row) vscodeApi.postMessage({ type: el.dataset.act, id: row.dataset.id });
+    ev.stopPropagation();
+    return;
   }
-
-  private resOf(view: SessionView): ResStat | undefined {
-    if (!view.pid) return undefined;
-    const r = this.res.get(view.pid);
-    if (!r) return undefined;
-    if (Date.now() / 1000 - r.ts > RES_FRESH_SEC) return undefined;
-    return r;
-  }
-
-  getTreeItem(node: Node): vscode.TreeItem {
-    if (node.kind === "group") {
-      const item = new vscode.TreeItem(
-        `${node.group.label} (${node.count})`,
-        vscode.TreeItemCollapsibleState.Expanded,
-      );
-      item.iconPath = new vscode.ThemeIcon(node.group.icon, new vscode.ThemeColor(node.group.color));
-      item.contextValue = "group";
-      return item;
-    }
-    const v = node.view;
-    try {
-      // Fixed-width label: long titles are cut so the state/CPU/RAM description
-      // after them stays visible; the tooltip carries the full title.
-      const item = new vscode.TreeItem(truncateTitle(v.title), vscode.TreeItemCollapsibleState.None);
-
-      const res = this.resOf(v);
-      // Horizontal space is scarce on a narrow panel, so the row description is
-      // kept lean and priority-ordered (survivors of a right-edge truncation
-      // come first):
-      //   1. sub-status ONLY when it adds info the group header/icon does not
-      //   2. 5h tokens + share of this machine's window (the limit pressure
-      //      per chat — the thing the panel exists to make visible)
-      //   3. model, then age · cwd, then CPU/RAM last (it changes the fastest,
-      //      so at the end its updates cannot shift anything else).
-      // Every number is padFixed so a value changing width ("13s" -> "1m",
-      // "CPU 2%" -> "CPU 22%") does not make the rest of the row jump around.
-      // Effort is global (same for every session) so it lives in the view header.
-      const segs: string[] = [];
-      if (!isRedundantSub(v.sub)) segs.push(v.sub);
-      const tok = this.tok5h[v.sessionId];
-      const share = tok && this.tot5h > 0 ? Math.round((tok / this.tot5h) * 100) : 0;
-      if (tok && tok >= 10_000) {
-        const hog = v.sessionId === this.tokenHogId ? "💸 " : "";
-        segs.push(`${hog}${padFixed(fmtTokensCompact(tok), 5)} (${padFixed(String(share), 2)}%)`);
-      }
-      if (v.model) segs.push(shortModelName(v.model));
-      if (v.resetText) segs.push(`reset ${formatReset(v.resetText, Date.now() / 1000)}`);
-      const age = v.lastActivityMs ? humanizeAge(Date.now() / 1000 - v.lastActivityMs / 1000) : "";
-      if (age) segs.push(padFixed(age, 3));
-      if (v.cwdLabel) segs.push(v.cwdLabel);
-      if (res) {
-        const hog = res.cpu >= this.hogThreshold();
-        segs.push(`${hog ? "🔥" : ""}CPU ${padFixed(String(Math.round(res.cpu)), 3)}% · ${padFixed(fmtMb(res.rssMb), 5)}`);
-      }
-      item.description = segs.join(" · ");
-
-      const resTip = res ? `\nCPU: ${Math.round(res.cpu)}%  RAM: ${res.rssMb}MB  (pid ${v.pid})` : "";
-      const tokTip = tok
-        ? `\ntokens (5h): ${fmtTokensCompact(tok)}${share >= 1 ? ` · ${share}% of this Mac's 5h total` : ""}${v.sessionId === this.tokenHogId ? "  💸 top consumer" : ""}`
-        : "";
-      item.tooltip = v.tooltip + resTip + tokTip;
-      item.contextValue = groupOf(v) === "ended" ? "session-ended" : "session";
-      const g = GROUPS[GROUP_INDEX[groupOf(v)]];
-      item.iconPath = new vscode.ThemeIcon(
-        groupOf(v) === "working" && v.stale ? "warning" : g.icon,
-        new vscode.ThemeColor(g.color),
-      );
-      item.command = {
-        command: "claudeSessionMonitor.openSession",
-        title: "Open",
-        arguments: [v],
-      };
-      return item;
-    } catch (e) {
-      log("getTreeItem error: " + String(e));
-      const fb = new vscode.TreeItem(v.title || v.sessionId, vscode.TreeItemCollapsibleState.None);
-      fb.contextValue = "session";
-      return fb;
-    }
-  }
-
-  getChildren(node?: Node): Node[] {
-    if (!node) {
-      const out: Node[] = [];
-      for (const meta of GROUPS) {
-        const arr = this.grouped.get(meta.key);
-        if (arr && arr.length) out.push({ kind: "group", group: meta, count: arr.length });
-      }
-      return out;
-    }
-    if (node.kind === "group") {
-      return (this.grouped.get(node.group.key) ?? []).map((view) => ({ kind: "session", view }));
-    }
-    return [];
-  }
+  vscodeApi.postMessage({ type: 'open', id: el.dataset.id });
+});
+document.getElementById('root').addEventListener('keydown', (ev) => {
+  if(ev.key !== 'Enter' && ev.key !== ' ') return;
+  const row = ev.target && ev.target.classList && ev.target.classList.contains('row') ? ev.target : null;
+  if(row){ vscodeApi.postMessage({ type: 'open', id: row.dataset.id }); ev.preventDefault(); }
+});
+window.addEventListener('message', e => { if(e.data && e.data.type === 'update'){ last = e.data; render(); } });
+setInterval(render, 1000); // ages tick client-side between payloads
+</script>
+</body>
+</html>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -870,12 +942,17 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const trackAllAccounts = () => cfg().get<boolean>("trackAllAccounts", true);
 
   const resourceCache = new Map<number, ResStat>();
-  const tree = new SessionTree(resourceCache, () => cfg().get<number>("cpuHogThreshold", 60));
-  const treeView = vscode.window.createTreeView("claudeSessionMonitor.view", {
-    treeDataProvider: tree,
-    showCollapseAll: false,
+  const sessionsView = new SessionsView((action, sessionId) => {
+    const v = lastViews.find((s) => s.sessionId === sessionId);
+    if (!v) return;
+    if (action === "open") void jumpToSession(v);
+    else if (action === "transcript") openTranscript(v);
+    else if (action === "kill") void vscode.commands.executeCommand("claudeSessionMonitor.killProcess", v);
+    else if (action === "remove") void vscode.commands.executeCommand("claudeSessionMonitor.removeSession", v);
   });
-  ctx.subscriptions.push(treeView);
+  ctx.subscriptions.push(
+    vscode.window.registerWebviewViewProvider("claudeSessionMonitor.view", sessionsView),
+  );
 
   // Multi-account state: every account seen as the active login is remembered
   // (registry file shared across windows; tokens in SecretStorage), and the
@@ -1250,6 +1327,32 @@ export function activate(ctx: vscode.ExtensionContext): void {
     };
   }
 
+  /** Rebuild the sessions table payload (grouping, per-row stats, badge) and post it. */
+  function pushSessions(views: SessionView[]): void {
+    // Token hog: the biggest 5h consumer, only when it is a meaningful share.
+    let hogId: string | null = null;
+    if (tokenUsage?.bySession5h) {
+      const top = Object.entries(tokenUsage.bySession5h).sort((a, b) => b[1] - a[1])[0];
+      if (top && top[1] >= 200_000 && top[1] >= tokenUsage.fiveHour * 0.25) hogId = top[0];
+    }
+    sessionsView.update(
+      buildSessionsPayload(
+        views,
+        resourceCache,
+        tokenUsage,
+        hogId,
+        needsYouOnly ? "needs-you only" : "",
+        cfg().get<number>("cpuHogThreshold", 60),
+      ),
+    );
+    let badge = 0;
+    for (const v of views) {
+      const g = groupOf(v);
+      if (g === "limited" || g === "waiting") badge++;
+    }
+    sessionsView.setBadge(badge, `${badge} session(s) waiting / limited`);
+  }
+
   function pushUsagePayload(): void {
     try {
       const c = currentAccountCtx();
@@ -1338,16 +1441,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       log(`sessions=${views.length} ${JSON.stringify(countBuckets(views))} dismissed=${dismissed.size} needsYouOnly=${needsYouOnly}`);
     }
 
-    // Token hog: the biggest 5h consumer, only when it is a meaningful share.
-    let hogId: string | null = null;
-    if (tokenUsage?.bySession5h) {
-      const top = Object.entries(tokenUsage.bySession5h).sort((a, b) => b[1] - a[1])[0];
-      if (top && top[1] >= 200_000 && top[1] >= tokenUsage.fiveHour * 0.25) hogId = top[0];
-    }
-    tree.setTokenInfo(hogId, tokenUsage?.bySession5h ?? {}, tokenUsage?.fiveHour ?? 0);
-
-    tree.setData(views);
-    updateAux(treeView, views, resourceCache, needsYouOnly);
+    pushSessions(views);
     pushUsagePayload();
 
     maybeScheduleAutoResume(views);
@@ -1389,8 +1483,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const pids = views.map((v) => v.pid).filter((p): p is number => !!p);
       sampleResources(pids, resourceCache, () => {
         updateStatusBar(statusBar, lastViews, resourceCache, officialUsage);
-        updateAux(treeView, lastViews, resourceCache, needsYouOnly);
-        tree.rerender();
+        pushSessions(lastViews);
       });
     }
   }
@@ -1568,7 +1661,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         void runOne();
       }
     }),
-    vscode.commands.registerCommand("claudeSessionMonitor.openTranscript", (arg?: SessionView | Node) =>
+    vscode.commands.registerCommand("claudeSessionMonitor.openTranscript", (arg?: SessionView) =>
       openTranscript(arg),
     ),
     vscode.commands.registerCommand("claudeSessionMonitor.openSession", (v: SessionView) =>
@@ -1631,13 +1724,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
       focusCursor = next.sessionId;
       void jumpToSession(next);
     }),
-    vscode.commands.registerCommand("claudeSessionMonitor.copySessionId", (arg?: SessionView | Node) => {
+    vscode.commands.registerCommand("claudeSessionMonitor.copySessionId", (arg?: SessionView) => {
       const v = asView(arg);
       if (!v) return;
       vscode.env.clipboard.writeText(v.sessionId);
       vscode.window.setStatusBarMessage(`Copied session id ${v.sessionId.slice(0, 8)}…`, 3000);
     }),
-    vscode.commands.registerCommand("claudeSessionMonitor.revealCwd", (arg?: SessionView | Node) => {
+    vscode.commands.registerCommand("claudeSessionMonitor.revealCwd", (arg?: SessionView) => {
       const v = asView(arg);
       if (!v?.cwd) {
         vscode.window.showWarningMessage("No working folder known for this session.");
@@ -1645,7 +1738,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       }
       vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(v.cwd));
     }),
-    vscode.commands.registerCommand("claudeSessionMonitor.killProcess", async (arg?: SessionView | Node) => {
+    vscode.commands.registerCommand("claudeSessionMonitor.killProcess", async (arg?: SessionView) => {
       const v = asView(arg);
       if (!v?.pid) {
         vscode.window.showWarningMessage("No process id known for this session.");
@@ -1796,41 +1889,74 @@ function updateStatusBar(
   }
 }
 
-function updateAux(
-  treeView: vscode.TreeView<Node>,
+function buildSessionsPayload(
   views: SessionView[],
-  cache: Map<number, ResStat>,
-  needsYouOnly: boolean,
-): void {
-  let limited = 0;
-  let waiting = 0;
+  resCache: Map<number, ResStat>,
+  tokens: TokenUsage | null,
+  hogId: string | null,
+  filter: string,
+  cpuHogThreshold: number,
+): SessionsPayload {
+  const nowSec = Date.now() / 1000;
+  const grouped = new Map<GroupKey, SessionRow[]>();
   let totalCpu = 0;
   let totalRss = 0;
+  let anyRes = false;
   for (const v of views) {
     const g = groupOf(v);
-    if (g === "limited") limited++;
-    else if (g === "waiting") waiting++;
-    const r = freshRes(v, cache);
-    if (r) {
-      totalCpu += r.cpu;
-      totalRss += r.rssMb;
+    const res = freshRes(v, resCache);
+    if (res) {
+      totalCpu += res.cpu;
+      totalRss += res.rssMb;
+      anyRes = true;
     }
+    const tok = tokens?.bySession5h?.[v.sessionId] ?? 0;
+    const total5h = tokens?.fiveHour ?? 0;
+    const share = tok && total5h > 0 ? Math.round((tok / total5h) * 100) : 0;
+    const resTip = res ? `\nCPU: ${Math.round(res.cpu)}%  RAM: ${res.rssMb}MB  (pid ${v.pid})` : "";
+    const tokTip =
+      tok >= 10_000
+        ? `\ntokens (5h): ${fmtTokensCompact(tok)}${share >= 1 ? ` · ${share}% of this Mac's total` : ""}${v.sessionId === hogId ? " · top consumer" : ""}`
+        : "";
+    const row: SessionRow = {
+      id: v.sessionId,
+      title: v.title,
+      sub: isRedundantSub(v.sub) ? "" : v.sub,
+      reset: v.resetText ? formatReset(v.resetText, nowSec) : "",
+      tokens: tok >= 10_000 ? fmtTokensCompact(tok) : "",
+      share,
+      hog: v.sessionId === hogId,
+      model: v.model ? shortModelName(v.model) : "",
+      lastMs: v.lastActivityMs,
+      dir: v.cwdLabel ?? "",
+      cpu: res ? Math.round(res.cpu) : null,
+      rssMb: res ? res.rssMb : null,
+      cpuHog: !!res && res.cpu >= cpuHogThreshold,
+      stale: g === "working" && v.stale,
+      ended: g === "ended",
+      tip: v.tooltip + resTip + tokTip,
+    };
+    const arr = grouped.get(g) ?? [];
+    arr.push(row);
+    grouped.set(g, arr);
   }
-  const badge = limited + waiting;
-  treeView.badge = badge
-    ? { value: badge, tooltip: `${badge} session(s) waiting / limited` }
-    : undefined;
-
-  // Effort is a global setting (same for every session), so state it once here
-  // rather than repeating it on each row. shortEffort compacts e.g. "medium".
-  const effort = shortEffort(views.find((v) => v.effort)?.effort);
-  const effortSeg = effort ? ` · effort ${effort}` : "";
-  const filt = needsYouOnly ? "[needs-you only] " : "";
-  treeView.message = totalRss
-    ? `${filt}total load: CPU ${padFixed(String(Math.round(totalCpu)), 3)}% · ${padFixed(fmtMb(totalRss), 5)}${effortSeg}`
-    : effort
-      ? `${filt}effort ${effort}`
-      : filt || undefined;
+  const groups = GROUPS.filter((m) => grouped.get(m.key)?.length).map((m) => ({
+    key: m.key,
+    label: m.label,
+    count: grouped.get(m.key)!.length,
+    rows: grouped.get(m.key)!,
+  }));
+  // Effort is a global setting (same for every session), so it is stated once
+  // in the meta strip rather than repeated on each row.
+  const effort = shortEffort(views.find((v) => v.effort)?.effort) ?? "";
+  return {
+    type: "update",
+    groups,
+    totalCpu: anyRes ? Math.round(totalCpu) : null,
+    totalRss: anyRes ? totalRss : null,
+    effort,
+    filter,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -2000,18 +2126,13 @@ async function jumpToSession(v: SessionView): Promise<void> {
   openTranscript(v);
 }
 
-/** Normalize a command argument that may be a tree Node or a bare SessionView. */
-function asView(arg?: SessionView | Node): SessionView | undefined {
-  if (!arg) return undefined;
-  if ((arg as Node).kind === "session") return (arg as { view: SessionView }).view;
-  if ((arg as SessionView).sessionId) return arg as SessionView;
-  return undefined;
+/** Normalize a command argument to a SessionView (undefined when absent/foreign). */
+function asView(arg?: SessionView): SessionView | undefined {
+  return arg && typeof arg.sessionId === "string" ? arg : undefined;
 }
 
-function openTranscript(arg?: SessionView | Node): void {
-  let p: string | undefined;
-  if (arg && (arg as Node).kind === "session") p = (arg as { view: SessionView }).view.transcriptPath;
-  else if (arg && (arg as SessionView).transcriptPath) p = (arg as SessionView).transcriptPath;
+function openTranscript(arg?: SessionView): void {
+  const p = asView(arg)?.transcriptPath;
   if (!p) {
     vscode.window.showWarningMessage("No transcript path for this session.");
     return;

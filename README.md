@@ -28,8 +28,17 @@ Claude Session Monitor puts all of that in one Activity Bar panel, live.
 - **Per-session CPU% + RAM** — see exactly which session is hammering your machine,
   with a total at the top and a 🔥 on CPU hogs. *(macOS/Linux)*
 - **Official usage budget** — real **Session (5h)** and **Weekly (7d)** gauges with
-  **% used**, **% left**, and a reset countdown, pulled from your own account. Plus a
-  **token-usage trend** (rolling 5h / 7d) with an hourly chart. *(official gauges: macOS)*
+  fine-grained 20-segment bars, **% used**, **% left**, and a reset countdown, pulled
+  from your own account. Plus a **usage-over-time chart** (gridlines + burn-rate
+  projection) and a **token-usage trend** (rolling 5h / 7d) with an hourly chart.
+  *(official gauges: macOS)*
+- **Multiple accounts** — switch Claude Code logins and the panel remembers each
+  account: click the account pills to flip between their gauges, see which login is
+  active (green dot), and keep watching the other account's reset countdown while
+  you work on this one. *(macOS; see Privacy)*
+- **Per-session token spend** — every session row shows its 5h tokens and share of
+  the machine total (`2.1M (12%)`), the top consumer gets a 💸, and the usage panel
+  lists the top sessions with bars — so "which chat is eating my limit" has an answer.
 - **Notifications** — in-VS-Code toasts and native macOS notifications the moment a
   session needs you or hits a limit (even when VS Code isn't focused).
 - **Stuck-session alert** — flags a "working" session that has gone silent too long.
@@ -83,8 +92,13 @@ A pure, `vscode`-free data layer merges three sources per session:
 
 - No telemetry. Nothing is sent anywhere except a **read-only GET of your own account
   usage** to Anthropic (the same call the Claude app makes), and only on macOS.
-- The keychain token is read locally to authorize that call and is never stored or
-  logged by this extension.
+- The keychain token is read locally to authorize that call and is never logged.
+- **Multi-account**: with `trackAllAccounts` on (default), each login's access token
+  is kept in **VS Code Secret Storage** (your OS keychain — same protection as the
+  original) so the panel can keep refreshing the account you logged out of; account
+  identity (uuid + email) lives in `~/.claude/session-monitor/accounts.json`. Tokens
+  never touch plain files or logs. Disable the setting to stop this, and run
+  **Claude Sessions: Forget Other Accounts** to delete anything already stored.
 - CPU/RAM come from a local `ps`; auto-resume uses local `osascript` keystrokes.
 
 ## Configuration
@@ -107,6 +121,7 @@ All settings are under `claudeSessionMonitor.*`:
 | `recentScanMaxAgeHours` | `6` | Show sessions active within the last N hours |
 | `hideEndedAfterMinutes` | `30` | Hide ended sessions after this long |
 | `workspaceOnly` | `false` | Only show this workspace's sessions |
+| `trackAllAccounts` | `true` | Remember each Claude login + refresh non-active accounts in the background |
 
 ## Platform support
 

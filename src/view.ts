@@ -146,6 +146,85 @@ export function parseOfficialGauges(p: unknown): OfficialGauge[] {
   return gauges;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-account presentation helpers
+// ---------------------------------------------------------------------------
+
+/** One account entry as shown in the webview's switcher row. */
+export interface AccountView {
+  id: string;
+  email: string;
+  label: string;
+  active: boolean; // currently the Claude Code login on this machine
+  selected: boolean; // currently displayed in the panel
+  ts: number | null; // epoch sec of its last successful usage fetch
+  stale: boolean; // stored token expired/rejected — data is last-known only
+}
+
+/**
+ * Short pill labels for a set of account emails: the local part alone when it
+ * is unambiguous ("bilal"), local@domain-word when two accounts share a local
+ * part ("info@glossgo" vs "info@softween").
+ */
+export function accountPillLabels(emails: string[]): string[] {
+  const locals = emails.map((e) => {
+    const at = e.indexOf("@");
+    return at > 0 ? e.slice(0, at) : e;
+  });
+  return locals.map((local, i) => {
+    const dup = locals.some((other, j) => j !== i && other.toLowerCase() === local.toLowerCase());
+    if (!dup) return local;
+    const domain = emails[i].slice(emails[i].indexOf("@") + 1);
+    const word = domain.split(".")[0] || domain;
+    return word ? `${local}@${word}` : local;
+  });
+}
+
+/**
+ * History points belonging to one account: points tagged with its id, plus —
+ * only for the account that is the CURRENT active login — untagged legacy
+ * points (pre-multi-account extension writes and terminal-statusline writes,
+ * which always describe the active login).
+ */
+export function filterHistoryForAccount<T extends { acct?: string }>(
+  points: T[],
+  accountId: string | null,
+  isActiveLogin: boolean,
+): T[] {
+  if (!accountId) return points;
+  return points.filter((p) => (p.acct ? p.acct === accountId : isActiveLogin));
+}
+
+/** One session row in the webview's "Sessions (5h tokens)" breakdown. */
+export interface SessionTokenRow {
+  label: string;
+  tokens: number;
+  pct: number; // share of the machine's 5h total, 0-100
+}
+
+/**
+ * Top sessions by 5h token spend, labeled with live session titles where the
+ * session is still visible (fallback: the short session id).
+ */
+export function topSessionRows(
+  bySession5h: Record<string, number>,
+  titles: Map<string, string>,
+  fiveHourTotal: number,
+  n = 6,
+): SessionTokenRow[] {
+  const summed = Object.values(bySession5h).reduce((s, v) => s + v, 0);
+  const total = Math.max(fiveHourTotal, summed, 1);
+  return Object.entries(bySession5h)
+    .filter(([, tokens]) => tokens > 0)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([sid, tokens]) => ({
+      label: titles.get(sid) ?? `session ${sid.slice(0, 8)}`,
+      tokens,
+      pct: Math.min(100, Math.round((tokens / total) * 100)),
+    }));
+}
+
 /** Strip trailing ellipsis/dots and lowercase, for tolerant tab-label matching. */
 export function normLabel(s: string): string {
   return s.replace(/[….]+$/, "").trim().toLowerCase();

@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 1.8.0
+
+- **Multiple Claude accounts.** Switch Claude Code logins once and the panel remembers both accounts:
+  - Clickable account pills at the top of the Usage limits view show each account (green dot = active login); click to flip the gauges, history chart, and burn-rate projection to that account.
+  - The non-active account keeps refreshing in the background with its stored token (slower cadence, shared across windows); when that token expires, the pill shows ⚠ and the panel keeps last-known data with an honest note — its reset countdown still ticks.
+  - Access tokens live in VS Code Secret Storage (your OS keychain), identity in `~/.claude/session-monitor/accounts.json`; per-account history/snapshots are kept separate. Disable via `claudeSessionMonitor.trackAllAccounts` (untrusted-workspace restricted); a new **Claude Sessions: Forget Other Accounts** command deletes stored tokens.
+  - The terminal statusline now tags its history samples with the account uuid so charts stay correctly attributed after a login switch (re-run `scripts/install.sh` to pick up the updated `statusline.sh`).
+- **Per-session token visibility.** Each session row now shows its 5h token spend and share of the machine total (`💸 2.1M (12%)` on the top consumer), and the Usage limits view gains a **Sessions (5h tokens)** breakdown with bars — so it is finally obvious which chat is eating the limit.
+- **Finer usage gauges.** The 5h/7d bars went from 10 coarse blocks to 20 segments with fractional fill (single-percent resolution), and sub-10% values show one decimal.
+- **Better usage chart.** Gridlines at 25/50/75%, a soft area fill under the 5h line, a data time-span label, and friendlier "updated Xm ago" ages.
+
 ## 1.7.4
 
 - Tuned the row layout for narrow side panels, where long rows were cut off before the model was visible:

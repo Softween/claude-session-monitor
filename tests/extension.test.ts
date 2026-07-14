@@ -117,6 +117,25 @@ afterAll(() => {
   }
 });
 
+function mkCtx(): any {
+  const state = new Map<string, unknown>();
+  return {
+    subscriptions: [],
+    globalState: {
+      get: (k: string, def?: unknown) => (state.has(k) ? state.get(k) : def),
+      update: (k: string, v: unknown) => {
+        state.set(k, v);
+        return Promise.resolve();
+      },
+    },
+    secrets: {
+      get: () => Promise.resolve(undefined),
+      store: () => Promise.resolve(),
+      delete: () => Promise.resolve(),
+    },
+  };
+}
+
 let lastCtx: any;
 afterEach(() => {
   for (const d of lastCtx?.subscriptions ?? []) {
@@ -144,11 +163,13 @@ const REQUIRED_COMMANDS = [
   "resumeAll",
   "openTranscript",
   "openSession",
+  "refreshUsage",
+  "forgetOtherAccounts",
 ];
 
 describe("extension activate()", () => {
   it("wires the tree, webview, status bar and all commands without throwing", () => {
-    lastCtx = { subscriptions: [] };
+    lastCtx = mkCtx();
     expect(() => ext.activate(lastCtx)).not.toThrow();
     const ids = [...rec.commands.keys()];
     for (const c of REQUIRED_COMMANDS) {
@@ -160,7 +181,7 @@ describe("extension activate()", () => {
   });
 
   it("refresh and openSession run without throwing on an empty home", async () => {
-    lastCtx = { subscriptions: [] };
+    lastCtx = mkCtx();
     ext.activate(lastCtx);
     expect(() => rec.commands.get("claudeSessionMonitor.refresh")!()).not.toThrow();
     await rec.commands.get("claudeSessionMonitor.openSession")!({

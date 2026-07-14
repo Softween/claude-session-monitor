@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, truncateTitle, TITLE_MAX, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec } from "../src/view";
+import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, truncateTitle, TITLE_MAX, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec, accountPillLabels, filterHistoryForAccount, topSessionRows } from "../src/view";
 import type { SessionView } from "../src/core";
 
 const v = (bucket: SessionView["bucket"], sub: string): SessionView =>
@@ -248,5 +248,51 @@ describe("nextUsageBackoffSec", () => {
     expect(nextUsageBackoffSec(undefined, 300)).toBe(300);
     expect(nextUsageBackoffSec(undefined, 5)).toBe(60);
     expect(nextUsageBackoffSec(120, 1000)).toBe(900);
+  });
+});
+
+describe("accountPillLabels", () => {
+  it("uses the bare local part when unambiguous", () => {
+    expect(accountPillLabels(["bilal@glossgo.com", "emir@glossgo.com"])).toEqual(["bilal", "emir"]);
+  });
+  it("disambiguates duplicate local parts with the domain word", () => {
+    expect(accountPillLabels(["info@glossgo.com", "info@softween.com"])).toEqual(["info@glossgo", "info@softween"]);
+  });
+  it("passes through values without an @", () => {
+    expect(accountPillLabels(["this account"])).toEqual(["this account"]);
+  });
+});
+
+describe("filterHistoryForAccount", () => {
+  const pts = [{ acct: "a", fh: 1 }, { acct: "b", fh: 2 }, { fh: 3 }] as { acct?: string; fh: number }[];
+  it("keeps tagged points of the account plus legacy points only for the active login", () => {
+    expect(filterHistoryForAccount(pts, "a", true).map((p) => p.fh)).toEqual([1, 3]);
+    expect(filterHistoryForAccount(pts, "a", false).map((p) => p.fh)).toEqual([1]);
+    expect(filterHistoryForAccount(pts, "b", false).map((p) => p.fh)).toEqual([2]);
+  });
+  it("returns everything when no account is selected", () => {
+    expect(filterHistoryForAccount(pts, null, true)).toHaveLength(3);
+  });
+});
+
+describe("topSessionRows", () => {
+  it("sorts by tokens, labels from live titles, falls back to the short id", () => {
+    const rows = topSessionRows(
+      { "aaaabbbb-1111": 500_000, "ccccdddd-2222": 1_500_000 },
+      new Map([["ccccdddd-2222", "Fix the deploy"]]),
+      2_000_000,
+    );
+    expect(rows.map((r) => r.label)).toEqual(["Fix the deploy", "session aaaabbbb"]);
+    expect(rows[0].pct).toBe(75);
+    expect(rows[1].pct).toBe(25);
+  });
+  it("caps at n rows, drops zero rows, and never exceeds 100%", () => {
+    const by: Record<string, number> = {};
+    for (let i = 0; i < 9; i++) by["s" + i] = (i + 1) * 1000;
+    by.zero = 0;
+    const rows = topSessionRows(by, new Map(), 100, 6); // total smaller than the sum
+    expect(rows).toHaveLength(6);
+    expect(rows.every((r) => r.pct <= 100)).toBe(true);
+    expect(rows.find((r) => r.tokens === 0)).toBeUndefined();
   });
 });

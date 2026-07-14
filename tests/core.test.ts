@@ -17,6 +17,11 @@ import {
   appendLimitsHistory,
   readOfficialSnapshot,
   writeOfficialSnapshot,
+  officialUsageFileFor,
+  readAccountsFile,
+  upsertActiveAccount,
+  writeAccountsFile,
+  type AccountsFile,
   type HookStatus,
   type RecentTranscript,
 } from "../src/core";
@@ -776,5 +781,54 @@ describe("official usage snapshot", () => {
     expect(readOfficialSnapshot(file)).toBeUndefined();
     fs.writeFileSync(file, JSON.stringify({ ts: "x", gauges: {} }));
     expect(readOfficialSnapshot(file)).toBeUndefined();
+  });
+});
+
+describe("account registry", () => {
+  it("round-trips through the accounts file and tolerates garbage", () => {
+    const file = path.join(tmp, "accounts.json");
+    expect(readAccountsFile(file)).toEqual({ v: 1, accounts: [], activeId: undefined });
+
+    let f: AccountsFile = { v: 1, accounts: [] };
+    f = upsertActiveAccount(f, { id: "uuid-a", email: "bilal@glossgo.com", tokenExpiresAt: 111 }, 1000);
+    writeAccountsFile(f, file);
+    const back = readAccountsFile(file);
+    expect(back.activeId).toBe("uuid-a");
+    expect(back.accounts).toHaveLength(1);
+    expect(back.accounts[0]).toMatchObject({ id: "uuid-a", email: "bilal@glossgo.com", tokenExpiresAt: 111 });
+
+    fs.writeFileSync(file, "not json");
+    expect(readAccountsFile(file)).toEqual({ v: 1, accounts: [], activeId: undefined });
+    fs.writeFileSync(file, JSON.stringify({ accounts: [{ id: 5 }, { id: "ok", email: "x@y.z", lastSeenTs: 2 }] }));
+    expect(readAccountsFile(file).accounts).toEqual([{ id: "ok", email: "x@y.z", lastSeenTs: 2 }]);
+  });
+
+  it("upsertActiveAccount switches the active id, keeps history, and preserves expiry", () => {
+    let f: AccountsFile = { v: 1, accounts: [] };
+    f = upsertActiveAccount(f, { id: "a", email: "a@x.com", tokenExpiresAt: 111 }, 1000);
+    f = upsertActiveAccount(f, { id: "b", email: "b@x.com", tokenExpiresAt: 222 }, 2000);
+    expect(f.activeId).toBe("b");
+    expect(f.accounts.map((a) => a.id)).toEqual(["b", "a"]);
+
+    // Re-login to "a" without a known expiry keeps the previously stored one.
+    f = upsertActiveAccount(f, { id: "a", email: "a@x.com" }, 3000);
+    expect(f.activeId).toBe("a");
+    expect(f.accounts[0]).toMatchObject({ id: "a", lastSeenTs: 3000, tokenExpiresAt: 111 });
+    expect(f.accounts).toHaveLength(2);
+  });
+
+  it("officialUsageFileFor sanitizes ids into distinct per-account paths", () => {
+    const a = officialUsageFileFor("1c51b773-d698-4dcf-80cd-bde382be8604");
+    const b = officialUsageFileFor("2d62c884-e7a9-5eda-91de-cef493cf9715");
+    expect(a).toMatch(/official-usage-1c51b773-d698-4d\.json$/);
+    expect(a).not.toBe(b);
+    expect(officialUsageFileFor("../evil/../path")).toMatch(/official-usage-evilpath\.json$/);
+    expect(officialUsageFileFor("")).toMatch(/official-usage-default\.json$/);
+  });
+
+  it("tokenStale survives the snapshot round-trip", () => {
+    const file = path.join(tmp, "snap-acct.json");
+    writeOfficialSnapshot({ gauges: [{ key: "session", label: "Session (5h)", pct: 7, resetMs: null }], ts: 123, tokenStale: true }, file);
+    expect(readOfficialSnapshot(file)!.tokenStale).toBe(true);
   });
 });

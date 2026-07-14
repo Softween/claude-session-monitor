@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Claude Code Session Monitor",
   "description": "Live monitor for all your Claude Code sessions: which is working, which is waiting for you, which hit a limit, plus per-session CPU/RAM and 5h/7d usage limits.",
-  "version": "1.7.4",
+  "version": "1.8.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -24,7 +24,8 @@
       "restrictedConfigurations": [
         "claudeSessionMonitor.resumePrompt",
         "claudeSessionMonitor.resumeAutoType",
-        "claudeSessionMonitor.autoResumeAfterReset"
+        "claudeSessionMonitor.autoResumeAfterReset",
+        "claudeSessionMonitor.trackAllAccounts"
       ]
     }
   },
@@ -142,6 +143,10 @@
         "title": "Kill Process (SIGTERM)"
       },
       {
+        "command": "claudeSessionMonitor.forgetOtherAccounts",
+        "title": "Claude Sessions: Forget Other Accounts (delete stored tokens)"
+      },
+      {
         "command": "claudeSessionMonitor.refreshUsage",
         "title": "Claude Sessions: Refresh Usage Limits",
         "icon": "$(refresh)"
@@ -246,6 +251,11 @@
           "default": 30,
           "minimum": 5,
           "description": "How often to refresh official account usage limits from Anthropic, in seconds. The poll is shared across ALL VS Code windows (single-flight through a snapshot file), and a 429 triggers an exponential backoff every window honors."
+        },
+        "claudeSessionMonitor.trackAllAccounts": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Remember every Claude account you log into (identity in `~/.claude/session-monitor/accounts.json`, access token in VS Code Secret Storage, i.e. your OS keychain) and keep fetching usage for non-active accounts in the background, so the Usage limits panel can show each account and switch between them. Turn off to track only the current login; run **Claude Sessions: Forget Other Accounts** to also delete already-stored tokens."
         },
         "claudeSessionMonitor.usageWarnPercent": {
           "type": "number",

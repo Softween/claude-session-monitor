@@ -681,6 +681,10 @@ export function cleanupMonitorFiles(maxAgeMs: number, now: number, dir = MONITOR
   }
   for (const f of files) {
     if (!f.endsWith(".json")) continue;
+    // Infrastructure files are state, not per-session status — age never
+    // invalidates them (accounts.json in particular may legitimately sit
+    // untouched for days between account switches).
+    if (f === "accounts.json" || f.startsWith("official-usage")) continue;
     const full = path.join(dir, f);
     try {
       const st = fs.statSync(full);
@@ -749,6 +753,7 @@ export interface RawLimits {
   model?: string;
   ts?: number;
   src?: string; // "ext" = written by the extension (percent scale, never 0-1)
+  acct?: string; // account id the point belongs to (absent on legacy/statusline points)
 }
 
 export function readLimits(file = LIMITS_FILE): RawLimits | undefined {
@@ -826,6 +831,7 @@ export interface OfficialSnapshot {
   attemptTs?: number; // epoch sec of last attempt by any window (single-flight)
   backoffUntil?: number; // epoch sec all windows wait until after a 429
   backoffSec?: number; // last backoff length, for exponential growth
+  tokenStale?: boolean; // stored token rejected/expired — gauges are last-known only
 }
 
 export function readOfficialSnapshot(file = OFFICIAL_USAGE_FILE): OfficialSnapshot | undefined {
@@ -843,6 +849,69 @@ export function readOfficialSnapshot(file = OFFICIAL_USAGE_FILE): OfficialSnapsh
 export function writeOfficialSnapshot(snap: OfficialSnapshot, file = OFFICIAL_USAGE_FILE): void {
   try {
     atomicWrite(file, JSON.stringify(snap));
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Per-account official-usage snapshot path (the active account also mirrors to the legacy file). */
+export function officialUsageFileFor(accountId: string): string {
+  const safe = accountId.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 16) || "default";
+  return path.join(MONITOR_DIR, `official-usage-${safe}.json`);
+}
+
+// ---------------------------------------------------------------------------
+// Account registry — every Claude account seen as the active login on this
+// machine, so the UI can show usage for each account of a user who switches
+// logins. Identity + freshness metadata only; tokens live in VS Code
+// SecretStorage (OS keychain), never in this file.
+// ---------------------------------------------------------------------------
+
+export const ACCOUNTS_FILE = path.join(MONITOR_DIR, "accounts.json");
+
+export interface AccountInfo {
+  id: string; // Anthropic account UUID ("default" when identity is unknown)
+  email: string;
+  lastSeenTs: number; // epoch sec this account was last seen as the active login
+  tokenExpiresAt?: number; // epoch ms the stored access token expires (from the keychain payload)
+}
+
+export interface AccountsFile {
+  v: 1;
+  accounts: AccountInfo[];
+  activeId?: string;
+}
+
+export function readAccountsFile(file = ACCOUNTS_FILE): AccountsFile {
+  const raw = readJson<Record<string, unknown>>(file, {});
+  const accounts = Array.isArray(raw.accounts)
+    ? (raw.accounts as AccountInfo[]).filter(
+        (a) => !!a && typeof a.id === "string" && typeof a.email === "string" && typeof a.lastSeenTs === "number",
+      )
+    : [];
+  return { v: 1, accounts, activeId: typeof raw.activeId === "string" ? raw.activeId : undefined };
+}
+
+/** Pure upsert: a NEW AccountsFile with `acct` recorded as the active login, newest first. */
+export function upsertActiveAccount(
+  f: AccountsFile,
+  acct: { id: string; email: string; tokenExpiresAt?: number },
+  nowSec: number,
+): AccountsFile {
+  const prev = f.accounts.find((a) => a.id === acct.id);
+  const entry: AccountInfo = {
+    id: acct.id,
+    email: acct.email,
+    lastSeenTs: nowSec,
+    tokenExpiresAt: acct.tokenExpiresAt ?? prev?.tokenExpiresAt,
+  };
+  const rest = f.accounts.filter((a) => a.id !== acct.id);
+  return { v: 1, accounts: [entry, ...rest].sort((a, b) => b.lastSeenTs - a.lastSeenTs), activeId: acct.id };
+}
+
+export function writeAccountsFile(f: AccountsFile, file = ACCOUNTS_FILE): void {
+  try {
+    atomicWrite(file, JSON.stringify(f));
   } catch {
     /* ignore */
   }

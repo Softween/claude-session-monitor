@@ -32,6 +32,13 @@ if [ -n "$vals" ] && [ "$vals" != "null" ]; then
     printf '%s' "$vals" > "$dir/limits.json.tmp" 2>/dev/null && mv "$dir/limits.json.tmp" "$dir/limits.json" 2>/dev/null
     hist="$dir/limits-history.jsonl"
     if [ ! -f "$hist" ] || [ -z "$(/usr/bin/find "$hist" -mmin -1 2>/dev/null)" ]; then
+      # Tag the point with the active account so multi-account charts stay
+      # attributed after a login switch. Only in this <=1/min branch: parsing
+      # the (possibly large) ~/.claude.json on every render would be too slow.
+      acct="$(/usr/bin/jq -r '.oauthAccount.accountUuid // empty' "$HOME/.claude.json" 2>/dev/null)"
+      if [ -n "$acct" ]; then
+        vals="$(printf '%s' "$vals" | /usr/bin/jq -c --arg a "$acct" '. + {acct:$a}' 2>/dev/null || printf '%s' "$vals")"
+      fi
       printf '%s\n' "$vals" >> "$hist" 2>/dev/null
     fi
   fi

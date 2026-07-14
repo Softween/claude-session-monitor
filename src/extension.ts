@@ -32,9 +32,14 @@ import {
   humanizeAge,
   readOfficialSnapshot,
   writeOfficialSnapshot,
+  officialUsageFileFor,
+  readAccountsFile,
+  upsertActiveAccount,
+  writeAccountsFile,
   MONITOR_DIR,
   PROJECTS_DIR,
   DEFAULT_ENTRYPOINTS,
+  type AccountsFile,
   type SessionView,
   type RecentTranscript,
   type TxInfo,
@@ -60,6 +65,11 @@ import {
   shortEffort,
   fmtTokensCompact,
   nextUsageBackoffSec,
+  accountPillLabels,
+  filterHistoryForAccount,
+  topSessionRows,
+  type AccountView,
+  type SessionTokenRow,
   type BurnEta,
   type GroupKey,
   type GroupMeta,
@@ -113,15 +123,17 @@ class SessionTree implements vscode.TreeDataProvider<Node> {
   private grouped = new Map<GroupKey, SessionView[]>();
   private tokenHogId: string | null = null;
   private tok5h: Record<string, number> = {};
+  private tot5h = 0;
 
   constructor(
     private readonly res: Map<number, ResStat>,
     private readonly hogThreshold: () => number,
   ) {}
 
-  setTokenInfo(hogId: string | null, tok5h: Record<string, number>): void {
+  setTokenInfo(hogId: string | null, tok5h: Record<string, number>, total5h: number): void {
     this.tokenHogId = hogId;
     this.tok5h = tok5h;
+    this.tot5h = total5h;
   }
 
   setData(views: SessionView[]): void {
@@ -169,24 +181,29 @@ class SessionTree implements vscode.TreeDataProvider<Node> {
       // kept lean and priority-ordered (survivors of a right-edge truncation
       // come first):
       //   1. sub-status ONLY when it adds info the group header/icon does not
-      //   2. model (varies per session — the thing the user most wants to see)
-      //   3. detail (age · cwd), then CPU/RAM, then the token-hog marker.
+      //   2. 5h tokens + share of this machine's window (the limit pressure
+      //      per chat — the thing the panel exists to make visible)
+      //   3. model, then detail (age · cwd), then CPU/RAM.
       // Effort is global (same for every session) so it lives in the view header.
       const segs: string[] = [];
       if (!isRedundantSub(v.sub)) segs.push(v.sub);
+      const tok = this.tok5h[v.sessionId];
+      const share = tok && this.tot5h > 0 ? Math.round((tok / this.tot5h) * 100) : 0;
+      if (tok && tok >= 10_000) {
+        const hog = v.sessionId === this.tokenHogId ? "💸 " : "";
+        segs.push(`${hog}${fmtTokensCompact(tok)}${share >= 1 ? ` (${share}%)` : ""}`);
+      }
       if (v.model) segs.push(shortModelName(v.model));
       if (v.detail) segs.push(v.detail);
       if (res) {
         const hog = res.cpu >= this.hogThreshold();
         segs.push(`${hog ? "🔥" : ""}CPU ${Math.round(res.cpu)}% · ${res.rssMb}MB`);
       }
-      if (v.sessionId === this.tokenHogId) segs.push("💸");
       item.description = segs.join(" · ");
 
       const resTip = res ? `\nCPU: ${Math.round(res.cpu)}%  RAM: ${res.rssMb}MB  (pid ${v.pid})` : "";
-      const tok = this.tok5h[v.sessionId];
       const tokTip = tok
-        ? `\ntokens (5h): ${fmtTokensCompact(tok)}${v.sessionId === this.tokenHogId ? "  💸 top consumer" : ""}`
+        ? `\ntokens (5h): ${fmtTokensCompact(tok)}${share >= 1 ? ` · ${share}% of this Mac's 5h total` : ""}${v.sessionId === this.tokenHogId ? "  💸 top consumer" : ""}`
         : "";
       item.tooltip = v.tooltip + resTip + tokTip;
       item.contextValue = groupOf(v) === "ended" ? "session-ended" : "session";
@@ -261,6 +278,9 @@ interface LimitsPayload {
   tokens: TokenUsage | null; // rolling 5h / 7d token usage (proxy for limit pressure)
   eta: BurnEta | null; // burn-rate projection for the 5h window
   models: ModelRow[]; // 7d token share per model (+ rough cost where priced)
+  sessions: SessionTokenRow[]; // top 5h token consumers per session (this machine)
+  accounts: AccountView[]; // account switcher pills ([] until 2+ accounts are known)
+  accountNote: string | null; // honesty note when a non-active account is displayed
   usageNote: string | null; // honest status when the usage API is degraded
 }
 
@@ -276,19 +296,24 @@ interface OfficialUsage {
   ts: number;
 }
 
-// The keychain read spawns a `security` subprocess; with a 10s usage poll that
-// would be constant churn, so the token is cached and invalidated on 401/403.
-const TOKEN_TTL_SEC = 300;
-let cachedToken: { value: string; ts: number } | undefined;
-
-async function readClaudeTokenCached(): Promise<string | undefined> {
-  if (cachedToken && Date.now() / 1000 - cachedToken.ts < TOKEN_TTL_SEC) return cachedToken.value;
-  const t = await readClaudeToken();
-  if (t) cachedToken = { value: t, ts: Date.now() / 1000 };
-  return t;
+interface ClaudeCredentials {
+  token: string;
+  expiresAt?: number; // epoch ms the access token expires (from the keychain payload)
 }
 
-function readClaudeToken(): Promise<string | undefined> {
+// The keychain read spawns a `security` subprocess; with a 10s usage poll that
+// would be constant churn, so the credentials are cached and invalidated on 401/403.
+const TOKEN_TTL_SEC = 300;
+let cachedCreds: { creds: ClaudeCredentials; ts: number } | undefined;
+
+async function readClaudeCredentialsCached(): Promise<ClaudeCredentials | undefined> {
+  if (cachedCreds && Date.now() / 1000 - cachedCreds.ts < TOKEN_TTL_SEC) return cachedCreds.creds;
+  const c = await readClaudeCredentials();
+  if (c) cachedCreds = { creds: c, ts: Date.now() / 1000 };
+  return c;
+}
+
+function readClaudeCredentials(): Promise<ClaudeCredentials | undefined> {
   if (process.platform !== "darwin") return Promise.resolve(undefined);
   return new Promise((resolve) => {
     const user = process.env.USER || os.userInfo().username || "";
@@ -302,8 +327,13 @@ function readClaudeToken(): Promise<string | undefined> {
           return;
         }
         try {
-          const creds = JSON.parse(String(stdout).trim());
-          resolve(creds?.claudeAiOauth?.accessToken);
+          const oauth = JSON.parse(String(stdout).trim())?.claudeAiOauth;
+          const token = oauth?.accessToken;
+          if (!token || typeof token !== "string") {
+            resolve(undefined);
+            return;
+          }
+          resolve({ token, expiresAt: typeof oauth.expiresAt === "number" ? oauth.expiresAt : undefined });
         } catch {
           resolve(undefined);
         }
@@ -312,16 +342,37 @@ function readClaudeToken(): Promise<string | undefined> {
   });
 }
 
+// Which account is the active login? Claude Code writes it to ~/.claude.json
+// (oauthAccount) together with the keychain token, so parsing that once per
+// distinct token is enough — the file can be multi-MB, so never parse per poll.
+interface ActiveIdentity {
+  id: string;
+  email: string;
+}
+
+let identityCache: { token: string; identity: ActiveIdentity | undefined } | undefined;
+
+async function readActiveIdentity(token: string): Promise<ActiveIdentity | undefined> {
+  if (identityCache?.token === token) return identityCache.identity;
+  let identity: ActiveIdentity | undefined;
+  try {
+    const raw = await fs.promises.readFile(`${os.homedir()}/.claude.json`, "utf8");
+    const oa = JSON.parse(raw)?.oauthAccount;
+    if (oa && typeof oa.accountUuid === "string" && oa.accountUuid && typeof oa.emailAddress === "string") {
+      identity = { id: oa.accountUuid, email: oa.emailAddress };
+    }
+  } catch {
+    /* missing or unparsable — identity stays unknown */
+  }
+  identityCache = { token, identity };
+  return identity;
+}
+
 type UsageFetch =
   | { ok: true; usage: OfficialUsage }
   | { ok: false; status?: number; retryAfterSec?: number };
 
-async function fetchOfficialUsage(): Promise<UsageFetch> {
-  const token = await readClaudeTokenCached();
-  if (!token) {
-    log("usage: no keychain token");
-    return { ok: false };
-  }
+async function fetchOfficialUsage(token: string): Promise<UsageFetch> {
   try {
     const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
       headers: {
@@ -332,7 +383,6 @@ async function fetchOfficialUsage(): Promise<UsageFetch> {
       signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) {
-      if (res.status === 401 || res.status === 403) cachedToken = undefined; // token rotated -> re-read keychain
       log(`usage: HTTP ${res.status}`);
       const ra = parseInt(res.headers.get("retry-after") ?? "", 10);
       return { ok: false, status: res.status, retryAfterSec: Number.isFinite(ra) ? ra : undefined };
@@ -350,22 +400,33 @@ async function fetchOfficialUsage(): Promise<UsageFetch> {
   }
 }
 
+/** Which account the payload should describe, plus the pills to render. */
+interface AccountCtx {
+  accounts: AccountView[]; // [] when fewer than 2 accounts are known
+  selectedId: string | null;
+  activeId: string | null;
+  selectedStale: boolean;
+}
+
 function buildLimitsPayload(
   views: SessionView[],
   tokens: TokenUsage | null,
-  officialUsage: OfficialUsage | null,
+  officialUsage: OfficialUsage | null, // usage of the SELECTED account
   usageNote: string | null = null,
+  acctCtx: AccountCtx | null = null,
 ): LimitsPayload {
   const now = Date.now() / 1000;
   const gauges: Gauge[] = [];
   let model: string | null = null;
   let ts: number | null = null;
+  const selectedIsActive = !acctCtx || acctCtx.selectedId === acctCtx.activeId;
 
   if (officialUsage && officialUsage.gauges.length) {
     ts = officialUsage.ts;
     for (const g of officialUsage.gauges) gauges.push({ key: g.key, label: g.label, pct: g.pct, resetMs: g.resetMs });
-  } else {
+  } else if (selectedIsActive) {
     // Fallback: limits.json written by a terminal status line (if present).
+    // It always describes the active login, so never use it for another account.
     const lim = readLimits();
     if (lim) {
       ts = lim.ts ?? null;
@@ -379,11 +440,13 @@ function buildLimitsPayload(
 
   const official = gauges.some((g) => g.pct != null);
   // Extension-written points are always percent scale; statusline points may be 0-1.
-  const history = readLimitsHistory(240).map((p) => ({
-    t: typeof p.ts === "number" ? p.ts * 1000 : 0,
-    fh: p.src === "ext" ? clampPct(p.fh) : normPct(p.fh),
-    sd: p.src === "ext" ? clampPct(p.sd) : normPct(p.sd),
-  }));
+  const history = filterHistoryForAccount(readLimitsHistory(240), acctCtx?.selectedId ?? null, selectedIsActive).map(
+    (p) => ({
+      t: typeof p.ts === "number" ? p.ts * 1000 : 0,
+      fh: p.src === "ext" ? clampPct(p.fh) : normPct(p.fh),
+      sd: p.src === "ext" ? clampPct(p.sd) : normPct(p.sd),
+    }),
+  );
   const limited: LimitedHit[] = views
     .filter((v) => v.bucket === "limited")
     .map((v) => {
@@ -406,6 +469,24 @@ function buildLimitsPayload(
     }));
   }
 
+  let sessions: SessionTokenRow[] = [];
+  if (tokens?.bySession5h) {
+    const titles = new Map(views.map((v) => [v.sessionId, v.title]));
+    sessions = topSessionRows(tokens.bySession5h, titles, tokens.fiveHour);
+  }
+
+  let accountNote: string | null = null;
+  if (acctCtx && !selectedIsActive) {
+    if (acctCtx.selectedStale) {
+      accountNote =
+        "this account is not the active login and its stored token has expired — showing last-known data; log in with Claude Code once to refresh";
+    } else if (!official) {
+      accountNote = "no usage data captured for this account yet — it appears after its first background fetch";
+    } else {
+      accountNote = "not the active login — refreshed in the background with its stored token";
+    }
+  }
+
   return {
     type: "update",
     ts,
@@ -417,7 +498,12 @@ function buildLimitsPayload(
     tokens,
     eta,
     models,
-    usageNote,
+    sessions,
+    accounts: acctCtx?.accounts ?? [],
+    accountNote,
+    // API-status notes describe the ACTIVE login's fetch loop; suppress them
+    // while another account is displayed so they cannot be misattributed.
+    usageNote: selectedIsActive ? usageNote : null,
   };
 }
 
@@ -425,7 +511,10 @@ class LimitsView implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private pending?: LimitsPayload;
 
-  constructor(private readonly onRefresh: () => void) {}
+  constructor(
+    private readonly onRefresh: () => void,
+    private readonly onSelectAccount: (id: string) => void,
+  ) {}
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
@@ -433,6 +522,7 @@ class LimitsView implements vscode.WebviewViewProvider {
     view.webview.html = limitsHtml();
     view.webview.onDidReceiveMessage((m) => {
       if (m && m.type === "refresh") this.onRefresh();
+      else if (m && m.type === "selectAccount" && typeof m.id === "string") this.onSelectAccount(m.id);
     });
     if (this.pending) view.webview.postMessage(this.pending);
   }
@@ -464,13 +554,24 @@ function limitsHtml(): string {
   .greset { opacity:.7; font-size:11px; }
   .bar { height:8px; border-radius:4px; background: var(--vscode-editorWidget-background, rgba(127,127,127,.18)); overflow:hidden; }
   .fill { height:100%; border-radius:4px; transition: width .4s ease; }
-  .segs { display:flex; gap:3px; margin:3px 0; }
-  .seg { flex:1; height:9px; border-radius:2px; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
+  .segs { display:flex; gap:2px; margin:3px 0; }
+  .seg { flex:1; height:10px; border-radius:2px; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
+  .accts { display:flex; flex-wrap:wrap; gap:5px; margin:0 0 10px 0; }
+  .pill { display:inline-flex; align-items:center; gap:5px; max-width:100%; overflow:hidden; white-space:nowrap;
+    padding:2px 9px; border-radius:999px; cursor:pointer; font-size:11px; user-select:none;
+    border:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35));
+    background:transparent; color:var(--vscode-foreground); opacity:.72; }
+  .pill:hover { opacity:1; }
+  .pill.sel { background: var(--vscode-badge-background, rgba(127,127,127,.25));
+    color: var(--vscode-badge-foreground, var(--vscode-foreground)); opacity:1; border-color:transparent; font-weight:600; }
+  .adot { width:7px; height:7px; border-radius:50%; background:var(--vscode-charts-green,#4caf50); flex:none; }
   .spark { margin-top:8px; }
   .spark h4 { margin:0 0 4px 0; font-size:11px; opacity:.7; font-weight:600; }
-  .legend { font-size:11px; opacity:.7; display:flex; gap:12px; margin-top:2px; }
+  .legend { font-size:11px; opacity:.7; display:flex; gap:12px; margin-top:2px; flex-wrap:wrap; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; vertical-align:middle; }
-  svg { width:100%; height:48px; display:block; }
+  svg { width:100%; display:block; }
+  .spark svg { height:56px; }
+  .tokchart { height:40px; }
   .foot { margin-top:8px; font-size:11px; opacity:.55; }
   .sec { margin-top:10px; }
   .sec h4 { margin:0 0 4px 0; font-size:11px; opacity:.7; font-weight:600; }
@@ -520,17 +621,29 @@ function fmtLeft(ms){
 function spark(history, eta){
   const pts = (history||[]).filter(p=>p.fh!=null || p.sd!=null);
   if(pts.length < 2) return '';
-  const W=300, H=48, n=pts.length;
+  const W=300, H=56, n=pts.length;
   // History points arrive ~1/min, so index ~= minutes; when a projection is
   // shown, the last 15% of the width is reserved for it.
   const spanW = eta ? W*0.85 : W;
   const x = i => (i/(n-1))*spanW;
   const y = v => H - (Math.max(0,Math.min(100,v))/100)*(H-4) - 2;
+  let grid='';
+  for(const gv of [25,50,75]) grid += '<line x1="0" y1="'+y(gv).toFixed(1)+'" x2="'+W+'" y2="'+y(gv).toFixed(1)+'" stroke="rgba(127,127,127,.18)" stroke-width="1" stroke-dasharray="2,4"/>';
   const line = (key,col) => {
     let d='', started=false;
     pts.forEach((p,i)=>{ const v=p[key]; if(v==null) return; d += (started?'L':'M')+x(i).toFixed(1)+','+y(v).toFixed(1)+' '; started=true; });
     return d ? '<polyline fill="none" stroke="'+col+'" stroke-width="1.5" points="'+d.replace(/[ML]/g,' ').trim()+'"/>' : '';
   };
+  // Soft area fill under the 5h line so the busy periods read at a glance.
+  const fhIdx = [];
+  pts.forEach((p,i)=>{ if(p.fh!=null) fhIdx.push(i); });
+  let area='';
+  if(fhIdx.length > 1){
+    let d = 'M'+x(fhIdx[0]).toFixed(1)+','+y(pts[fhIdx[0]].fh).toFixed(1);
+    for(const i of fhIdx.slice(1)) d += ' L'+x(i).toFixed(1)+','+y(pts[i].fh).toFixed(1);
+    d += ' L'+x(fhIdx[fhIdx.length-1]).toFixed(1)+','+H+' L'+x(fhIdx[0]).toFixed(1)+','+H+' Z';
+    area = '<path d="'+d+'" fill="'+C_BLUE+'" opacity="0.10"/>';
+  }
   let proj='';
   if(eta){
     const fhPts = pts.filter(p=>p.fh!=null);
@@ -544,11 +657,14 @@ function spark(history, eta){
       proj = '<polyline fill="none" stroke="'+(eta.beforeReset?C_BAD:C_BLUE)+'" stroke-width="1.5" stroke-dasharray="3,3" points="'+d.replace(/[ML]/g,' ').trim()+'"/>';
     }
   }
-  return '<div class="spark"><h4>Usage over time</h4><svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'
-    + line('fh', C_BLUE) + line('sd', C_WARN) + proj
+  const spanH = (pts[n-1].t - pts[0].t)/3600e3;
+  const spanLabel = spanH >= 0.1 ? ('last '+(spanH<10?spanH.toFixed(1):Math.round(spanH))+'h') : '';
+  return '<div class="spark"><h4>Usage over time <span style="opacity:.5;font-weight:400">· 0-100%</span></h4><svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'
+    + grid + area + line('fh', C_BLUE) + line('sd', C_WARN) + proj
     + '</svg><div class="legend"><span><span class="dot" style="background:'+C_BLUE+'"></span>5-hour</span>'
     + '<span><span class="dot" style="background:'+C_WARN+'"></span>7-day</span>'
     + (eta ? '<span>┄ projected</span>' : '')
+    + (spanLabel ? '<span>'+spanLabel+'</span>' : '')
     + '</div></div>';
 }
 function fmtDur(ms){
@@ -563,6 +679,63 @@ function etaLine(eta){
   const cls = eta.beforeReset ? 'eta bad' : 'eta';
   const tail = eta.beforeReset ? ' — before reset ⚠️' : ' (after reset, safe)';
   return '<div class="'+cls+'">at this rate (+'+eta.perHour.toFixed(1)+'%/h): full in '+fmtDur(eta.fullAtMs-Date.now())+tail+'</div>';
+}
+function fmtAge(s){
+  if(s<90) return s+'s';
+  if(s<5400) return Math.round(s/60)+'m';
+  if(s<172800) return (s/3600).toFixed(1)+'h';
+  return Math.round(s/86400)+'d';
+}
+function acctRow(accounts){
+  if(!accounts || accounts.length < 2) return '';
+  let h='<div class="accts">';
+  for(const a of accounts){
+    const age = a.ts ? Math.max(0, Math.round(Date.now()/1000 - a.ts)) : null;
+    const tip = a.email + (a.active ? ' — active login' : '')
+      + (a.stale ? ' — token expired, log in once to refresh' : '')
+      + (age!=null ? ' — updated '+fmtAge(age)+' ago' : ' — no data yet')
+      + ' — click to view';
+    h += '<span class="pill'+(a.selected?' sel':'')+'" data-id="'+esc(a.id)+'" title="'+esc(tip)+'">'
+      + (a.active ? '<span class="adot"></span>' : '')
+      + esc(a.label)
+      + (a.stale ? ' ⚠' : '')
+      + '</span>';
+  }
+  h += '</div>';
+  return h;
+}
+// 20 segments of 5% each; the boundary segment is partially filled, so the bar
+// resolves single percent points instead of 10% jumps.
+const NSEG = 20;
+function segRow(p){
+  const span = 100/NSEG;
+  let segs='';
+  for(let i=0;i<NSEG;i++){
+    const fill = p==null ? 0 : Math.max(0, Math.min(1, (p - i*span)/span));
+    let st='';
+    if(fill>=1) st = 'background:'+color(p);
+    else if(fill>0){
+      const cut = (fill*100).toFixed(0)+'%';
+      st = 'background:linear-gradient(90deg,'+color(p)+' '+cut+', var(--vscode-editorWidget-background, rgba(127,127,127,.2)) '+cut+')';
+    }
+    segs += '<div class="seg" style="'+st+'"></div>';
+  }
+  return '<div class="segs">'+segs+'</div>';
+}
+function fmtPct(p){
+  if(p==null) return '?';
+  return p < 10 ? (Math.round(p*10)/10).toString() : String(Math.round(p));
+}
+function sessionSection(rows){
+  if(!rows || !rows.length) return '';
+  let h='<div class="sec"><h4>Sessions (5h tokens)</h4>';
+  for(const s of rows){
+    h += '<div class="mrow"><span class="mname" title="'+esc(s.label)+'">'+esc(s.label)+'</span>'
+      + '<span class="mbar"><span class="mfill" style="width:'+Math.max(2,s.pct)+'%;background:'+C_OK+'"></span></span>'
+      + '<span class="mval">'+s.pct+'% · '+fmtTokens(s.tokens)+'</span></div>';
+  }
+  h += '<div class="legend"><span>share of this Mac\\'s 5h token total</span></div></div>';
+  return h;
 }
 function modelSection(models){
   if(!models || !models.length) return '';
@@ -584,7 +757,7 @@ function fmtTokens(n){
   if(n<1e6) return (n/1e3).toFixed(n<1e4?1:0)+'K';
   return (n/1e6).toFixed(2)+'M';
 }
-function tokenSection(t){
+function tokenSection(t, multiAcct){
   if(!t) return '';
   const hrs = t.hourly||[];
   const max = Math.max(1, ...hrs.map(h=>h.tokens||0));
@@ -594,36 +767,41 @@ function tokenSection(t){
   return '<div class="sec"><h4>Token usage (in + out + cache-write)</h4>'
     + '<div class="grow"><span class="glabel">Last 5h</span><span class="gpct">'+fmtTokens(t.fiveHour)+'</span></div>'
     + '<div class="grow"><span class="glabel">Last 7d</span><span class="gpct">'+fmtTokens(t.sevenDay)+'</span></div>'
-    + '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'+bars+'</svg>'
-    + '<div class="legend"><span>hourly, last 48h</span></div></div>';
+    + '<svg class="tokchart" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'+bars+'</svg>'
+    + '<div class="legend"><span>hourly, last 48h</span>'+(multiAcct?'<span>all logins on this Mac</span>':'')+'</div></div>';
 }
 function render(){
   const root = document.getElementById('root');
   if(!last){ return; }
   let h='';
-  // Official 5h / 7d gauges: only present when a terminal status line feeds limits.json.
+  const multiAcct = !!(last.accounts && last.accounts.length > 1);
+  h += acctRow(last.accounts);
+  // Official 5h / 7d gauges: live for the selected account (or the statusline fallback).
   if(last.official){
     for(const g of last.gauges){
       const p = g.pct;
-      const used = p==null ? 0 : Math.round(p);
-      const left = p==null ? 100 : Math.max(0, 100 - used);
-      const filled = p==null ? 0 : Math.max(0, Math.min(10, Math.round(p/10)));
-      let segs='';
-      for(let i=0;i<10;i++) segs += '<div class="seg" style="'+(i<filled?('background:'+color(p)):'')+'"></div>';
+      const usedStr = fmtPct(p);
+      // Derive "left" from the DISPLAYED used value so the two always sum to 100
+      // (independent rounding could show 34% used / 67% left on p=33.5).
+      const leftStr = p==null ? '100' : String(Math.max(0, Math.round((100 - Number(usedStr))*10)/10));
       h += '<div class="gauge"><div class="grow"><span class="glabel">'+esc(g.label)+'</span>'
-         + '<span class="gpct">'+used+'% used</span></div>'
-         + '<div class="segs">'+segs+'</div>'
-         + '<div class="greset"><b>'+left+'% left</b>'+(g.resetMs?(' · '+fmtLeft(g.resetMs)):'')+'</div></div>';
+         + '<span class="gpct">'+usedStr+'% used</span></div>'
+         + segRow(p)
+         + '<div class="greset"><b>'+leftStr+'% left</b>'+(g.resetMs?(' · '+fmtLeft(g.resetMs)):'')+'</div></div>';
       if((g.key==='session'||g.key==='5h')) h += etaLine(last.eta);
     }
     if(last.ts){
-      const age = Math.round(Date.now()/1000 - last.ts);
-      h += '<div class="foot">official account usage · updated '+age+'s ago</div>';
+      const age = Math.max(0, Math.round(Date.now()/1000 - last.ts));
+      h += '<div class="foot">official account usage · updated '+fmtAge(age)+' ago</div>';
     }
+  }
+  if(last.accountNote){
+    h += '<div class="note">'+esc(last.accountNote)+'</div>';
   }
   h += spark(last.history, last.eta);
   // Token usage (real proxy; always shown when available).
-  h += tokenSection(last.tokens);
+  h += tokenSection(last.tokens, multiAcct);
+  h += sessionSection(last.sessions);
   h += modelSection(last.models);
   // Reactive limit hits: always real, derived from session transcripts (429).
   if(last.limited && last.limited.length){
@@ -639,7 +817,7 @@ function render(){
     h += '<div class="note">'+esc(last.usageNote)+'</div>';
   }
   // Honest note when the official live gauges are unavailable (VS Code app mode).
-  if(!last.official && !last.usageNote){
+  if(!last.official && !last.usageNote && !last.accountNote){
     h += '<div class="note">Official 5h / 7d usage unavailable (needs macOS keychain access to "Claude Code-credentials" + network). The token-usage proxy below still works; sessions also appear under "Active limit hits" the moment they hit a limit.</div>';
   }
   root.innerHTML = h;
@@ -658,6 +836,13 @@ refreshBtn.addEventListener('click', () => {
   refreshBtn.classList.add('spin');
   spinDeadline = Date.now() + 8000;
 });
+// Account pills are re-rendered every second, so the click handler is
+// delegated from the stable root node instead of being attached per pill.
+document.getElementById('root').addEventListener('click', (ev) => {
+  let el = ev.target;
+  while(el && el !== ev.currentTarget && !(el.classList && el.classList.contains('pill'))) el = el.parentElement;
+  if(el && el.dataset && el.dataset.id) vscodeApi.postMessage({ type: 'selectAccount', id: el.dataset.id });
+});
 window.addEventListener('message', e => {
   if(e.data && e.data.type==='update'){ last = e.data; stopSpinIfDone(); render(); }
 });
@@ -674,6 +859,7 @@ setInterval(() => { stopSpinIfDone(); render(); }, 1000); // keep countdowns liv
 export function activate(ctx: vscode.ExtensionContext): void {
   const cfg = () => vscode.workspace.getConfiguration("claudeSessionMonitor");
   const workspaceCwd = () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  const trackAllAccounts = () => cfg().get<boolean>("trackAllAccounts", true);
 
   const resourceCache = new Map<number, ResStat>();
   const tree = new SessionTree(resourceCache, () => cfg().get<number>("cpuHogThreshold", 60));
@@ -683,7 +869,25 @@ export function activate(ctx: vscode.ExtensionContext): void {
   });
   ctx.subscriptions.push(treeView);
 
-  const limitsView = new LimitsView(() => vscode.commands.executeCommand("claudeSessionMonitor.refreshUsage"));
+  // Multi-account state: every account seen as the active login is remembered
+  // (registry file shared across windows; tokens in SecretStorage), and the
+  // webview can pin the panel to any of them.
+  let accountsFile: AccountsFile = readAccountsFile();
+  let selectedAccountId = ctx.globalState.get<string | null>("selectedAccountId", null);
+  const usageByAccount = new Map<string, { usage: OfficialUsage | null; stale: boolean }>();
+  let othersInflight = false;
+  let lastOthersCheck = 0;
+
+  const limitsView = new LimitsView(
+    () => vscode.commands.executeCommand("claudeSessionMonitor.refreshUsage"),
+    (id) => {
+      // Clicking the active account returns to follow-the-login mode; any other
+      // account pins the panel to it.
+      selectedAccountId = id === (accountsFile.activeId ?? null) ? null : id;
+      void ctx.globalState.update("selectedAccountId", selectedAccountId);
+      pushUsagePayload();
+    },
+  );
   ctx.subscriptions.push(
     vscode.window.registerWebviewViewProvider("claudeSessionMonitor.limits", limitsView),
   );
@@ -709,10 +913,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastUsageCheck = 0;
   let usageFetchInflight = false;
 
-  // Boot from the shared snapshot so gauges render immediately (with an honest
+  // Boot from the shared snapshots so gauges render immediately (with an honest
   // "updated Xs ago" age) even before the first live fetch succeeds.
   const bootSnap = readOfficialSnapshot();
   if (bootSnap?.gauges.length && bootSnap.ts) officialUsage = { gauges: bootSnap.gauges, ts: bootSnap.ts };
+  for (const a of accountsFile.accounts) {
+    const s = readOfficialSnapshot(officialUsageFileFor(a.id));
+    if (s?.gauges.length && s.ts) usageByAccount.set(a.id, { usage: { gauges: s.gauges, ts: s.ts }, stale: !!s.tokenStale });
+  }
   let firstPaintDone = false;
   let needsYouOnly = false;
   let workspaceOnlyOverride: boolean | undefined;
@@ -829,7 +1037,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       usageNote = null;
     }
     if (force) {
-      cachedToken = undefined; // re-read keychain: the account may have changed
+      cachedCreds = undefined; // re-read keychain: the account may have changed
       usageNote = "refreshing usage from Anthropic…";
     }
     const fresh = !force && !!snap && now - snap.ts < usageEverySec;
@@ -843,7 +1051,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
     writeOfficialSnapshot({ ...(snap ?? { gauges: [], ts: 0 }), attemptTs: now });
     if (force) pushUsagePayload(); // show the "refreshing…" note right away
     try {
-      const r = await fetchOfficialUsage();
+      const creds = await readClaudeCredentialsCached();
+      if (!creds) {
+        log("usage: no keychain token");
+        if (force)
+          usageNote = "not signed in to Claude Code on this Mac (no keychain credentials) — log in, then refresh";
+        return;
+      }
+      const r = await fetchOfficialUsage(creds.token);
+      if (!r.ok && (r.status === 401 || r.status === 403)) cachedCreds = undefined; // token rotated -> re-read keychain
       const nowSec = Date.now() / 1000;
       const cur = readOfficialSnapshot() ?? { gauges: [], ts: 0 };
       if (r.ok) {
@@ -851,10 +1067,22 @@ export function activate(ctx: vscode.ExtensionContext): void {
         usageNote = null;
         writeOfficialSnapshot({ gauges: r.usage.gauges, ts: r.usage.ts, attemptTs: nowSec }); // clears backoff
         log(`usage ok${force ? " (manual)" : ""}: ${r.usage.gauges.map((g) => `${g.key}=${Math.round(g.pct)}`).join(" ")}`);
+        // Record which account this usage belongs to: registry entry, per-account
+        // snapshot, and (when enabled) the token vault that lets the extension
+        // keep refreshing this account after the user logs into another one.
+        const ident = (await readActiveIdentity(creds.token)) ?? { id: "default", email: "this account" };
+        accountsFile = upsertActiveAccount(readAccountsFile(), { ...ident, tokenExpiresAt: creds.expiresAt }, nowSec);
+        writeAccountsFile(accountsFile);
+        usageByAccount.set(ident.id, { usage: r.usage, stale: false });
+        writeOfficialSnapshot({ gauges: r.usage.gauges, ts: r.usage.ts, attemptTs: nowSec }, officialUsageFileFor(ident.id));
+        if (trackAllAccounts()) {
+          void ctx.secrets.store(`csm.token.${ident.id}`, creds.token).then(undefined, () => {});
+        }
         const g5 = r.usage.gauges.find((g) => g.key === "session");
         const g7 = r.usage.gauges.find((g) => g.key === "weekly");
         appendLimitsHistory({
           src: "ext",
+          acct: ident.id,
           fh: g5?.pct ?? null,
           fh_reset: g5?.resetMs ?? null,
           sd: g7?.pct ?? null,
@@ -878,13 +1106,146 @@ export function activate(ctx: vscode.ExtensionContext): void {
       log("usage rejected: " + String(e));
     } finally {
       usageFetchInflight = false;
+      pushUsagePayload(); // also on the no-credentials early return
     }
-    pushUsagePayload();
+  }
+
+  /**
+   * Background refresh for accounts that are NOT the active login, using their
+   * stored tokens — slower cadence than the active poll, per-account snapshot
+   * files for cross-window single-flight, and honest staleness marking when a
+   * token has expired (Anthropic tokens outlive a logout for a few hours, so
+   * right after switching accounts this keeps the other account live).
+   */
+  async function pollOtherAccounts(force: boolean): Promise<void> {
+    if (othersInflight || !trackAllAccounts()) return;
+    const activeId = accountsFile.activeId;
+    const others = accountsFile.accounts.filter((a) => a.id !== activeId);
+    if (!others.length) return;
+    othersInflight = true;
+    let changed = false;
+    try {
+      const cadence = Math.max(120, cfg().get<number>("usagePollSeconds", 30) * 2);
+      for (const a of others) {
+        const file = officialUsageFileFor(a.id);
+        const snap = readOfficialSnapshot(file);
+        const nowSec = Date.now() / 1000;
+        const known = usageByAccount.get(a.id);
+        if (snap?.gauges.length && snap.ts && (!known?.usage || snap.ts > known.usage.ts)) {
+          usageByAccount.set(a.id, { usage: { gauges: snap.gauges, ts: snap.ts }, stale: !!snap.tokenStale });
+          changed = true; // another window fetched it
+        }
+        if (a.tokenExpiresAt != null && Date.now() > a.tokenExpiresAt) {
+          if (snap && !snap.tokenStale) writeOfficialSnapshot({ ...snap, tokenStale: true }, file);
+          const cur = usageByAccount.get(a.id);
+          if (cur && !cur.stale) {
+            usageByAccount.set(a.id, { usage: cur.usage, stale: true });
+            changed = true;
+          }
+          continue; // token is known-dead: don't burn a request on a guaranteed 401
+        }
+        const freshEnough = !force && !!snap && nowSec - snap.ts < cadence;
+        const attempted = !force && !!snap?.attemptTs && nowSec - snap.attemptTs < Math.min(60, cadence);
+        const inBackoff = !force && !!snap?.backoffUntil && nowSec < snap.backoffUntil;
+        if (freshEnough || attempted || inBackoff) continue;
+        let token: string | undefined;
+        try {
+          token = await ctx.secrets.get(`csm.token.${a.id}`);
+        } catch {
+          token = undefined;
+        }
+        if (!token) {
+          const cur = usageByAccount.get(a.id);
+          if (cur && !cur.stale) {
+            usageByAccount.set(a.id, { usage: cur.usage, stale: true });
+            changed = true;
+          }
+          continue;
+        }
+        writeOfficialSnapshot({ ...(snap ?? { gauges: [], ts: 0 }), attemptTs: nowSec }, file);
+        const r = await fetchOfficialUsage(token);
+        const now2 = Date.now() / 1000;
+        const cur2 = readOfficialSnapshot(file) ?? { gauges: [], ts: 0 };
+        if (r.ok) {
+          usageByAccount.set(a.id, { usage: r.usage, stale: false });
+          writeOfficialSnapshot({ gauges: r.usage.gauges, ts: r.usage.ts, attemptTs: now2 }, file);
+          changed = true;
+          log(`usage ok (acct ${a.email}): ${r.usage.gauges.map((g) => `${g.key}=${Math.round(g.pct)}`).join(" ")}`);
+        } else if (r.status === 401 || r.status === 403) {
+          // Token revoked/expired server-side: keep last-known data, mark stale,
+          // and retry no sooner than 30 minutes (a re-login refreshes instantly).
+          writeOfficialSnapshot(
+            { ...cur2, attemptTs: now2, backoffUntil: now2 + 1800, backoffSec: 1800, tokenStale: true },
+            file,
+          );
+          const cur = usageByAccount.get(a.id);
+          usageByAccount.set(a.id, { usage: cur?.usage ?? null, stale: true });
+          changed = true;
+          log(`usage acct ${a.email}: token rejected (${r.status})`);
+        } else if (r.status === 429) {
+          const b = nextUsageBackoffSec(cur2.backoffSec, r.retryAfterSec);
+          writeOfficialSnapshot({ ...cur2, attemptTs: now2, backoffUntil: now2 + b, backoffSec: b }, file);
+        }
+      }
+    } catch (e) {
+      log("pollOtherAccounts error: " + String(e));
+    } finally {
+      othersInflight = false;
+    }
+    if (changed) pushUsagePayload();
+  }
+
+  /**
+   * Resolve which account the panel shows and the pill row to render.
+   * Selection follows the active login unless the user pinned another account;
+   * a pin that catches up with the active login dissolves back to follow mode.
+   */
+  function currentAccountCtx(): AccountCtx & { usage: OfficialUsage | null } {
+    const activeId = accountsFile.activeId ?? null;
+    const track = trackAllAccounts();
+    if (activeId && officialUsage) usageByAccount.set(activeId, { usage: officialUsage, stale: false });
+    if (selectedAccountId && selectedAccountId === activeId) {
+      selectedAccountId = null;
+      void ctx.globalState.update("selectedAccountId", null);
+    }
+    // A pin only holds while multi-account tracking is on: with tracking off the
+    // pinned account would never refresh again, so the panel follows the active
+    // login instead (the pin itself is kept for when tracking is re-enabled).
+    const selId =
+      track && selectedAccountId && accountsFile.accounts.some((a) => a.id === selectedAccountId)
+        ? selectedAccountId
+        : activeId;
+    const list = track ? accountsFile.accounts : accountsFile.accounts.filter((a) => a.id === activeId);
+    const labels = accountPillLabels(list.map((a) => a.email));
+    const accounts: AccountView[] = list.map((a, i) => {
+      const e = usageByAccount.get(a.id);
+      return {
+        id: a.id,
+        email: a.email,
+        label: labels[i],
+        active: a.id === activeId,
+        selected: a.id === selId,
+        ts: e?.usage?.ts ?? null,
+        stale:
+          a.id === activeId
+            ? false
+            : (e?.stale ?? false) || (a.tokenExpiresAt != null && Date.now() > a.tokenExpiresAt),
+      };
+    });
+    const usage = selId === activeId ? officialUsage : (selId && usageByAccount.get(selId)?.usage) || null;
+    return {
+      accounts: accounts.length > 1 ? accounts : [],
+      selectedId: selId,
+      activeId,
+      selectedStale: accounts.find((v) => v.id === selId)?.stale ?? false,
+      usage,
+    };
   }
 
   function pushUsagePayload(): void {
     try {
-      limitsView.update(buildLimitsPayload(lastViews, tokenUsage, officialUsage, usageNote));
+      const c = currentAccountCtx();
+      limitsView.update(buildLimitsPayload(lastViews, tokenUsage, c.usage, usageNote, c));
       updateStatusBar(statusBar, lastViews, resourceCache, officialUsage);
     } catch {
       /* ignore */
@@ -932,6 +1293,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
       void pollUsage(false);
     }
 
+    // Non-active accounts: pick up registry changes other windows wrote, then
+    // refresh their usage in the background on a slower cadence.
+    if (now - lastOthersCheck > 30) {
+      lastOthersCheck = now;
+      accountsFile = readAccountsFile();
+      void pollOtherAccounts(false);
+    }
+
     const wsOnly =
       workspaceOnlyOverride !== undefined ? workspaceOnlyOverride : c.get<boolean>("workspaceOnly", false);
 
@@ -967,16 +1336,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const top = Object.entries(tokenUsage.bySession5h).sort((a, b) => b[1] - a[1])[0];
       if (top && top[1] >= 200_000 && top[1] >= tokenUsage.fiveHour * 0.25) hogId = top[0];
     }
-    tree.setTokenInfo(hogId, tokenUsage?.bySession5h ?? {});
+    tree.setTokenInfo(hogId, tokenUsage?.bySession5h ?? {}, tokenUsage?.fiveHour ?? 0);
 
     tree.setData(views);
-    updateStatusBar(statusBar, views, resourceCache, officialUsage);
     updateAux(treeView, views, resourceCache, needsYouOnly);
-    try {
-      limitsView.update(buildLimitsPayload(views, tokenUsage, officialUsage, usageNote));
-    } catch {
-      /* ignore */
-    }
+    pushUsagePayload();
 
     maybeScheduleAutoResume(views);
 
@@ -1205,6 +1569,42 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claudeSessionMonitor.refreshUsage", async () => {
       vscode.window.setStatusBarMessage("Claude Sessions: refreshing usage…", 2500);
       await pollUsage(true);
+      await pollOtherAccounts(true);
+    }),
+    vscode.commands.registerCommand("claudeSessionMonitor.forgetOtherAccounts", async () => {
+      accountsFile = readAccountsFile(); // another window may have a fresher registry
+      const keepId = accountsFile.activeId;
+      if (!keepId) {
+        vscode.window.showWarningMessage(
+          "Claude Sessions: the active account is not known yet — try again after the next usage refresh.",
+        );
+        return;
+      }
+      const drop = accountsFile.accounts.filter((a) => a.id !== keepId);
+      for (const a of drop) {
+        try {
+          await ctx.secrets.delete(`csm.token.${a.id}`);
+        } catch {
+          /* ignore */
+        }
+        try {
+          fs.unlinkSync(officialUsageFileFor(a.id));
+        } catch {
+          /* may not exist */
+        }
+        usageByAccount.delete(a.id);
+      }
+      const active = accountsFile.accounts.find((a) => a.id === keepId);
+      accountsFile = { v: 1, accounts: active ? [active] : [], activeId: keepId };
+      writeAccountsFile(accountsFile);
+      selectedAccountId = null;
+      void ctx.globalState.update("selectedAccountId", null);
+      vscode.window.showInformationMessage(
+        drop.length
+          ? `Claude Sessions: forgot ${drop.length} other account(s) and deleted their stored tokens.`
+          : "Claude Sessions: no other accounts stored.",
+      );
+      pushUsagePayload();
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.focusNextNeedsYou", () => {
       const order: Record<string, number> = { limited: 0, waiting: 1, done: 2 };

@@ -651,7 +651,6 @@ function limitsHtml(): string {
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; vertical-align:middle; }
   svg { width:100%; display:block; }
   .spark svg { height:56px; }
-  .tokchart { height:40px; }
   .foot { margin-top:8px; font-size:11px; opacity:.55; }
   .sec { margin-top:10px; }
   .sec h4 { margin:0 0 4px 0; font-size:11px; opacity:.7; font-weight:600; }
@@ -839,16 +838,14 @@ function fmtTokens(n){
 }
 function tokenSection(t, multiAcct){
   if(!t) return '';
-  const hrs = t.hourly||[];
-  const max = Math.max(1, ...hrs.map(h=>h.tokens||0));
-  const W=300,H=40,n=hrs.length||1, bw=W/n;
-  let bars='';
-  hrs.forEach((h,i)=>{ const bh=(h.tokens/max)*(H-2); bars+='<rect x="'+(i*bw).toFixed(1)+'" y="'+(H-bh).toFixed(1)+'" width="'+(bw*0.8).toFixed(1)+'" height="'+Math.max(0,bh).toFixed(1)+'" fill="'+C_BLUE+'"/>'; });
+  // Totals only — the 48h hourly bar chart was dropped as visual noise (same
+  // reasoning as the 1.7.0 heatmap removal): it cost vertical space without
+  // informing any decision the panel supports.
   return '<div class="sec"><h4>Token usage (in + out + cache-write)</h4>'
     + '<div class="grow"><span class="glabel">Last 5h</span><span class="gpct">'+fmtTokens(t.fiveHour)+'</span></div>'
     + '<div class="grow"><span class="glabel">Last 7d</span><span class="gpct">'+fmtTokens(t.sevenDay)+'</span></div>'
-    + '<svg class="tokchart" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'+bars+'</svg>'
-    + '<div class="legend"><span>hourly, last 48h</span>'+(multiAcct?'<span>all logins on this Mac</span>':'')+'</div></div>';
+    + (multiAcct?'<div class="legend"><span>all logins on this Mac</span></div>':'')
+    + '</div>';
 }
 function render(){
   const root = document.getElementById('root');

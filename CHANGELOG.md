@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 1.9.1
+
+- Removed the 48h hourly token bar chart from the usage panel — it took vertical space without informing any decision (same reasoning as the 1.7.0 heatmap removal). The Last 5h / Last 7d totals stay.
+
 ## 1.9.0
 
 - **The session list is a real table now.** The Sessions view moved from a native tree to a data grid: fixed column tracks (state · session · 5h tok · % · model · dir · age · cpu · mem), all numerics in the editor's monospace with tabular figures and right alignment — values update strictly in place, nothing dances. Each row's token cell carries a hairline bar showing that chat's share of the machine's 5h total (the top consumer's bar is highlighted), CPU hogs tint red, stalled workers get a warning ring on their state dot, and low-priority columns collapse first on narrow panels.

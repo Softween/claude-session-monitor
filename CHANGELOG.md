@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 1.9.2
+
+- The usage panel now folds: "Usage over time", "Sessions (5h tokens)" and "Models (7d share)" are collapsible sections (click the header; state is remembered). Models starts collapsed, and a collapsed header shows its key figure inline (top session / top model). Token usage shrank to a single "Tokens · 5h X · 7d Y" line. Net effect: the panel fits in well under half the sidebar by default, and one click per section takes it down to headers only.
+
 ## 1.9.1
 
 - Removed the 48h hourly token bar chart from the usage panel — it took vertical space without informing any decision (same reasoning as the 1.7.0 heatmap removal). The Last 5h / Last 7d totals stay.

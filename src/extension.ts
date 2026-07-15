@@ -652,8 +652,13 @@ function limitsHtml(): string {
   svg { width:100%; display:block; }
   .spark svg { height:56px; }
   .foot { margin-top:8px; font-size:11px; opacity:.55; }
-  .sec { margin-top:10px; }
+  .sec { margin-top:8px; }
   .sec h4 { margin:0 0 4px 0; font-size:11px; opacity:.7; font-weight:600; }
+  .sech { display:flex; align-items:baseline; gap:6px; cursor:pointer; user-select:none; padding:1px 0; }
+  .sech h4 { margin:0; }
+  .sech:hover h4 { opacity:1; }
+  .chev { font-size:9px; opacity:.55; width:9px; flex:none; }
+  .hint { font-size:10px; opacity:.5; margin-left:auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:55%; font-weight:400; }
   .hit { padding:4px 0; border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.2)); }
   .hitt { font-weight:600; }
   .note { margin-top:10px; font-size:11px; opacity:.6; line-height:1.4; }
@@ -679,6 +684,7 @@ function limitsHtml(): string {
   <div class="topbar"><span id="refreshBtn" class="refresh" title="Re-fetch usage from Anthropic now (use after switching Claude accounts)"><span class="ic">⟳</span> Refresh usage</span></div>
   <div id="root"><div class="empty">Waiting for usage-limit data… (reload the window once so the status line starts reporting)</div></div>
 <script nonce="${nonce}">
+const vscodeApi = acquireVsCodeApi();
 const C_OK = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-green') || '#4caf50';
 const C_WARN = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-yellow') || '#e6b800';
 const C_BAD = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-red') || '#f14c4c';
@@ -738,7 +744,7 @@ function spark(history, eta){
   }
   const spanH = (pts[n-1].t - pts[0].t)/3600e3;
   const spanLabel = spanH >= 0.1 ? ('last '+(spanH<10?spanH.toFixed(1):Math.round(spanH))+'h') : '';
-  return '<div class="spark"><h4>Usage over time <span style="opacity:.5;font-weight:400">· 0-100%</span></h4><svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'
+  return '<div class="spark"><svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'
     + grid + area + line('fh', C_BLUE) + line('sd', C_WARN) + proj
     + '</svg><div class="legend"><span><span class="dot" style="background:'+C_BLUE+'"></span>5-hour</span>'
     + '<span><span class="dot" style="background:'+C_WARN+'"></span>7-day</span>'
@@ -805,28 +811,44 @@ function fmtPct(p){
   if(p==null) return '?';
   return p < 10 ? (Math.round(p*10)/10).toString() : String(Math.round(p));
 }
+// Collapsible sections: the panel shares a sidebar with the session table, so
+// every block below the gauges can be folded to one header line. State is kept
+// in the webview state store (survives hide/show and window reloads).
+let collapsed = (vscodeApi.getState() && vscodeApi.getState().collapsed) || { chart:false, sessions:false, models:true };
+function secHeader(id, title, hint){
+  return '<div class="sech" data-sec="'+id+'"><span class="chev">'+(collapsed[id]?'▸':'▾')+'</span>'
+    + '<h4>'+title+'</h4>'
+    + (collapsed[id] && hint ? '<span class="hint">'+hint+'</span>' : '')
+    + '</div>';
+}
+function truncLbl(s){ return s.length>16 ? s.slice(0,15)+'…' : s; }
 function sessionSection(rows){
   if(!rows || !rows.length) return '';
-  let h='<div class="sec"><h4>Sessions (5h tokens)</h4>';
-  for(const s of rows){
-    h += '<div class="mrow"><span class="mname" title="'+esc(s.label)+'">'+esc(s.label)+'</span>'
-      + '<span class="mbar"><span class="mfill" style="width:'+Math.max(2,s.pct)+'%;background:'+C_OK+'"></span></span>'
-      + '<span class="mval">'+s.pct+'% · '+fmtTokens(s.tokens)+'</span></div>';
+  let h='<div class="sec">'+secHeader('sessions','Sessions (5h tokens)', esc(truncLbl(rows[0].label))+' '+rows[0].pct+'%');
+  if(!collapsed.sessions){
+    for(const s of rows.slice(0,5)){
+      h += '<div class="mrow"><span class="mname" title="'+esc(s.label)+'">'+esc(s.label)+'</span>'
+        + '<span class="mbar"><span class="mfill" style="width:'+Math.max(2,s.pct)+'%;background:'+C_OK+'"></span></span>'
+        + '<span class="mval">'+s.pct+'% · '+fmtTokens(s.tokens)+'</span></div>';
+    }
+    h += '<div class="legend"><span>share of this Mac\\'s 5h token total</span></div>';
   }
-  h += '<div class="legend"><span>share of this Mac\\'s 5h token total</span></div></div>';
+  h += '</div>';
   return h;
 }
 function modelSection(models){
   if(!models || !models.length) return '';
-  let h='<div class="sec"><h4>Models (7d share)</h4>';
-  let total=0, priced=true;
-  for(const m of models){
-    h += '<div class="mrow"><span class="mname" title="'+esc(m.name)+'">'+esc(m.name)+'</span>'
-      + '<span class="mbar"><span class="mfill" style="width:'+Math.max(2,m.pct)+'%;background:'+C_BLUE+'"></span></span>'
-      + '<span class="mval">'+m.pct+'% · '+fmtTokens(m.tokens)+(m.cost!=null?(' · ≈$'+m.cost.toFixed(2)):'')+'</span></div>';
-    if(m.cost!=null) total+=m.cost; else priced=false;
+  let h='<div class="sec">'+secHeader('models','Models (7d share)', esc(models[0].name)+' '+models[0].pct+'%');
+  if(!collapsed.models){
+    let total=0, priced=true;
+    for(const m of models){
+      h += '<div class="mrow"><span class="mname" title="'+esc(m.name)+'">'+esc(m.name)+'</span>'
+        + '<span class="mbar"><span class="mfill" style="width:'+Math.max(2,m.pct)+'%;background:'+C_BLUE+'"></span></span>'
+        + '<span class="mval">'+m.pct+'% · '+fmtTokens(m.tokens)+(m.cost!=null?(' · ≈$'+m.cost.toFixed(2)):'')+'</span></div>';
+      if(m.cost!=null) total+=m.cost; else priced=false;
+    }
+    if(total>0) h += '<div class="legend"><span>≈$'+total.toFixed(2)+' total'+(priced?'':' (priced models only)')+' · rough, excl. cache reads</span></div>';
   }
-  if(total>0) h += '<div class="legend"><span>≈$'+total.toFixed(2)+' total'+(priced?'':' (priced models only)')+' · rough, excl. cache reads</span></div>';
   h += '</div>';
   return h;
 }
@@ -838,14 +860,11 @@ function fmtTokens(n){
 }
 function tokenSection(t, multiAcct){
   if(!t) return '';
-  // Totals only — the 48h hourly bar chart was dropped as visual noise (same
-  // reasoning as the 1.7.0 heatmap removal): it cost vertical space without
-  // informing any decision the panel supports.
-  return '<div class="sec"><h4>Token usage (in + out + cache-write)</h4>'
-    + '<div class="grow"><span class="glabel">Last 5h</span><span class="gpct">'+fmtTokens(t.fiveHour)+'</span></div>'
-    + '<div class="grow"><span class="glabel">Last 7d</span><span class="gpct">'+fmtTokens(t.sevenDay)+'</span></div>'
-    + (multiAcct?'<div class="legend"><span>all logins on this Mac</span></div>':'')
-    + '</div>';
+  // One line: totals carry all the signal (the 48h hourly bars were dropped in
+  // 1.9.1, and the two-row layout wasted a section on two numbers).
+  return '<div class="sec"><div class="grow">'
+    + '<span class="glabel" title="in + out + cache-write'+(multiAcct?', all logins on this Mac':'')+'">Tokens'+(multiAcct?' <span class="hint">all logins</span>':'')+'</span>'
+    + '<span class="gpct">5h '+fmtTokens(t.fiveHour)+' · 7d '+fmtTokens(t.sevenDay)+'</span></div></div>';
 }
 function render(){
   const root = document.getElementById('root');
@@ -875,7 +894,10 @@ function render(){
   if(last.accountNote){
     h += '<div class="note">'+esc(last.accountNote)+'</div>';
   }
-  h += spark(last.history, last.eta);
+  const sparkBody = spark(last.history, last.eta);
+  if(sparkBody){
+    h += '<div class="sec">'+secHeader('chart','Usage over time','0-100%')+(collapsed.chart?'':sparkBody)+'</div>';
+  }
   // Token usage (real proxy; always shown when available).
   h += tokenSection(last.tokens, multiAcct);
   h += sessionSection(last.sessions);
@@ -899,7 +921,6 @@ function render(){
   }
   root.innerHTML = h;
 }
-const vscodeApi = acquireVsCodeApi();
 const refreshBtn = document.getElementById('refreshBtn');
 let spinDeadline = 0;
 function stopSpinIfDone(){
@@ -913,12 +934,23 @@ refreshBtn.addEventListener('click', () => {
   refreshBtn.classList.add('spin');
   spinDeadline = Date.now() + 8000;
 });
-// Account pills are re-rendered every second, so the click handler is
-// delegated from the stable root node instead of being attached per pill.
+// Pills and section headers are re-rendered every second, so their click
+// handlers are delegated from the stable root node.
 document.getElementById('root').addEventListener('click', (ev) => {
   let el = ev.target;
-  while(el && el !== ev.currentTarget && !(el.classList && el.classList.contains('pill'))) el = el.parentElement;
-  if(el && el.dataset && el.dataset.id) vscodeApi.postMessage({ type: 'selectAccount', id: el.dataset.id });
+  while(el && el !== ev.currentTarget){
+    if(el.classList && el.classList.contains('pill') && el.dataset.id){
+      vscodeApi.postMessage({ type: 'selectAccount', id: el.dataset.id });
+      return;
+    }
+    if(el.classList && el.classList.contains('sech') && el.dataset.sec){
+      collapsed[el.dataset.sec] = !collapsed[el.dataset.sec];
+      vscodeApi.setState({ collapsed });
+      render();
+      return;
+    }
+    el = el.parentElement;
+  }
 });
 window.addEventListener('message', e => {
   if(e.data && e.data.type==='update'){ last = e.data; stopSpinIfDone(); render(); }

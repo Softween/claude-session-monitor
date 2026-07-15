@@ -8,7 +8,7 @@
  *    notifications, a live limit-reset countdown, a stuck-session alert,
  *    a "needs-you only" filter, and click -> best-effort jump to that tab.
  *  - a webview charting the account usage limits (5-hour / 7-day) as gauges
- *    with reset countdowns plus a usage sparkline.
+ *    with reset countdowns and a burn-rate projection line.
  *
  * Session state comes from core.ts (hook status files + transcript tails).
  * Usage-limit data comes from limits.json (written by statusline.sh).
@@ -355,7 +355,6 @@ interface LimitsPayload {
   model: string | null;
   official: boolean; // true only when real 5h/7d gauges are available (terminal status line)
   gauges: Gauge[];
-  history: { t: number; fh: number | null; sd: number | null }[];
   limited: LimitedHit[]; // reactive: sessions that actually hit a limit (from transcripts)
   tokens: TokenUsage | null; // rolling 5h / 7d token usage (proxy for limit pressure)
   eta: BurnEta | null; // burn-rate projection for the 5h window
@@ -575,7 +574,6 @@ function buildLimitsPayload(
     model,
     official,
     gauges,
-    history,
     limited,
     tokens,
     eta,
@@ -647,12 +645,9 @@ function limitsHtml(): string {
   .pill.sel { background: var(--vscode-badge-background, rgba(127,127,127,.25));
     color: var(--vscode-badge-foreground, var(--vscode-foreground)); opacity:1; border-color:transparent; font-weight:600; }
   .adot { width:7px; height:7px; border-radius:50%; background:var(--vscode-charts-green,#4caf50); flex:none; }
-  .spark { margin-top:8px; }
-  .spark h4 { margin:0 0 4px 0; font-size:11px; opacity:.7; font-weight:600; }
   .legend { font-size:11px; opacity:.7; display:flex; gap:12px; margin-top:2px; flex-wrap:wrap; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; vertical-align:middle; }
   svg { width:100%; display:block; }
-  .spark svg { height:56px; }
   .foot { margin-top:8px; font-size:11px; opacity:.55; }
   .sec { margin-top:8px; }
   .sec h4 { margin:0 0 4px 0; font-size:11px; opacity:.7; font-weight:600; }
@@ -694,55 +689,6 @@ function fmtLeft(ms){
   if(h>0) return 'resets in '+h+'h '+m+'m';
   if(m>0) return 'resets in '+m+'m';
   return 'resets in <1m';
-}
-function spark(history, eta){
-  const pts = (history||[]).filter(p=>p.fh!=null || p.sd!=null);
-  if(pts.length < 2) return '';
-  const W=300, H=56, n=pts.length;
-  // History points arrive ~1/min, so index ~= minutes; when a projection is
-  // shown, the last 15% of the width is reserved for it.
-  const spanW = eta ? W*0.85 : W;
-  const x = i => (i/(n-1))*spanW;
-  const y = v => H - (Math.max(0,Math.min(100,v))/100)*(H-4) - 2;
-  let grid='';
-  for(const gv of [25,50,75]) grid += '<line x1="0" y1="'+y(gv).toFixed(1)+'" x2="'+W+'" y2="'+y(gv).toFixed(1)+'" stroke="rgba(127,127,127,.18)" stroke-width="1" stroke-dasharray="2,4"/>';
-  const line = (key,col) => {
-    let d='', started=false;
-    pts.forEach((p,i)=>{ const v=p[key]; if(v==null) return; d += (started?'L':'M')+x(i).toFixed(1)+','+y(v).toFixed(1)+' '; started=true; });
-    return d ? '<polyline fill="none" stroke="'+col+'" stroke-width="1.5" points="'+d.replace(/[ML]/g,' ').trim()+'"/>' : '';
-  };
-  // Soft area fill under the 5h line so the busy periods read at a glance.
-  const fhIdx = [];
-  pts.forEach((p,i)=>{ if(p.fh!=null) fhIdx.push(i); });
-  let area='';
-  if(fhIdx.length > 1){
-    let d = 'M'+x(fhIdx[0]).toFixed(1)+','+y(pts[fhIdx[0]].fh).toFixed(1);
-    for(const i of fhIdx.slice(1)) d += ' L'+x(i).toFixed(1)+','+y(pts[i].fh).toFixed(1);
-    d += ' L'+x(fhIdx[fhIdx.length-1]).toFixed(1)+','+H+' L'+x(fhIdx[0]).toFixed(1)+','+H+' Z';
-    area = '<path d="'+d+'" fill="'+C_BLUE+'" opacity="0.10"/>';
-  }
-  let proj='';
-  if(eta){
-    const fhPts = pts.filter(p=>p.fh!=null);
-    if(fhPts.length){
-      const lastFh = fhPts[fhPts.length-1].fh;
-      // Continue the observed slope: perHour/60 percent points per minute-step.
-      const stepPct = eta.perHour/60;
-      const stepPx = spanW/Math.max(1,n-1);
-      let px = spanW, pv = lastFh, d = 'M'+px.toFixed(1)+','+y(pv).toFixed(1)+' ';
-      while(px < W && pv < 100){ px += stepPx; pv += stepPct; d += 'L'+Math.min(px,W).toFixed(1)+','+y(Math.min(pv,100)).toFixed(1)+' '; }
-      proj = '<polyline fill="none" stroke="'+(eta.beforeReset?C_BAD:C_BLUE)+'" stroke-width="1.5" stroke-dasharray="3,3" points="'+d.replace(/[ML]/g,' ').trim()+'"/>';
-    }
-  }
-  const spanH = (pts[n-1].t - pts[0].t)/3600e3;
-  const spanLabel = spanH >= 0.1 ? ('last '+(spanH<10?spanH.toFixed(1):Math.round(spanH))+'h') : '';
-  return '<div class="spark"><svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'
-    + grid + area + line('fh', C_BLUE) + line('sd', C_WARN) + proj
-    + '</svg><div class="legend"><span><span class="dot" style="background:'+C_BLUE+'"></span>5-hour</span>'
-    + '<span><span class="dot" style="background:'+C_WARN+'"></span>7-day</span>'
-    + (eta ? '<span>┄ projected</span>' : '')
-    + (spanLabel ? '<span>'+spanLabel+'</span>' : '')
-    + '</div></div>';
 }
 function fmtDur(ms){
   if(ms==null || ms<=0) return 'now';
@@ -806,7 +752,7 @@ function fmtPct(p){
 // Collapsible sections: the panel shares a sidebar with the session table, so
 // every block below the gauges can be folded to one header line. State is kept
 // in the webview state store (survives hide/show and window reloads).
-let collapsed = (vscodeApi.getState() && vscodeApi.getState().collapsed) || { chart:false, sessions:false, models:true };
+let collapsed = (vscodeApi.getState() && vscodeApi.getState().collapsed) || { sessions:false, models:true };
 function secHeader(id, title, hint){
   return '<div class="sech" data-sec="'+id+'"><span class="chev">'+(collapsed[id]?'▸':'▾')+'</span>'
     + '<h4>'+title+'</h4>'
@@ -883,10 +829,6 @@ function render(){
   }
   if(last.accountNote){
     h += '<div class="note">'+esc(last.accountNote)+'</div>';
-  }
-  const sparkBody = spark(last.history, last.eta);
-  if(sparkBody){
-    h += '<div class="sec">'+secHeader('chart','Usage over time','0-100%')+(collapsed.chart?'':sparkBody)+'</div>';
   }
   // Token usage (real proxy; always shown when available).
   h += tokenSection(last.tokens, multiAcct);

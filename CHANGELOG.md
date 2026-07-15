@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 1.9.5
+
+- Removed the "Usage over time" line chart. The gauges answer "where am I now", the burn-rate line under the 5h gauge answers "when do I run out" (it still works — the history series is kept and the projection is computed from it), and the chart answered neither well enough to earn its space. The panel is now: gauges + burn line + one token line + collapsible Sessions/Models.
+
 ## 1.9.4
 
 - Compact gauges: each 5h/7d/per-model gauge is two lines now — the used % and the reset countdown sit on the label line, and the separate "% left" line (which just restated 100-used) is gone. The in-panel "Refresh usage" button was removed too; the ⟳ icon in the view title bar does the same job. Together with tighter spacing this cuts the always-visible part of the usage panel by roughly a third.

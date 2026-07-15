@@ -627,9 +627,9 @@ function limitsHtml(): string {
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <style>
-  body { font-family: var(--vscode-font-family); font-size: 12px; color: var(--vscode-foreground); padding: 8px 10px; }
+  body { font-family: var(--vscode-font-family); font-size: 12px; color: var(--vscode-foreground); padding: 6px 10px 4px; }
   .empty { opacity: .65; padding: 6px 0; }
-  .gauge { margin: 0 0 10px 0; }
+  .gauge { margin: 0 0 7px 0; }
   .grow { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:3px; }
   .glabel { font-weight:600; }
   .gpct { font-variant-numeric: tabular-nums; }
@@ -664,26 +664,16 @@ function limitsHtml(): string {
   .hit { padding:4px 0; border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.2)); }
   .hitt { font-weight:600; }
   .note { margin-top:10px; font-size:11px; opacity:.6; line-height:1.4; }
-  .eta { font-size:11px; margin:-6px 0 10px 0; opacity:.85; }
+  .eta { font-size:11px; margin:-3px 0 8px 0; opacity:.85; }
   .eta.bad { color: var(--vscode-charts-red, #f14c4c); opacity:1; }
   .mrow { display:flex; align-items:center; gap:6px; margin:3px 0; }
   .mname { width:84px; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .mbar { flex:1; height:7px; border-radius:3px; background: var(--vscode-editorWidget-background, rgba(127,127,127,.18)); overflow:hidden; }
   .mfill { height:100%; border-radius:3px; }
   .mval { font-size:10px; font-variant-numeric: tabular-nums; opacity:.75; white-space:nowrap; }
-  .topbar { display:flex; justify-content:flex-end; margin:0 0 6px 0; }
-  .refresh { display:inline-flex; align-items:center; gap:5px; cursor:pointer; font-size:11px;
-    padding:3px 9px; border-radius:4px; border:1px solid var(--vscode-button-border, transparent);
-    background: var(--vscode-button-secondaryBackground, rgba(127,127,127,.16));
-    color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); user-select:none; }
-  .refresh:hover { background: var(--vscode-button-secondaryHoverBackground, rgba(127,127,127,.28)); }
-  .refresh.spin .ic { animation: sp 1s linear infinite; }
-  .ic { display:inline-block; }
-  @keyframes sp { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
-  <div class="topbar"><span id="refreshBtn" class="refresh" title="Re-fetch usage from Anthropic now (use after switching Claude accounts)"><span class="ic">⟳</span> Refresh usage</span></div>
   <div id="root"><div class="empty">Waiting for usage-limit data… (reload the window once so the status line starts reporting)</div></div>
 <script nonce="${nonce}">
 const vscodeApi = acquireVsCodeApi();
@@ -878,14 +868,12 @@ function render(){
   if(last.official){
     for(const g of last.gauges){
       const p = g.pct;
-      const usedStr = fmtPct(p);
-      // Derive "left" from the DISPLAYED used value so the two always sum to 100
-      // (independent rounding could show 34% used / 67% left on p=33.5).
-      const leftStr = p==null ? '100' : String(Math.max(0, Math.round((100 - Number(usedStr))*10)/10));
+      // Two lines per gauge: header (label + used% + reset countdown) and the
+      // bar. "% left" was dropped — it restated 100-used on a line of its own.
       h += '<div class="gauge"><div class="grow"><span class="glabel">'+esc(g.label)+'</span>'
-         + '<span class="gpct">'+usedStr+'% used</span></div>'
+         + '<span class="gpct">'+fmtPct(p)+'%'+(g.resetMs?(' <span class="greset">· '+fmtLeft(g.resetMs)+'</span>'):'')+'</span></div>'
          + segRow(p)
-         + '<div class="greset"><b>'+leftStr+'% left</b>'+(g.resetMs?(' · '+fmtLeft(g.resetMs)):'')+'</div></div>';
+         + '</div>';
       if((g.key==='session'||g.key==='5h')) h += etaLine(last.eta);
     }
     if(last.ts){
@@ -923,19 +911,9 @@ function render(){
   }
   root.innerHTML = h;
 }
-const refreshBtn = document.getElementById('refreshBtn');
-let spinDeadline = 0;
-function stopSpinIfDone(){
-  // Spin while the manual fetch is in flight ("refreshing…" note), then stop;
-  // also a hard 8s deadline so a hung fetch can't spin forever.
-  const refreshing = last && typeof last.usageNote === 'string' && last.usageNote.indexOf('refreshing') === 0;
-  if(!refreshing || Date.now() > spinDeadline) refreshBtn.classList.remove('spin');
-}
-refreshBtn.addEventListener('click', () => {
-  vscodeApi.postMessage({ type: 'refresh' });
-  refreshBtn.classList.add('spin');
-  spinDeadline = Date.now() + 8000;
-});
+// Manual refresh lives in the view title bar (the ⟳ icon runs
+// claudeSessionMonitor.refreshUsage); the in-panel button was removed to give
+// the vertical space back to data. The "refreshing…" note still reports state.
 // Pills and section headers are re-rendered every second, so their click
 // handlers are delegated from the stable root node.
 document.getElementById('root').addEventListener('click', (ev) => {
@@ -955,9 +933,9 @@ document.getElementById('root').addEventListener('click', (ev) => {
   }
 });
 window.addEventListener('message', e => {
-  if(e.data && e.data.type==='update'){ last = e.data; stopSpinIfDone(); render(); }
+  if(e.data && e.data.type==='update'){ last = e.data; render(); }
 });
-setInterval(() => { stopSpinIfDone(); render(); }, 1000); // keep countdowns live
+setInterval(render, 1000); // keep countdowns live
 </script>
 </body>
 </html>`;

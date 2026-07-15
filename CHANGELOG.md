@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 1.9.4
+
+- Compact gauges: each 5h/7d/per-model gauge is two lines now — the used % and the reset countdown sit on the label line, and the separate "% left" line (which just restated 100-used) is gone. The in-panel "Refresh usage" button was removed too; the ⟳ icon in the view title bar does the same job. Together with tighter spacing this cuts the always-visible part of the usage panel by roughly a third.
+
 ## 1.9.3
 
 - Each session row shows its reasoning effort again, in a dedicated `eff` column next to the model (user preference; 1.7.3 had folded it into the header). The meta strip keeps the value for narrow panels where the column is hidden. Effort is still sourced from the global `effortLevel` setting — transcripts carry no per-session effort — so rows differ only after the setting changes between sessions.

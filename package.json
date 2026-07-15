@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Claude Code Session Monitor",
   "description": "Live monitor for all your Claude Code sessions: which is working, which is waiting for you, which hit a limit, plus per-session CPU/RAM and 5h/7d usage limits.",
-  "version": "1.9.2",
+  "version": "1.9.3",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",

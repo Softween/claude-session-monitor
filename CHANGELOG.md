@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 1.9.3
+
+- Each session row shows its reasoning effort again, in a dedicated `eff` column next to the model (user preference; 1.7.3 had folded it into the header). The meta strip keeps the value for narrow panels where the column is hidden. Effort is still sourced from the global `effortLevel` setting — transcripts carry no per-session effort — so rows differ only after the setting changes between sessions.
+
 ## 1.9.2
 
 - The usage panel now folds: "Usage over time", "Sessions (5h tokens)" and "Models (7d share)" are collapsible sections (click the header; state is remembered). Models starts collapsed, and a collapsed header shows its key figure inline (top session / top model). Token usage shrank to a single "Tokens · 5h X · 7d Y" line. Net effect: the panel fits in well under half the sidebar by default, and one click per section takes it down to headers only.

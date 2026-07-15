@@ -125,6 +125,7 @@ interface SessionRow {
   share: number; // 0-100 share of this machine's 5h token total
   hog: boolean; // top 5h token consumer
   model: string;
+  effort: string; // reasoning effort ("" when unknown)
   lastMs: number; // last activity epoch ms — age ticks client-side
   dir: string;
   cpu: number | null;
@@ -183,11 +184,11 @@ function sessionsHtml(): string {
   .num { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px;
     font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
   /* Column tracks — the single source of the table geometry. Order:
-     dot · title · 5h tok · share · model · dir · age · cpu · mem · actions */
-  :root { --cols: 14px minmax(40px,1fr) 62px 34px 60px 56px 30px 36px 46px 36px; }
-  @media (max-width: 469px) { :root { --cols: 14px minmax(40px,1fr) 62px 34px 60px 30px 36px 46px 36px; } .c-dir { display:none; } }
-  @media (max-width: 409px) { :root { --cols: 14px minmax(40px,1fr) 62px 34px 30px 36px 46px 36px; } .c-dir,.c-model { display:none; } }
-  @media (max-width: 349px) { :root { --cols: 14px minmax(40px,1fr) 62px 30px 36px 36px; } .c-dir,.c-model,.c-pct,.c-ram { display:none; } }
+     dot · title · 5h tok · share · model · eff · dir · age · cpu · mem · actions */
+  :root { --cols: 14px minmax(40px,1fr) 62px 34px 60px 34px 56px 30px 36px 46px 36px; }
+  @media (max-width: 503px) { :root { --cols: 14px minmax(40px,1fr) 62px 34px 60px 34px 30px 36px 46px 36px; } .c-dir { display:none; } }
+  @media (max-width: 443px) { :root { --cols: 14px minmax(40px,1fr) 62px 34px 30px 36px 46px 36px; } .c-dir,.c-model,.c-eff { display:none; } }
+  @media (max-width: 349px) { :root { --cols: 14px minmax(40px,1fr) 62px 30px 36px 36px; } .c-dir,.c-model,.c-eff,.c-pct,.c-ram { display:none; } }
   .meta { display:flex; gap:12px; padding:5px 10px 3px; font-size:10px;
     color: var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; }
   .meta b { font-weight:600; color: var(--vscode-foreground); }
@@ -210,7 +211,7 @@ function sessionsHtml(): string {
   .dot.stale { box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-charts-yellow, #e6b800) 35%, transparent); }
   .c-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .sub { color: var(--vscode-descriptionForeground); font-size: 11px; }
-  .c-model, .c-dir { overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  .c-model, .c-eff, .c-dir { overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
     font-size:11px; color: var(--vscode-descriptionForeground); }
   /* Signature: the token cell carries a hairline bar = this chat's share of the
      machine's 5h total, so "who is eating the limit" reads as geometry. */
@@ -267,7 +268,7 @@ function render(){
     return;
   }
   h += '<div class="thead"><span></span><span>session</span><span class="num">5h tok</span>'
-    + '<span class="num c-pct">%</span><span class="c-model">model</span><span class="c-dir">dir</span>'
+    + '<span class="num c-pct">%</span><span class="c-model">model</span><span class="c-eff">eff</span><span class="c-dir">dir</span>'
     + '<span class="num">age</span><span class="num">cpu</span><span class="num c-ram">mem</span><span></span></div>';
   for(const g of last.groups){
     h += '<div class="ghead"><span class="gdot" style="background:'+GCOLOR[g.key]+'"></span>'
@@ -282,6 +283,7 @@ function render(){
         + '</span>'
         + '<span class="num c-pct">'+(r.tokens && r.share>=1 ? r.share+'%' : '')+'</span>'
         + '<span class="c-model" title="'+esc(r.model)+'">'+esc(r.model)+'</span>'
+        + '<span class="c-eff" title="reasoning effort">'+esc(r.effort)+'</span>'
         + '<span class="c-dir" title="'+esc(r.dir)+'">'+esc(r.dir)+'</span>'
         + '<span class="num">'+fmtAge(r.lastMs)+'</span>'
         + '<span class="num c-cpu'+(r.cpuHog?' hot':'')+'">'+(r.cpu!=null?r.cpu+'%':'')+'</span>'
@@ -1956,6 +1958,7 @@ function buildSessionsPayload(
       share,
       hog: v.sessionId === hogId,
       model: v.model ? shortModelName(v.model) : "",
+      effort: shortEffort(v.effort) ?? "",
       lastMs: v.lastActivityMs,
       dir: v.cwdLabel ?? "",
       cpu: res ? Math.round(res.cpu) : null,
@@ -1975,8 +1978,8 @@ function buildSessionsPayload(
     count: grouped.get(m.key)!.length,
     rows: grouped.get(m.key)!,
   }));
-  // Effort is a global setting (same for every session), so it is stated once
-  // in the meta strip rather than repeated on each row.
+  // Effort also appears per row (user preference); the meta strip keeps the
+  // value visible on narrow panels where the eff column is hidden.
   const effort = shortEffort(views.find((v) => v.effort)?.effort) ?? "";
   return {
     type: "update",

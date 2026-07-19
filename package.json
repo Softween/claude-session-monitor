@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Claude Code Session Monitor",
   "description": "Live monitor for all your Claude Code sessions: which is working, which is waiting for you, which hit a limit, plus per-session CPU/RAM and 5h/7d usage limits.",
-  "version": "1.9.5",
+  "version": "1.10.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -123,6 +123,16 @@
         "icon": "$(debug-stop)"
       },
       {
+        "command": "claudeSessionMonitor.setModelAll",
+        "title": "Claude Sessions: Set Model for All Sessions…",
+        "icon": "$(chip)"
+      },
+      {
+        "command": "claudeSessionMonitor.setEffortAll",
+        "title": "Claude Sessions: Set Effort for All Sessions…",
+        "icon": "$(dashboard)"
+      },
+      {
         "command": "claudeSessionMonitor.dumpTabs",
         "title": "Claude Sessions: Dump Open Tabs (debug)"
       },
@@ -182,6 +192,16 @@
         },
         {
           "command": "claudeSessionMonitor.stopResumeAll",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "overflow"
+        },
+        {
+          "command": "claudeSessionMonitor.setModelAll",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "overflow"
+        },
+        {
+          "command": "claudeSessionMonitor.setEffortAll",
           "when": "view == claudeSessionMonitor.view",
           "group": "overflow"
         },
@@ -286,6 +306,12 @@
           "type": "number",
           "default": 60,
           "description": "Seconds between sessions during a staggered resume sweep (avoids hitting the rate limit by resuming all at once)."
+        },
+        "claudeSessionMonitor.commandStaggerSeconds": {
+          "type": "number",
+          "default": 8,
+          "minimum": 3,
+          "description": "Seconds between sessions when sweeping a slash command like /model or /effort into every open session."
         },
         "claudeSessionMonitor.resumeAutoType": {
           "type": "boolean",

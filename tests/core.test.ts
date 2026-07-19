@@ -10,6 +10,7 @@ import {
   parseTranscriptTail,
   collectSessions,
   readGlobalEffort,
+  writeGlobalEffort,
   countBuckets,
   scanTokenUsage,
   readLimits,
@@ -192,6 +193,43 @@ describe("parseTranscriptTail", () => {
     const tx = parseTranscriptTail(p);
     expect(tx.model).toBe("claude-opus-4-8");
   });
+
+  it("recovers the ai-title record from the head of a transcript too long for the tail window", () => {
+    const p = path.join(tmp, "long.jsonl");
+    const filler = "y".repeat(2000);
+    const lines: unknown[] = [{ type: "ai-title", aiTitle: "Head-scanned title" }];
+    // Pad well past MAX_TAIL (512KB) with filler lines so the tail read never
+    // reaches the ai-title record written at the top of the file.
+    while (Buffer.byteLength(lines.map((l) => JSON.stringify(l)).join("\n")) < 600 * 1024) {
+      lines.push({ type: "user", message: { content: [{ type: "text", text: filler }] }, timestamp: iso(NOW - 100) });
+    }
+    lines.push({ type: "assistant", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 5) });
+    fs.writeFileSync(p, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    expect(fs.statSync(p).size).toBeGreaterThan(600 * 1024);
+
+    const tx = parseTranscriptTail(p);
+    expect(tx.title).toBe("Head-scanned title");
+    expect(tx.convKind).toBe("end_turn");
+  });
+
+  it("carries the previous title forward on an unchanged-window re-parse without a head re-scan", () => {
+    const p = path.join(tmp, "carry.jsonl");
+    const filler = "z".repeat(2000);
+    const lines: unknown[] = [{ type: "ai-title", aiTitle: "Carried title" }];
+    while (Buffer.byteLength(lines.map((l) => JSON.stringify(l)).join("\n")) < 600 * 1024) {
+      lines.push({ type: "user", message: { content: [{ type: "text", text: filler }] }, timestamp: iso(NOW - 100) });
+    }
+    fs.writeFileSync(p, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    const a = parseTranscriptTail(p);
+    expect(a.title).toBe("Carried title");
+
+    // Append a fresh tail line (changes mtime/size) so re-parse doesn't hit the
+    // unchanged-file cache path, but the tail window still can't see the title.
+    fs.appendFileSync(p, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 1) }) + "\n");
+    const b = parseTranscriptTail(p, a);
+    expect(b.title).toBe("Carried title");
+    expect(b.convKind).toBe("end_turn");
+  });
 });
 
 // --- collectSessions (bucket resolution) ------------------------------------
@@ -267,6 +305,45 @@ describe("collectSessions", () => {
     const views = run([], [{ sessionId: "f", path: p, mtimeMs: st.mtimeMs }]);
     expect(views.find((v) => v.sessionId === "f")?.title).toBe("Discovered");
   });
+
+  it("rejects a machine-blob hook.prompt/lastPrompt and falls through the title chain", () => {
+    const p = writeTranscript("blob.jsonl", [
+      {
+        type: "user",
+        entrypoint: "claude-vscode",
+        cwd: "/repo",
+        message: { content: [{ type: "text", text: "q" }] },
+        timestamp: iso(NOW - 8),
+      },
+      { type: "assistant", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 6) },
+      { type: "last-prompt", lastPrompt: "<task-notification>\n<task-id>abc</task-id>\n</task-notification>" },
+    ]);
+    const hooks: HookStatus[] = [
+      { session_id: "blob", state: "idle", ts: NOW - 5, cwd: "/repo", transcript_path: p, prompt: "<system-reminder>ignored</system-reminder>" },
+    ];
+    const views = run(hooks, []);
+    const v = views.find((x) => x.sessionId === "blob");
+    // no clean candidate survived -> falls back to the "session <id>" placeholder,
+    // which is still the sole (self-)match candidate.
+    expect(v?.title).toBe("session blob");
+    expect(v?.matchLabels).toEqual(["session blob"]);
+  });
+
+  it("surfaces every cleaned title candidate on matchLabels for tolerant tab matching", () => {
+    const p = writeTranscript("multi.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 8) },
+      { type: "assistant", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 6) },
+      { type: "ai-title", aiTitle: "AI Title" },
+      { type: "last-prompt", lastPrompt: "last prompt text" },
+    ]);
+    const hooks: HookStatus[] = [
+      { session_id: "multi", state: "idle", ts: NOW - 5, cwd: "/repo", transcript_path: p, prompt: "hook prompt text" },
+    ];
+    const views = run(hooks, []);
+    const v = views.find((x) => x.sessionId === "multi");
+    expect(v?.title).toBe("AI Title");
+    expect(v?.matchLabels).toEqual(["AI Title", "hook prompt text", "last prompt text"]);
+  });
 });
 
 describe("readGlobalEffort / effort + model surfacing", () => {
@@ -282,6 +359,31 @@ describe("readGlobalEffort / effort + model surfacing", () => {
     fs.writeFileSync(good, "{ not json");
     expect(readGlobalEffort(good)).toBeUndefined();
     expect(readGlobalEffort(path.join(tmp, "nope.json"))).toBeUndefined();
+  });
+
+  it("writeGlobalEffort updates effortLevel while preserving other keys", () => {
+    const f = path.join(tmp, "settings.json");
+    fs.writeFileSync(f, JSON.stringify({ effortLevel: "low", theme: "dark", nested: { a: 1 } }));
+    expect(writeGlobalEffort("xhigh", f)).toBe(true);
+    const written = JSON.parse(fs.readFileSync(f, "utf8"));
+    expect(written).toEqual({ effortLevel: "xhigh", theme: "dark", nested: { a: 1 } });
+    expect(readGlobalEffort(f)).toBe("xhigh");
+  });
+
+  it("writeGlobalEffort aborts (returns false, touches nothing) on a missing/broken/non-object file", () => {
+    const missing = path.join(tmp, "nope-settings.json");
+    expect(writeGlobalEffort("high", missing)).toBe(false);
+    expect(fs.existsSync(missing)).toBe(false);
+
+    const broken = path.join(tmp, "broken.json");
+    fs.writeFileSync(broken, "{ not json");
+    expect(writeGlobalEffort("high", broken)).toBe(false);
+    expect(fs.readFileSync(broken, "utf8")).toBe("{ not json");
+
+    const arr = path.join(tmp, "array.json");
+    fs.writeFileSync(arr, "[1,2,3]");
+    expect(writeGlobalEffort("high", arr)).toBe(false);
+    expect(fs.readFileSync(arr, "utf8")).toBe("[1,2,3]");
   });
 
   it("surfaces the transcript model and the injected global effort onto the view", () => {
@@ -374,6 +476,78 @@ describe("scanTokenUsage", () => {
     );
     // Correct byte offset -> only the new 500 is added (a char-based offset would drift and mis-count).
     expect(scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile }).fiveHour).toBe(1500);
+  });
+});
+
+// --- scanTokenUsage requestId dedup -----------------------------------------
+
+describe("scanTokenUsage requestId dedup", () => {
+  function reqLine(sec: number, requestId: string, input: number, output: number) {
+    return {
+      type: "assistant",
+      requestId,
+      message: { id: `msg_${requestId}`, content: [{ type: "text", text: "x" }], usage: { input_tokens: input, output_tokens: output } },
+      timestamp: iso(sec),
+    };
+  }
+
+  it("counts 3 consecutive content-block lines sharing a requestId only once", () => {
+    const p = writeTranscript("dedup1.jsonl", [
+      reqLine(NOW - 1800, "req-A", 1000, 0), // thinking block
+      reqLine(NOW - 1800, "req-A", 1000, 0), // tool_use block, identical usage
+      reqLine(NOW - 1800, "req-A", 1000, 500), // final text block, identical usage stamped by CC
+    ]);
+    const offsetsFile = path.join(tmp, "dedup-off1.json");
+    const bucketsFile = path.join(tmp, "dedup-buck1.json");
+    const u = scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile });
+    // Only the FIRST of the 3 duplicate lines is counted (turn total = 1000, not 3000+).
+    expect(u.fiveHour).toBe(1000);
+  });
+
+  it("counts a new requestId as a separate turn", () => {
+    const p = writeTranscript("dedup2.jsonl", [
+      reqLine(NOW - 1800, "req-A", 1000, 0),
+      reqLine(NOW - 1800, "req-A", 1000, 0),
+      reqLine(NOW - 1700, "req-B", 500, 0),
+      reqLine(NOW - 1700, "req-B", 500, 0),
+    ]);
+    const offsetsFile = path.join(tmp, "dedup-off2.json");
+    const bucketsFile = path.join(tmp, "dedup-buck2.json");
+    const u = scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile });
+    expect(u.fiveHour).toBe(1000 + 500);
+  });
+
+  it("dedups across two incremental scans of the same file via the persisted offset state", () => {
+    const p = writeTranscript("dedup3.jsonl", [reqLine(NOW - 1800, "req-A", 1000, 0)]);
+    const offsetsFile = path.join(tmp, "dedup-off3.json");
+    const bucketsFile = path.join(tmp, "dedup-buck3.json");
+    const u1 = scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile });
+    expect(u1.fiveHour).toBe(1000);
+    // Append another line of the SAME turn (same requestId) — must not be recounted
+    // even though it lands in a fresh incremental read of the file.
+    fs.appendFileSync(p, JSON.stringify(reqLine(NOW - 1800, "req-A", 1000, 500)) + "\n");
+    const u2 = scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile });
+    expect(u2.fiveHour).toBe(1000);
+    // A genuinely new turn IS counted.
+    fs.appendFileSync(p, JSON.stringify(reqLine(NOW - 1700, "req-B", 300, 0)) + "\n");
+    const u3 = scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile });
+    expect(u3.fiveHour).toBe(1000 + 300);
+    // The persisted lastReq survived the round-trip through disk.
+    const offsets = JSON.parse(fs.readFileSync(offsetsFile, "utf8"));
+    expect(offsets[p].lastReq).toBe("req-B");
+  });
+
+  it("never dedups lines without a requestId or message.id (undefined key)", () => {
+    const untagged = (sec: number, input: number) => ({
+      type: "assistant",
+      message: { content: [{ type: "text", text: "x" }], usage: { input_tokens: input, output_tokens: 0 } },
+      timestamp: iso(sec),
+    });
+    const p = writeTranscript("dedup4.jsonl", [untagged(NOW - 1800, 500), untagged(NOW - 1799, 500)]);
+    const offsetsFile = path.join(tmp, "dedup-off4.json");
+    const bucketsFile = path.join(tmp, "dedup-buck4.json");
+    const u = scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile });
+    expect(u.fiveHour).toBe(1000); // both counted — no key means no dedup
   });
 });
 
@@ -749,6 +923,7 @@ describe("scanTokenUsage v2 breakdowns", () => {
     expect(u.bySession5h["sess-b"]).toBe(300);
     expect(u.byModel7d["claude-fable-5"].tokens).toBe(1000);
     expect(u.byModel7d["claude-haiku-4-5-20251001"].inTok).toBe(300);
+    expect(u.byModel7d["claude-fable-5"].crTok).toBe(0);
   });
 
   it("migrates a v1 buckets file (plain hour map) without losing totals", () => {
@@ -759,8 +934,39 @@ describe("scanTokenUsage v2 breakdowns", () => {
     const u = scanTokenUsage([], NOW, { offsetsFile, bucketsFile });
     expect(u.fiveHour).toBe(5000);
     const after = JSON.parse(fs.readFileSync(bucketsFile, "utf8"));
-    expect(after.v).toBe(2);
+    expect(after.v).toBe(3);
     expect(after.global[String(hour)]).toBe(5000);
+  });
+
+  it("wipes a stale v2 store (pre-dedup, inflated totals) instead of migrating it", () => {
+    const offsetsFile = path.join(tmp, "o3.json");
+    const bucketsFile = path.join(tmp, "b3.json");
+    const hour = Math.floor((NOW - 3600) / 3600);
+    // A v2 store as it would have looked pre-fix: inflated 2-3x by the duplicate-line bug.
+    fs.writeFileSync(
+      bucketsFile,
+      JSON.stringify({ v: 2, global: { [hour]: 15000 }, session: {}, model: {} }),
+    );
+    const u = scanTokenUsage([], NOW, { offsetsFile, bucketsFile });
+    expect(u.fiveHour).toBe(0); // wiped, not carried forward inflated
+    const after = JSON.parse(fs.readFileSync(bucketsFile, "utf8"));
+    expect(after.v).toBe(3);
+    expect(after.global).toEqual({});
+  });
+
+  it("tracks per-model cache-read tokens separately from the headline token total", () => {
+    const withCache = (sec: number, input: number, cacheRead: number, model: string) => ({
+      type: "assistant",
+      message: { content: [{ type: "text", text: "x" }], model, usage: { input_tokens: input, output_tokens: 0, cache_read_input_tokens: cacheRead } },
+      timestamp: iso(sec),
+    });
+    const p = writeTranscript("cr.jsonl", [withCache(NOW - 1800, 1000, 50000, "claude-sonnet-5")]);
+    const offsetsFile = path.join(tmp, "o4.json");
+    const bucketsFile = path.join(tmp, "b4.json");
+    const u = scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile });
+    expect(u.fiveHour).toBe(1000); // cache-read excluded from the headline total
+    expect(u.byModel7d["claude-sonnet-5"].crTok).toBe(50000);
+    expect(u.byModel7d["claude-sonnet-5"].inTok).toBe(1000);
   });
 });
 

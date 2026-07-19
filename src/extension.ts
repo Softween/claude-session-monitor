@@ -37,6 +37,7 @@ import {
   readAccountsFile,
   upsertActiveAccount,
   writeAccountsFile,
+  writeGlobalEffort,
   MONITOR_DIR,
   PROJECTS_DIR,
   DEFAULT_ENTRYPOINTS,
@@ -56,6 +57,7 @@ import {
   fmtMb,
   labelsMatch,
   parsePsOutput,
+  subtreeTotals,
   parseOfficialGauges,
   isRedundantSub,
   computeBurnEta,
@@ -1439,6 +1441,137 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
   }
 
+  /**
+   * Generic OS-keystroke sweep: focuses each queued session and types `text`
+   * + Enter into it, one every `opts.staggerSec`. Shared by "Resume All" and
+   * the "Set Model/Effort for All Sessions" commands so they all get the same
+   * safety rails: the resumeActive/stopResume guard (so "Stop Resume Sweep"
+   * always works), the modal "about to type..." confirmation before any
+   * unattended typing, accessibility-error handling, a frontmost + active-tab
+   * re-verification right before each keystroke, and self-chained scheduling
+   * (never overlaps, never double-types).
+   */
+  function startTypingSweep(
+    queue: SessionView[],
+    text: string,
+    opts: { staggerSec: number; doneLabel: string; submitDelayMs?: number; autoType?: boolean },
+  ): void {
+    if (!queue.length) {
+      vscode.window.showInformationMessage(`Claude Sessions: no open sessions to ${opts.doneLabel}.`);
+      return;
+    }
+    stopResume();
+    const stagger = Math.max(3, opts.staggerSec);
+    const auto = opts.autoType ?? true;
+    let i = 0;
+    let typed = 0;
+    let skipped = 0;
+    resumeActive = true;
+
+    // Self-chaining: each step is fully awaited before the next is scheduled, so
+    // a slow step (jump + osascript) can never overlap another and type twice.
+    const runOne = async () => {
+      if (!resumeActive) return;
+      if (i >= queue.length) {
+        stopResume(
+          auto
+            ? `Claude Sessions: ${opts.doneLabel} done · typed ${typed}, skipped ${skipped}.`
+            : `Claude Sessions: ${opts.doneLabel} done (${queue.length}).`,
+        );
+        return;
+      }
+      const v = queue[i++];
+      try {
+        await jumpToSession(v);
+        await sleep(500);
+        if (!resumeActive) return;
+
+        if (!auto) {
+          try {
+            await vscode.commands.executeCommand("claude-vscode.focus");
+          } catch {
+            /* ignore */
+          }
+          vscode.window
+            .showInformationMessage(`${opts.doneLabel} ${i}/${queue.length}: "${truncate(v.title, 40)}" · press Enter`, "Stop")
+            .then((x) => {
+              if (x === "Stop") stopResume("Claude Sessions: resume sweep stopped.");
+            });
+        } else {
+          await activateEditorApp();
+          await sleep(150);
+          try {
+            await vscode.commands.executeCommand("claude-vscode.focus");
+          } catch {
+            /* ignore */
+          }
+          await sleep(220);
+          if (!resumeActive) return;
+          // Re-verify immediately before typing: correct tab active AND VS Code frontmost.
+          const a = activeTabLabel();
+          const front = await isEditorFrontmost();
+          if (!resumeActive) return;
+          if (!front || !a || !matchCandidates(v).some((c) => labelsMatch(a, c))) {
+            skipped++;
+            log(`${opts.doneLabel} skip "${truncate(v.title, 40)}": front=${front} active=${a ?? "?"}`);
+          } else {
+            const r = await typeAndSubmit(text, opts.submitDelayMs);
+            if (!r.ok) {
+              if (/not allowed|assistive|accessibility|-1743|-25211|not permitted/i.test(r.err || "")) {
+                stopResume();
+                vscode.window
+                  .showErrorMessage(
+                    'Auto-resume needs Accessibility permission. Enable "Visual Studio Code" in System Settings > Privacy & Security > Accessibility, then run the sweep again.',
+                    "Open Settings",
+                  )
+                  .then((x) => {
+                    if (x === "Open Settings")
+                      execFile(
+                        "open",
+                        ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+                        () => {},
+                      );
+                  });
+                return; // stop the sweep entirely
+              }
+              skipped++;
+            } else {
+              typed++;
+            }
+          }
+        }
+      } catch (e) {
+        log(`${opts.doneLabel} step error: ` + String(e));
+      }
+      if (resumeActive) resumeTimer = setTimeout(runOne, stagger * 1000);
+    };
+
+    if (auto) {
+      // Defense in depth: keystrokes land in whatever has OS keyboard focus,
+      // and the tab-active check cannot guarantee focus is the Claude input
+      // (it may be a terminal, search box, etc.). Require one explicit
+      // confirmation before any unattended typing begins this sweep.
+      vscode.window
+        .showWarningMessage(
+          `Claude Sessions: about to type "${text}" + Enter into the focused editor for ${queue.length} session(s), one every ${stagger}s. Put your cursor in the Claude input and keep VS Code frontmost.`,
+          { modal: true },
+          "Start typing",
+        )
+        .then((choice) => {
+          if (choice !== "Start typing") {
+            stopResume();
+            return;
+          }
+          void runOne();
+        });
+    } else {
+      vscode.window.showInformationMessage(
+        `Claude Sessions: resuming ${queue.length} sessions, one every ${stagger}s. Press Enter in each.`,
+      );
+      void runOne();
+    }
+  }
+
   ctx.subscriptions.push(
     vscode.commands.registerCommand("claudeSessionMonitor.refresh", refresh),
     vscode.commands.registerCommand("claudeSessionMonitor.focus", () =>
@@ -1493,124 +1626,67 @@ export function activate(ctx: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand("claudeSessionMonitor.resumeAll", () => {
       const queue = lastViews.filter((v) => groupOf(v) !== "ended");
-      if (!queue.length) {
-        vscode.window.showInformationMessage("Claude Sessions: no open sessions to resume.");
-        return;
-      }
-      stopResume();
       const c = cfg();
-      const stagger = Math.max(5, c.get<number>("resumeStaggerSeconds", 60));
-      const auto = c.get<boolean>("resumeAutoType", true);
       // Collapse newlines so a single resumePrompt value can never encode more
       // than one Return keystroke (osascript `keystroke` submits on each \n).
       const prompt = c.get<string>("resumePrompt", "resume").replace(/[\r\n]+/g, " ").slice(0, 500);
-      let i = 0;
-      let typed = 0;
-      let skipped = 0;
-      resumeActive = true;
-
-      // Self-chaining: each step is fully awaited before the next is scheduled, so
-      // a slow step (jump + osascript) can never overlap another and type twice.
-      const runOne = async () => {
-        if (!resumeActive) return;
-        if (i >= queue.length) {
-          stopResume(
-            auto
-              ? `Claude Sessions: resume done · typed ${typed}, skipped ${skipped}.`
-              : `Claude Sessions: resume done (${queue.length}).`,
-          );
-          return;
-        }
-        const v = queue[i++];
-        try {
-          await jumpToSession(v);
-          await sleep(500);
-          if (!resumeActive) return;
-
-          if (!auto) {
-            try {
-              await vscode.commands.executeCommand("claude-vscode.focus");
-            } catch {
-              /* ignore */
-            }
-            vscode.window
-              .showInformationMessage(`Resume ${i}/${queue.length}: "${truncate(v.title, 40)}" · press Enter`, "Stop")
-              .then((x) => {
-                if (x === "Stop") stopResume("Claude Sessions: resume sweep stopped.");
-              });
-          } else {
-            await activateEditorApp();
-            await sleep(150);
-            try {
-              await vscode.commands.executeCommand("claude-vscode.focus");
-            } catch {
-              /* ignore */
-            }
-            await sleep(220);
-            if (!resumeActive) return;
-            // Re-verify immediately before typing: correct tab active AND VS Code frontmost.
-            const a = activeTabLabel();
-            const front = await isEditorFrontmost();
-            if (!resumeActive) return;
-            if (!front || !a || !labelsMatch(a, v.title)) {
-              skipped++;
-              log(`resume skip "${truncate(v.title, 40)}": front=${front} active=${a ?? "?"}`);
-            } else {
-              const r = await typeAndSubmit(prompt);
-              if (!r.ok) {
-                if (/not allowed|assistive|accessibility|-1743|-25211|not permitted/i.test(r.err || "")) {
-                  stopResume();
-                  vscode.window
-                    .showErrorMessage(
-                      'Auto-resume needs Accessibility permission. Enable "Visual Studio Code" in System Settings > Privacy & Security > Accessibility, then run Resume All again.',
-                      "Open Settings",
-                    )
-                    .then((x) => {
-                      if (x === "Open Settings")
-                        execFile(
-                          "open",
-                          ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
-                          () => {},
-                        );
-                    });
-                  return; // stop the sweep entirely
-                }
-                skipped++;
-              } else {
-                typed++;
-              }
-            }
-          }
-        } catch (e) {
-          log("resume step error: " + String(e));
-        }
-        if (resumeActive) resumeTimer = setTimeout(runOne, stagger * 1000);
-      };
-
-      if (auto) {
-        // Defense in depth: keystrokes land in whatever has OS keyboard focus,
-        // and the tab-active check cannot guarantee focus is the Claude input
-        // (it may be a terminal, search box, etc.). Require one explicit
-        // confirmation before any unattended typing begins this sweep.
-        vscode.window
-          .showWarningMessage(
-            `Claude Sessions: about to type "${prompt}" + Enter into the focused editor for ${queue.length} session(s), one every ${stagger}s. Put your cursor in the Claude input and keep VS Code frontmost.`,
-            { modal: true },
-            "Start typing",
-          )
-          .then((choice) => {
-            if (choice !== "Start typing") {
-              stopResume();
-              return;
-            }
-            void runOne();
-          });
-      } else {
-        vscode.window.showInformationMessage(
-          `Claude Sessions: resuming ${queue.length} sessions, one every ${stagger}s. Press Enter in each.`,
-        );
-        void runOne();
+      startTypingSweep(queue, prompt, {
+        staggerSec: Math.max(5, c.get<number>("resumeStaggerSeconds", 60)),
+        doneLabel: "resume",
+        autoType: c.get<boolean>("resumeAutoType", true),
+      });
+    }),
+    vscode.commands.registerCommand("claudeSessionMonitor.setModelAll", async () => {
+      const queue = lastViews.filter((v) => groupOf(v) !== "ended");
+      const items: { label: string; value: string }[] = [
+        { label: "Opus 4.8", value: "opus" },
+        { label: "Sonnet 5", value: "sonnet" },
+        { label: "Haiku 4.5", value: "haiku" },
+        { label: "Fable 5", value: "claude-fable-5" },
+        { label: "Default (recommended)", value: "default" },
+        { label: "Custom…", value: "" },
+      ];
+      const pick = await vscode.window.showQuickPick(
+        items.map((it) => it.label),
+        { placeHolder: "Model to set for every open session" },
+      );
+      if (!pick) return;
+      let value = items.find((it) => it.label === pick)?.value;
+      if (pick === "Custom…") {
+        const custom = await vscode.window.showInputBox({
+          prompt: "Model id or alias (e.g. claude-opus-4-8)",
+          placeHolder: "claude-opus-4-8",
+        });
+        if (!custom?.trim()) return;
+        value = custom.trim();
       }
+      if (!value) return;
+      startTypingSweep(queue, `/model ${value}`, {
+        staggerSec: Math.max(3, cfg().get<number>("commandStaggerSeconds", 8)),
+        doneLabel: "set model",
+        submitDelayMs: 500,
+      });
+    }),
+    vscode.commands.registerCommand("claudeSessionMonitor.setEffortAll", async () => {
+      const queue = lastViews.filter((v) => groupOf(v) !== "ended");
+      const level = await vscode.window.showQuickPick(["low", "medium", "high", "xhigh", "max"], {
+        placeHolder: "Reasoning effort to set for every open session",
+      });
+      if (!level) return;
+      if (!writeGlobalEffort(level)) {
+        vscode.window.showErrorMessage(
+          "Claude Sessions: could not update effortLevel in ~/.claude/settings.json — sweep aborted.",
+        );
+        return;
+      }
+      vscode.window.showInformationMessage(
+        `Claude Sessions: effortLevel set to "${level}"; sweeping /effort into ${queue.length} open session(s).`,
+      );
+      startTypingSweep(queue, `/effort ${level}`, {
+        staggerSec: Math.max(3, cfg().get<number>("commandStaggerSeconds", 8)),
+        doneLabel: "set effort",
+        submitDelayMs: 500,
+      });
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.openTranscript", (arg?: SessionView) =>
       openTranscript(arg),
@@ -1766,12 +1842,18 @@ function sampleResources(pids: number[], cache: Map<number, ResStat>, done: () =
     done();
     return;
   }
-  const list = [...new Set(pids)].join(",");
-  execFile("ps", ["-o", "pid=,pcpu=,rss=", "-p", list], { timeout: 4000 }, (err, stdout) => {
+  const roots = [...new Set(pids)];
+  // One system-wide snapshot per tick (not one `ps -p <pid>` call per session):
+  // a session's real footprint includes ~14 MCP-server children plus tool
+  // subprocesses, invisible to a single top-level pid sample. subtreeTotals
+  // walks the ppid tree from this one snapshot to sum each session's subtree.
+  execFile("ps", ["-axo", "pid=,ppid=,pcpu=,rss="], { timeout: 4000 }, (err, stdout) => {
     const now = Date.now() / 1000;
     if (!err && stdout) {
-      for (const r of parsePsOutput(String(stdout))) {
-        cache.set(r.pid, { cpu: r.cpu, rssMb: r.rssMb, ts: now });
+      const rows = parsePsOutput(String(stdout));
+      for (const pid of roots) {
+        const { cpu, rssMb } = subtreeTotals(rows, pid);
+        cache.set(pid, { cpu, rssMb, ts: now });
       }
     }
     for (const [pid, v] of cache) if (now - v.ts > 60) cache.delete(pid);
@@ -2030,8 +2112,14 @@ function writeTabDebug(dbg: unknown): void {
   }
 }
 
+/** Every cleaned title candidate for `v`, falling back to just its title. */
+function matchCandidates(v: SessionView): string[] {
+  return v.matchLabels?.length ? v.matchLabels : [v.title];
+}
+
 async function jumpToSession(v: SessionView): Promise<void> {
   const dbg: any = { ts: new Date().toISOString(), title: v.title, groups: [], matched: null, action: null, error: null };
+  const candidates = matchCandidates(v);
   try {
     const groups = vscode.window.tabGroups.all;
     groups.forEach((g, gi) => {
@@ -2049,7 +2137,7 @@ async function jumpToSession(v: SessionView): Promise<void> {
 
     for (let gi = 0; gi < groups.length; gi++) {
       const tabs = groups[gi].tabs;
-      const ti = tabs.findIndex((t) => t.label && labelsMatch(t.label, v.title));
+      const ti = tabs.findIndex((t) => t.label && candidates.some((c) => labelsMatch(t.label, c)));
       if (ti >= 0) {
         dbg.matched = { groupIndex: gi, tabIndex: ti, label: tabs[ti].label };
         if (gi < FOCUS_GROUP_CMDS.length) {
@@ -2070,12 +2158,36 @@ async function jumpToSession(v: SessionView): Promise<void> {
         return;
       }
     }
-    dbg.action = "no-match -> transcript";
+    dbg.action = "no-match -> prompt";
   } catch (e) {
     dbg.error = String(e);
   }
   writeTabDebug(dbg);
-  openTranscript(v);
+  await promptNoTabMatch(v);
+}
+
+/**
+ * No open tab matched this session's title. Rather than silently opening the
+ * (possibly huge) transcript file, ask what to do: open it anyway, resume the
+ * session in a fresh terminal, or just copy its id.
+ */
+async function promptNoTabMatch(v: SessionView): Promise<void> {
+  const choice = await vscode.window.showInformationMessage(
+    `Session "${truncate(v.title, 60)}" has no open tab in this window.`,
+    "Open Transcript",
+    "Resume in Terminal",
+    "Copy ID",
+  );
+  if (choice === "Open Transcript") {
+    openTranscript(v);
+  } else if (choice === "Resume in Terminal") {
+    const term = vscode.window.createTerminal({ name: truncate(v.title, 40), cwd: v.cwd });
+    term.sendText(`claude --resume ${v.sessionId}`);
+    term.show();
+  } else if (choice === "Copy ID") {
+    await vscode.env.clipboard.writeText(v.sessionId);
+    vscode.window.setStatusBarMessage(`Copied session id ${v.sessionId.slice(0, 8)}…`, 3000);
+  }
 }
 
 /** Normalize a command argument to a SessionView (undefined when absent/foreign). */
@@ -2147,10 +2259,16 @@ function appleStr(s: string): string {
   return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 }
 
-/** Types `text` into the focused element and presses Return, via System Events. */
-function typeAndSubmit(text: string): Promise<{ ok: boolean; err?: string }> {
+/**
+ * Types `text` into the focused element and presses Return, via System Events.
+ * `submitDelayMs` (default 150) is the pause between the keystroke and Return —
+ * slash commands (e.g. "/model ...") pop an autocomplete widget, so callers
+ * that type one should pass a longer delay (500ms) to let it settle first.
+ */
+function typeAndSubmit(text: string, submitDelayMs = 150): Promise<{ ok: boolean; err?: string }> {
   return new Promise((res) => {
-    const lines = ['tell application "System Events"', `keystroke ${appleStr(text)}`, "delay 0.15", "key code 36", "end tell"];
+    const delaySec = (Math.max(0, submitDelayMs) / 1000).toString();
+    const lines = ['tell application "System Events"', `keystroke ${appleStr(text)}`, `delay ${delaySec}`, "key code 36", "end tell"];
     const args: string[] = [];
     for (const l of lines) args.push("-e", l);
     execFile("osascript", args, { timeout: 8000 }, (err, _o, stderr) => {

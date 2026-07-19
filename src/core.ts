@@ -100,6 +100,7 @@ export interface SessionView {
   stale: boolean;
   model?: string; // model id in use (from the newest assistant transcript line)
   effort?: string; // reasoning effort level (global effortLevel from settings.json)
+  matchLabels: string[]; // deduped, cleaned title candidates for tolerant tab-label matching
 }
 
 export const BUCKET_ORDER: Record<Bucket, number> = {
@@ -150,6 +151,29 @@ export function readGlobalEffort(file = SETTINGS_FILE): string | undefined {
   }
 }
 
+/**
+ * Write `effortLevel` into ~/.claude/settings.json, preserving every other
+ * key. Returns false (and touches nothing) if the file can't be read/parsed
+ * or isn't a JSON object — callers must abort rather than sweep a stale
+ * value into running sessions when this fails.
+ */
+export function writeGlobalEffort(effort: string, file = SETTINGS_FILE): boolean {
+  let obj: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    obj = parsed as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  try {
+    fs.writeFileSync(file, JSON.stringify({ ...obj, effortLevel: effort }, null, 2) + "\n");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Transcript tail parsing
 // ---------------------------------------------------------------------------
@@ -185,6 +209,19 @@ function extractText(obj: any): string {
     }
   }
   return "";
+}
+
+/**
+ * Trim + collapse whitespace on a title candidate, and reject machine-generated
+ * blobs (task-notification / system-reminder XML-ish content that leaks into
+ * hook.prompt or tx.lastPrompt on subagent turns) that would never match a real
+ * VS Code tab label anyway.
+ */
+function cleanTitle(s: string | undefined): string | undefined {
+  if (typeof s !== "string") return undefined;
+  const t = s.replace(/\s+/g, " ").trim();
+  if (!t || t.startsWith("<")) return undefined;
+  return t;
 }
 
 export function classifyLimit(text: string, status?: number): LimitInfo | null {
@@ -306,6 +343,52 @@ function parseWindow(file: string, stat: fs.Stats, maxBytes: number): TxInfo {
   return info;
 }
 
+const HEAD_SCAN_BYTES = 256 * 1024;
+
+/**
+ * The `ai-title` record is written once, early in the transcript. For a
+ * transcript longer than the tail window, `parseWindow`'s tail read never
+ * reaches it, so the title would otherwise be lost. Read just the FIRST
+ * HEAD_SCAN_BYTES (a single fs read, no full-file parse) and keep the latest
+ * `ai-title` line found there (mirrors parseWindow's "last one wins" rule).
+ */
+function readHeadTitle(file: string): string | undefined {
+  let title: string | undefined;
+  let fd: number;
+  try {
+    fd = fs.openSync(file, "r");
+  } catch {
+    return undefined;
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    const len = Math.min(HEAD_SCAN_BYTES, stat.size);
+    if (len <= 0) return undefined;
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, 0);
+    const lines = buf.toString("utf8").split("\n");
+    if (len < stat.size) lines.pop(); // drop a possibly-incomplete trailing line
+    for (const ln of lines) {
+      const s = ln.trim();
+      if (!s) continue;
+      let obj: any;
+      try {
+        obj = JSON.parse(s);
+      } catch {
+        continue;
+      }
+      if (obj?.type === "ai-title" && typeof obj.aiTitle === "string" && obj.aiTitle.trim()) {
+        title = obj.aiTitle.trim();
+      }
+    }
+  } catch {
+    return title;
+  } finally {
+    fs.closeSync(fd);
+  }
+  return title;
+}
+
 /**
  * Parse the tail of a transcript file. `prev` lets the caller skip re-parsing
  * unchanged files (cache by mtime + size). If a single line larger than the
@@ -326,6 +409,12 @@ export function parseTranscriptTail(file: string, prev?: TxInfo): TxInfo {
   if (info.convKind === "none" && stat.size > MAX_TAIL) {
     // The newest conversational line was probably bigger than the window.
     info = parseWindow(file, stat, Math.min(stat.size, MAX_TAIL_GROW));
+  }
+  if (!info.title) {
+    // The tail window missed the (early) ai-title line. Carry the previously
+    // known title forward, else pay for one cheap head read to recover it.
+    if (prev?.title) info.title = prev.title;
+    else if (stat.size > MAX_TAIL) info.title = readHeadTitle(file);
   }
   return info;
 }
@@ -353,7 +442,17 @@ function resolve(
   const lastActivity = Math.max(hookTs, convTs, tx?.activityTs ?? 0, mtimeS);
 
   const title =
-    tx?.title || hook?.prompt || tx?.lastPrompt || `session ${sessionId.slice(0, 8)}`;
+    cleanTitle(tx?.title) ||
+    cleanTitle(hook?.prompt) ||
+    cleanTitle(tx?.lastPrompt) ||
+    `session ${sessionId.slice(0, 8)}`;
+  // Every cleaned candidate the title chain considered, deduped, so tab-label
+  // matching (jumpToSession) isn't limited to whichever one won.
+  const matchLabels = Array.from(
+    new Set([cleanTitle(tx?.title), cleanTitle(hook?.prompt), cleanTitle(tx?.lastPrompt), title].filter(
+      (s): s is string => !!s,
+    )),
+  );
   const cwd = hook?.cwd || tx?.cwd;
   const cwdLabel = cwd ? path.basename(cwd) : undefined;
   const transcriptPath = hook?.transcript_path || opts.txPath;
@@ -473,6 +572,7 @@ function resolve(
     stale,
     model,
     effort,
+    matchLabels,
   };
 }
 
@@ -948,6 +1048,7 @@ export interface ModelStat {
   inTok: number;
   outTok: number;
   cwTok: number;
+  crTok: number; // cache-read tokens; NOT included in `tokens` (see tokensOfLine)
 }
 
 export interface TokenUsage {
@@ -958,24 +1059,46 @@ export interface TokenUsage {
   byModel7d: Record<string, ModelStat>; // 7d totals per model id
 }
 
-function tokensOfLine(obj: any): { t: number; i: number; o: number; c: number } | null {
+function tokensOfLine(obj: any): { t: number; i: number; o: number; c: number; cr: number } | null {
   const u = obj?.message?.usage;
   if (!u) return null;
-  // input + output + cache-write. cache_read is excluded: it is huge and counts
-  // minimally toward limits, so including it would drown out the real signal.
+  // `t` (input + output + cache-write) is the headline 5h/7d token count and must
+  // KEEP excluding cache_read: it is huge and counts minimally toward limits, so
+  // including it would drown out the real signal. cache_read is still returned
+  // separately (`cr`) so per-model cost estimates can account for it (bills at
+  // ~10% of input price, see estimateCostUsd).
   const i = u.input_tokens || 0;
   const o = u.output_tokens || 0;
   const c = u.cache_creation_input_tokens || 0;
+  const cr = u.cache_read_input_tokens || 0;
   const t = i + o + c;
-  return t ? { t, i, o, c } : null;
+  return t ? { t, i, o, c, cr } : null;
 }
 
+function normalizeModelStat(m: any): ModelStat {
+  return {
+    tokens: typeof m?.tokens === "number" ? m.tokens : 0,
+    inTok: typeof m?.inTok === "number" ? m.inTok : 0,
+    outTok: typeof m?.outTok === "number" ? m.outTok : 0,
+    cwTok: typeof m?.cwTok === "number" ? m.cwTok : 0,
+    crTok: typeof m?.crTok === "number" ? m.crTok : 0, // absent on stores written before this field existed
+  };
+}
+
+// Bumped 3 (was 2) alongside the requestId-dedup fix below: a pre-fix v2 store's
+// totals are inflated 2-3x by counting every content-block line of a turn
+// instead of once per turn, so it is wiped rather than migrated (see
+// loadBucketStore) — future numbers are honest instead of a stale+correct mix.
+const BUCKET_STORE_VERSION = 3;
+
 /**
- * On-disk bucket store. v2 adds per-session and per-model hourly buckets;
- * a v1 file (plain hour->tokens map) is migrated in place on first load.
+ * On-disk bucket store. v2 added per-session and per-model hourly buckets;
+ * v3 adds per-line requestId dedup (see scanTokenUsage) and per-model cache-read
+ * tracking. A v1 file (plain hour->tokens map) is migrated in place on first
+ * load; any other stale/unrecognized version is wiped (see BUCKET_STORE_VERSION).
  */
 interface BucketStore {
-  v: 2;
+  v: typeof BUCKET_STORE_VERSION;
   global: Record<string, number>; // hour -> tokens
   session: Record<string, number>; // "hour:sessionId" -> tokens
   model: Record<string, ModelStat>; // "hour:modelId" -> stat
@@ -983,17 +1106,26 @@ interface BucketStore {
 
 function loadBucketStore(file: string): BucketStore {
   const raw = readJson<Record<string, unknown>>(file, {});
-  if (raw.v === 2 && raw.global && typeof raw.global === "object") {
+  if (raw.v === BUCKET_STORE_VERSION && raw.global && typeof raw.global === "object") {
+    const modelRaw = ((raw.model as Record<string, unknown>) ?? {}) as Record<string, unknown>;
+    const model: Record<string, ModelStat> = {};
+    for (const [k, v] of Object.entries(modelRaw)) model[k] = normalizeModelStat(v);
     return {
-      v: 2,
+      v: BUCKET_STORE_VERSION,
       global: (raw.global as Record<string, number>) ?? {},
       session: ((raw.session as Record<string, number>) ?? {}) as Record<string, number>,
-      model: ((raw.model as Record<string, ModelStat>) ?? {}) as Record<string, ModelStat>,
+      model,
     };
   }
-  const global: Record<string, number> = {};
-  for (const [k, v] of Object.entries(raw)) if (typeof v === "number") global[k] = v;
-  return { v: 2, global, session: {}, model: {} };
+  if (raw.v === undefined) {
+    // True v1 file: a flat hour->tokens map, no version tag at all.
+    const global: Record<string, number> = {};
+    for (const [k, v] of Object.entries(raw)) if (typeof v === "number") global[k] = v;
+    return { v: BUCKET_STORE_VERSION, global, session: {}, model: {} };
+  }
+  // Stale/unrecognized version (e.g. a pre-dedup v2 store) — wipe rather than
+  // migrate so future totals are honest instead of a mix of inflated old data.
+  return { v: BUCKET_STORE_VERSION, global: {}, session: {}, model: {} };
 }
 
 function readJson<T>(file: string, fallback: T): T {
@@ -1032,7 +1164,7 @@ export function scanTokenUsage(
   const maxBytesPerCall = opts.maxBytesPerCall ?? SCAN_BYTE_BUDGET;
   const backfillCap = opts.backfillCap ?? BACKFILL_CAP;
   const fileReadCap = opts.fileReadCap ?? FILE_READ_CAP;
-  const offsets = readJson<Record<string, { offset: number; size: number }>>(offsetsFile, {});
+  const offsets = readJson<Record<string, { offset: number; size: number; lastReq?: string }>>(offsetsFile, {});
   const store = loadBucketStore(bucketsFile);
   const buckets = store.global;
   let bytesRead = 0;
@@ -1047,9 +1179,15 @@ export function scanTokenUsage(
     }
     const prev = offsets[t.path];
     let start = prev ? prev.offset : Math.max(0, st.size - backfillCap);
-    if (prev && st.size < prev.size) start = Math.max(0, st.size - backfillCap); // rotated/truncated
+    // Dedup state (see below) persists across incremental scans of the same file;
+    // a rotation/truncation loses byte-continuity so the dedup context is stale too.
+    let lastReq = prev?.lastReq;
+    if (prev && st.size < prev.size) {
+      start = Math.max(0, st.size - backfillCap); // rotated/truncated
+      lastReq = undefined;
+    }
     if (start >= st.size) {
-      offsets[t.path] = { offset: st.size, size: st.size };
+      offsets[t.path] = { offset: st.size, size: st.size, lastReq };
       continue;
     }
 
@@ -1077,8 +1215,8 @@ export function scanTokenUsage(
     const lastNl = chunk.lastIndexOf("\n");
     if (lastNl < 0) {
       // No complete line in this chunk.
-      if (atEof) offsets[t.path] = { offset: start, size: st.size }; // last line still being written
-      else offsets[t.path] = { offset: start + read, size: st.size }; // skip past an over-long line
+      if (atEof) offsets[t.path] = { offset: start, size: st.size, lastReq }; // last line still being written
+      else offsets[t.path] = { offset: start + read, size: st.size, lastReq }; // skip past an over-long line
       continue;
     }
     const body = chunk.slice(0, lastNl);
@@ -1115,6 +1253,20 @@ export function scanTokenUsage(
         continue;
       }
       if (obj.type !== "assistant") continue;
+      // Claude Code writes one API turn as MULTIPLE consecutive jsonl lines (one per
+      // content block: thinking/text/tool_use) and stamps the IDENTICAL usage object
+      // on each. Dedup by request id so a turn is only counted once. Fallback chain:
+      // top-level requestId -> message.id -> undefined (never dedup that line, so an
+      // untagged line is always counted, worst case once extra).
+      const reqKey: string | undefined =
+        typeof obj.requestId === "string"
+          ? obj.requestId
+          : typeof obj.message?.id === "string"
+            ? obj.message.id
+            : undefined;
+      const isDup = reqKey !== undefined && reqKey === lastReq;
+      if (reqKey !== undefined) lastReq = reqKey;
+      if (isDup) continue;
       const tok = tokensOfLine(obj);
       if (!tok) continue;
       const ms = Date.parse(obj.timestamp);
@@ -1126,14 +1278,15 @@ export function scanTokenUsage(
       store.session[skey] = (store.session[skey] || 0) + tok.t;
       const model = typeof obj.message?.model === "string" ? obj.message.model : "unknown";
       const mkey = `${hour}:${model}`;
-      const m = store.model[mkey] ?? { tokens: 0, inTok: 0, outTok: 0, cwTok: 0 };
+      const m = store.model[mkey] ?? { tokens: 0, inTok: 0, outTok: 0, cwTok: 0, crTok: 0 };
       m.tokens += tok.t;
       m.inTok += tok.i;
       m.outTok += tok.o;
       m.cwTok += tok.c;
+      m.crTok += tok.cr;
       store.model[mkey] = m;
     }
-    offsets[t.path] = { offset: start + consumed, size: st.size };
+    offsets[t.path] = { offset: start + consumed, size: st.size, lastReq };
   }
 
   const cutoffHour = Math.floor((now - 8 * 86400) / 3600);
@@ -1196,11 +1349,12 @@ export function scanTokenUsage(
     const idx = k.indexOf(":");
     if (idx < 0) continue;
     const id = k.slice(idx + 1);
-    const agg = byModel7d[id] ?? { tokens: 0, inTok: 0, outTok: 0, cwTok: 0 };
+    const agg = byModel7d[id] ?? { tokens: 0, inTok: 0, outTok: 0, cwTok: 0, crTok: 0 };
     agg.tokens += m.tokens;
     agg.inTok += m.inTok;
     agg.outTok += m.outTok;
     agg.cwTok += m.cwTok;
+    agg.crTok += m.crTok;
     byModel7d[id] = agg;
   }
 

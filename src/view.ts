@@ -204,9 +204,17 @@ export function topSessionRows(
     }));
 }
 
-/** Strip trailing ellipsis/dots and lowercase, for tolerant tab-label matching. */
+/**
+ * Collapse whitespace runs (VS Code tab labels can carry literal newlines,
+ * e.g. an icon glyph stacked over the title text), strip a trailing
+ * ellipsis/dots, trim, and lowercase — for tolerant tab-label matching.
+ */
 export function normLabel(s: string): string {
-  return s.replace(/[….]+$/, "").trim().toLowerCase();
+  return s
+    .replace(/\s+/g, " ")
+    .replace(/[….]+$/, "")
+    .trim()
+    .toLowerCase();
 }
 
 export function labelsMatch(tabLabel: string, title: string): boolean {
@@ -275,7 +283,8 @@ function priceFor(modelId: string): { inUsd: number; outUsd: number } | null {
 export function estimateCostUsd(m: ModelStat, modelId: string): number | null {
   const p = priceFor(modelId);
   if (!p) return null;
-  return (m.inTok * p.inUsd + m.outTok * p.outUsd + m.cwTok * p.inUsd * 1.25) / 1e6;
+  const crTok = m.crTok ?? 0; // old persisted ModelStat objects predate this field
+  return (m.inTok * p.inUsd + m.outTok * p.outUsd + m.cwTok * p.inUsd * 1.25 + crTok * p.inUsd * 0.1) / 1e6;
 }
 
 /** Compact reasoning-effort label, e.g. "medium" -> "med". Passes unknowns through. */
@@ -322,11 +331,18 @@ export function nextUsageBackoffSec(prevSec: number | undefined, retryAfterSec: 
 
 export interface PsRow {
   pid: number;
+  ppid?: number; // present only when the 4-column form was parsed
   cpu: number;
   rssMb: number;
 }
 
-/** Parse `ps -o pid=,pcpu=,rss=` output into rows (rss kB -> MB), skipping junk lines. */
+/**
+ * Parse `ps` process-listing output into rows (rss kB -> MB), skipping junk
+ * lines. Supports both the legacy 3-column form (`ps -o pid=,pcpu=,rss=`,
+ * scoped to a `-p` pid list — no `ppid`) and the 4-column form
+ * (`ps -axo pid=,ppid=,pcpu=,rss=`, a system-wide snapshot used by
+ * `subtreeTotals` to sum a session's full process subtree).
+ */
 export function parsePsOutput(stdout: string): PsRow[] {
   const rows: PsRow[] = [];
   for (const line of stdout.split("\n")) {
@@ -334,6 +350,18 @@ export function parsePsOutput(stdout: string): PsRow[] {
     if (p.length < 3) continue;
     const pid = parseInt(p[0], 10);
     if (!Number.isFinite(pid)) continue;
+    if (p.length >= 4) {
+      const ppid = parseInt(p[1], 10);
+      const cpu = parseFloat(p[2]);
+      const rssKb = parseInt(p[3], 10);
+      rows.push({
+        pid,
+        ppid: Number.isFinite(ppid) ? ppid : undefined,
+        cpu: Number.isFinite(cpu) ? cpu : 0,
+        rssMb: Math.round((Number.isFinite(rssKb) ? rssKb : 0) / 1024),
+      });
+      continue;
+    }
     const cpu = parseFloat(p[1]);
     const rssKb = parseInt(p[2], 10);
     rows.push({
@@ -343,4 +371,41 @@ export function parsePsOutput(stdout: string): PsRow[] {
     });
   }
   return rows;
+}
+
+/**
+ * Sum cpu% + rssMb across a root pid and every descendant (BFS over the
+ * ppid links from a 4-column `parsePsOutput` snapshot). A session's real
+ * footprint is not just its top-level pid: Claude Code spawns ~14 MCP-server
+ * children plus tool subprocesses under it, all invisible to a single-pid
+ * `ps -p` sample. Cycle-safe (a pid is only summed once) and tolerant of a
+ * root that no longer exists in `rows` (process exited between sample ticks).
+ */
+export function subtreeTotals(rows: PsRow[], rootPid: number): { cpu: number; rssMb: number } {
+  const byPid = new Map<number, PsRow>();
+  const childrenOf = new Map<number, number[]>();
+  for (const r of rows) {
+    byPid.set(r.pid, r); // ps rarely repeats a pid; last one wins if it does
+    if (r.ppid == null) continue;
+    const kids = childrenOf.get(r.ppid);
+    if (kids) kids.push(r.pid);
+    else childrenOf.set(r.ppid, [r.pid]);
+  }
+
+  let cpu = 0;
+  let rssMb = 0;
+  const seen = new Set<number>();
+  const queue: number[] = [rootPid];
+  while (queue.length) {
+    const pid = queue.shift() as number;
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    const row = byPid.get(pid);
+    if (row) {
+      cpu += row.cpu;
+      rssMb += row.rssMb;
+    }
+    for (const child of childrenOf.get(pid) ?? []) if (!seen.has(child)) queue.push(child);
+  }
+  return { cpu, rssMb };
 }

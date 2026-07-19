@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec, accountPillLabels, filterHistoryForAccount, topSessionRows } from "../src/view";
+import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, subtreeTotals, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec, accountPillLabels, filterHistoryForAccount, topSessionRows } from "../src/view";
 import type { SessionView } from "../src/core";
 
 const v = (bucket: SessionView["bucket"], sub: string): SessionView =>
@@ -66,16 +66,80 @@ describe("normLabel / labelsMatch", () => {
     expect(labelsMatch("Totally different", "Refactor auth")).toBe(false);
     expect(labelsMatch("", "x")).toBe(false);
   });
+  it("collapses whitespace runs, including literal newlines VS Code tab labels carry", () => {
+    // e.g. an icon glyph stacked over the title text in the tab label.
+    expect(normLabel("error_outline\nSayfaların yüklenmesi…")).toBe("error_outline sayfaların yüklenmesi");
+    expect(normLabel("Title\n\twith\r\nmixed   whitespace")).toBe("title with mixed whitespace");
+  });
+  it("matches a newline-separated tab label against a space-separated title", () => {
+    expect(labelsMatch("error_outline\nSayfaların yüklenmesi", "error_outline Sayfaların yüklenmesi")).toBe(true);
+    expect(labelsMatch("Beauty service\nmarketplace mekan…", "Beauty service marketplace mekan")).toBe(true);
+  });
+  it("matches when ANY of several title candidates matches the tab label", () => {
+    const candidates = ["<task-notification>ignored</task-notification>", "kontrol et detaylı rapor", "resume"];
+    expect(candidates.some((c) => labelsMatch("kontrol et detaylı rapor…", c))).toBe(true);
+    expect(candidates.some((c) => labelsMatch("totally unrelated tab", c))).toBe(false);
+  });
 });
 
 describe("parsePsOutput", () => {
-  it("parses ps rows (kB->MB) and skips junk lines", () => {
+  it("parses the legacy 3-column form (kB->MB) and skips junk lines", () => {
     const out = "  1234  12.5  262144\n  5678   0.0   1024\ngarbage line\n  99 not-a-num xx\n";
     const m = new Map(parsePsOutput(out).map((r) => [r.pid, r]));
     expect(m.get(1234)).toEqual({ pid: 1234, cpu: 12.5, rssMb: 256 });
     expect(m.get(5678)).toEqual({ pid: 5678, cpu: 0, rssMb: 1 });
     expect(m.get(99)).toEqual({ pid: 99, cpu: 0, rssMb: 0 }); // NaN cpu/rss coerced to 0
     expect(m.size).toBe(3); // 2-token "garbage line" skipped
+  });
+
+  it("parses the 4-column form (pid,ppid,pcpu,rss) from a system-wide ps -axo snapshot", () => {
+    const out = "    1     0   0.5   16384\n  100     1   5.0   65536\n  200   100  12.5  262144\n";
+    const m = new Map(parsePsOutput(out).map((r) => [r.pid, r]));
+    expect(m.get(1)).toEqual({ pid: 1, ppid: 0, cpu: 0.5, rssMb: 16 });
+    expect(m.get(100)).toEqual({ pid: 100, ppid: 1, cpu: 5, rssMb: 64 });
+    expect(m.get(200)).toEqual({ pid: 200, ppid: 100, cpu: 12.5, rssMb: 256 });
+  });
+
+  it("coerces a non-numeric ppid to undefined in the 4-column form", () => {
+    const out = "  42   xx   3.0   4096\n";
+    const rows = parsePsOutput(out);
+    expect(rows[0]).toEqual({ pid: 42, ppid: undefined, cpu: 3, rssMb: 4 });
+  });
+});
+
+describe("subtreeTotals", () => {
+  const row = (pid: number, ppid: number, cpu: number, rssMb: number) => ({ pid, ppid, cpu, rssMb });
+
+  it("sums a root and every descendant across multiple generations", () => {
+    const rows = [
+      row(1, 0, 1, 100), // root
+      row(2, 1, 2, 50), // child
+      row(3, 1, 3, 60), // child
+      row(4, 2, 4, 20), // grandchild via 2
+      row(999, 500, 99, 999), // unrelated process, must NOT be summed
+    ];
+    const { cpu, rssMb } = subtreeTotals(rows, 1);
+    expect(cpu).toBeCloseTo(1 + 2 + 3 + 4);
+    expect(rssMb).toBe(100 + 50 + 60 + 20);
+  });
+
+  it("returns zero totals for a root pid with no matching row (process already exited)", () => {
+    const rows = [row(2, 1, 5, 50)];
+    expect(subtreeTotals(rows, 999)).toEqual({ cpu: 0, rssMb: 0 });
+  });
+
+  it("treats an orphan (ppid pointing nowhere) as its own isolated tree", () => {
+    const rows = [row(1, 0, 1, 10), row(2, 12345, 9, 90)]; // 2's ppid does not exist in rows
+    expect(subtreeTotals(rows, 2)).toEqual({ cpu: 9, rssMb: 90 });
+    expect(subtreeTotals(rows, 1)).toEqual({ cpu: 1, rssMb: 10 });
+  });
+
+  it("guards against a ppid cycle without infinite-looping", () => {
+    // 1 -> 2 -> 3 -> 1 (a malformed/adversarial snapshot); must terminate and count each pid once.
+    const rows = [row(1, 3, 1, 10), row(2, 1, 2, 20), row(3, 2, 3, 30)];
+    const { cpu, rssMb } = subtreeTotals(rows, 1);
+    expect(cpu).toBeCloseTo(1 + 2 + 3);
+    expect(rssMb).toBe(10 + 20 + 30);
   });
 });
 
@@ -175,10 +239,19 @@ describe("computeBurnEta", () => {
 
 describe("estimateCostUsd / shortModelName", () => {
   it("prices known models (cache-write at 1.25x input) and returns null for unpriced", () => {
-    const m = { tokens: 3_000_000, inTok: 1_000_000, outTok: 1_000_000, cwTok: 1_000_000 };
+    const m = { tokens: 3_000_000, inTok: 1_000_000, outTok: 1_000_000, cwTok: 1_000_000, crTok: 0 };
     expect(estimateCostUsd(m, "claude-opus-4-8")).toBeCloseTo(15 + 75 + 18.75, 2);
     expect(estimateCostUsd(m, "claude-haiku-4-5-20251001")).toBeCloseTo(1 + 5 + 1.25, 2);
     expect(estimateCostUsd(m, "claude-fable-5")).toBeNull();
+  });
+  it("bills cache-read tokens at 10% of the input price", () => {
+    const m = { tokens: 1_000_000, inTok: 1_000_000, outTok: 0, cwTok: 0, crTok: 1_000_000 };
+    // sonnet: $3/MTok input -> cache-read = $0.3/MTok -> 1M in + 1M cache-read = 3 + 0.3
+    expect(estimateCostUsd(m, "claude-sonnet-5")).toBeCloseTo(3 + 0.3, 2);
+  });
+  it("treats a persisted ModelStat lacking crTok as 0 (backward compat)", () => {
+    const legacy = { tokens: 1_000_000, inTok: 1_000_000, outTok: 0, cwTok: 0 } as unknown as import("../src/core").ModelStat;
+    expect(estimateCostUsd(legacy, "claude-sonnet-5")).toBeCloseTo(3, 2);
   });
   it("shortens model ids, joining numeric version segments with dots", () => {
     expect(shortModelName("claude-fable-5")).toBe("Fable 5");

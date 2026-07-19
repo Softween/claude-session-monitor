@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 1.10.1
+
+- The v3 bucket-store wipe now also drops the stale byte offsets, so instead of every token total restarting from zero, the recent window (last 4MB per transcript) is re-counted with requestId dedup over the next few scan ticks (~7 minutes to fully rebuild on a busy machine). Verified against real data: rebuilt 5h total matches the independent deduped ground-truth recompute.
+
 ## 1.10.0
 
 - **Fixed jump-to-session opening the transcript instead of the tab.** Two bugs compounded: tab labels can carry a literal newline (icon glyph stacked over the title), which the label normalizer didn't collapse before comparing; and the session title sometimes fell back to a machine-generated blob (`<task-notification>...`) that could never match any tab. Titles are now sanitized (whitespace-collapsed, `<...>` blobs rejected) through the whole `tx.title || hook.prompt || tx.lastPrompt` chain, the transcript's `ai-title` record is recovered from the head of very long transcripts (the tail-only read used to lose it), and matching now tries every cleaned title candidate, not just the one that won. When no tab still matches, you get a prompt (Open Transcript / Resume in Terminal / Copy ID) instead of the transcript opening silently.

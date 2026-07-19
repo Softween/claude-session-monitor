@@ -1104,28 +1104,35 @@ interface BucketStore {
   model: Record<string, ModelStat>; // "hour:modelId" -> stat
 }
 
-function loadBucketStore(file: string): BucketStore {
+function loadBucketStore(file: string): { store: BucketStore; wiped: boolean } {
   const raw = readJson<Record<string, unknown>>(file, {});
   if (raw.v === BUCKET_STORE_VERSION && raw.global && typeof raw.global === "object") {
     const modelRaw = ((raw.model as Record<string, unknown>) ?? {}) as Record<string, unknown>;
     const model: Record<string, ModelStat> = {};
     for (const [k, v] of Object.entries(modelRaw)) model[k] = normalizeModelStat(v);
     return {
-      v: BUCKET_STORE_VERSION,
-      global: (raw.global as Record<string, number>) ?? {},
-      session: ((raw.session as Record<string, number>) ?? {}) as Record<string, number>,
-      model,
+      store: {
+        v: BUCKET_STORE_VERSION,
+        global: (raw.global as Record<string, number>) ?? {},
+        session: ((raw.session as Record<string, number>) ?? {}) as Record<string, number>,
+        model,
+      },
+      wiped: false,
     };
   }
   if (raw.v === undefined) {
-    // True v1 file: a flat hour->tokens map, no version tag at all.
+    // True v1 file: a flat hour->tokens map, no version tag at all. An empty
+    // file also lands here — both are safe to keep byte offsets for.
     const global: Record<string, number> = {};
     for (const [k, v] of Object.entries(raw)) if (typeof v === "number") global[k] = v;
-    return { v: BUCKET_STORE_VERSION, global, session: {}, model: {} };
+    return { store: { v: BUCKET_STORE_VERSION, global, session: {}, model: {} }, wiped: false };
   }
   // Stale/unrecognized version (e.g. a pre-dedup v2 store) — wipe rather than
   // migrate so future totals are honest instead of a mix of inflated old data.
-  return { v: BUCKET_STORE_VERSION, global: {}, session: {}, model: {} };
+  // `wiped` tells scanTokenUsage to also drop its byte offsets, so the recent
+  // window (BACKFILL_CAP per file) is re-counted with dedup instead of every
+  // total restarting from zero.
+  return { store: { v: BUCKET_STORE_VERSION, global: {}, session: {}, model: {} }, wiped: true };
 }
 
 function readJson<T>(file: string, fallback: T): T {
@@ -1165,7 +1172,14 @@ export function scanTokenUsage(
   const backfillCap = opts.backfillCap ?? BACKFILL_CAP;
   const fileReadCap = opts.fileReadCap ?? FILE_READ_CAP;
   const offsets = readJson<Record<string, { offset: number; size: number; lastReq?: string }>>(offsetsFile, {});
-  const store = loadBucketStore(bucketsFile);
+  const { store, wiped } = loadBucketStore(bucketsFile);
+  if (wiped) {
+    // The bucket store was discarded (version bump). The old offsets point at
+    // EOF for already-counted bytes, so keeping them would freeze every total
+    // at zero until new activity. Drop them: each file re-counts its recent
+    // BACKFILL_CAP tail (with dedup) over the next few scan ticks.
+    for (const k of Object.keys(offsets)) delete offsets[k];
+  }
   const buckets = store.global;
   let bytesRead = 0;
 

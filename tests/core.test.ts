@@ -954,6 +954,34 @@ describe("scanTokenUsage v2 breakdowns", () => {
     expect(after.global).toEqual({});
   });
 
+  it("drops stale byte offsets on a version wipe so recent history is re-counted with dedup", () => {
+    const offsetsFile = path.join(tmp, "o3b.json");
+    const bucketsFile = path.join(tmp, "b3b.json");
+    // A transcript whose bytes were already fully counted (inflated) by the v2 code:
+    // one turn duplicated across two lines with the same requestId.
+    const line = (req: string) => ({
+      type: "assistant",
+      requestId: req,
+      message: { content: [{ type: "text", text: "x" }], model: "claude-sonnet-5", usage: { input_tokens: 700, output_tokens: 300 } },
+      timestamp: iso(NOW - 1800),
+    });
+    const p = writeTranscript("wipe-refill.jsonl", [line("req_1"), line("req_1")]);
+    const size = fs.statSync(p).size;
+    // v2-era state: offsets at EOF (bytes consumed), inflated bucket store.
+    fs.writeFileSync(offsetsFile, JSON.stringify({ [p]: { offset: size, size } }));
+    fs.writeFileSync(
+      bucketsFile,
+      JSON.stringify({ v: 2, global: { [String(Math.floor((NOW - 1800) / 3600))]: 2000 }, session: {}, model: {} }),
+    );
+    const u = scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile });
+    // Without the offset drop this would be 0 (EOF offsets freeze every total);
+    // with it, the file's tail re-counts under dedup: one turn, once.
+    expect(u.fiveHour).toBe(1000);
+    const offAfter = JSON.parse(fs.readFileSync(offsetsFile, "utf8"));
+    expect(offAfter[p].offset).toBe(size); // re-consumed to EOF
+    expect(offAfter[p].lastReq).toBe("req_1");
+  });
+
   it("tracks per-model cache-read tokens separately from the headline token total", () => {
     const withCache = (sec: number, input: number, cacheRead: number, model: string) => ({
       type: "assistant",

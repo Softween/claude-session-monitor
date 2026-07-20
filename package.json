@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Claude Code Session Monitor",
   "description": "Live monitor for all your Claude Code sessions: which is working, which is waiting for you, which hit a limit, plus per-session CPU/RAM and 5h/7d usage limits.",
-  "version": "1.10.1",
+  "version": "1.10.2",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -82,7 +82,8 @@
       {
         "command": "claudeSessionMonitor.refresh",
         "title": "Claude Sessions: Refresh",
-        "icon": "$(refresh)"
+        "icon": "$(refresh)",
+        "shortTitle": "Refresh"
       },
       {
         "command": "claudeSessionMonitor.focus",
@@ -90,22 +91,26 @@
       },
       {
         "command": "claudeSessionMonitor.openTranscript",
-        "title": "Claude Sessions: Open Transcript"
+        "title": "Claude Sessions: Open Transcript",
+        "shortTitle": "Open Transcript"
       },
       {
         "command": "claudeSessionMonitor.toggleWorkspaceOnly",
         "title": "Claude Sessions: This Workspace Only",
-        "icon": "$(filter)"
+        "icon": "$(filter)",
+        "shortTitle": "This Workspace Only"
       },
       {
         "command": "claudeSessionMonitor.toggleNeedsYouOnly",
         "title": "Claude Sessions: Needs-You Only",
-        "icon": "$(bell)"
+        "icon": "$(bell)",
+        "shortTitle": "Needs-You Only"
       },
       {
         "command": "claudeSessionMonitor.clearEnded",
         "title": "Claude Sessions: Clear Ended",
-        "icon": "$(trash)"
+        "icon": "$(trash)",
+        "shortTitle": "Clear Ended"
       },
       {
         "command": "claudeSessionMonitor.removeSession",
@@ -115,31 +120,37 @@
       {
         "command": "claudeSessionMonitor.resumeAll",
         "title": "Claude Sessions: Resume All (staggered)",
-        "icon": "$(debug-restart)"
+        "icon": "$(debug-restart)",
+        "shortTitle": "Resume All"
       },
       {
         "command": "claudeSessionMonitor.stopResumeAll",
         "title": "Claude Sessions: Stop Resume Sweep",
-        "icon": "$(debug-stop)"
+        "icon": "$(debug-stop)",
+        "shortTitle": "Stop Sweep"
       },
       {
         "command": "claudeSessionMonitor.setModelAll",
-        "title": "Claude Sessions: Set Model for All Sessions…",
-        "icon": "$(chip)"
+        "title": "Claude Sessions: Set Model for All Sessions\u2026",
+        "icon": "$(chip)",
+        "shortTitle": "Set Model (All)\u2026"
       },
       {
         "command": "claudeSessionMonitor.setEffortAll",
-        "title": "Claude Sessions: Set Effort for All Sessions…",
-        "icon": "$(dashboard)"
+        "title": "Claude Sessions: Set Effort for All Sessions\u2026",
+        "icon": "$(dashboard)",
+        "shortTitle": "Set Effort (All)\u2026"
       },
       {
         "command": "claudeSessionMonitor.dumpTabs",
-        "title": "Claude Sessions: Dump Open Tabs (debug)"
+        "title": "Claude Sessions: Dump Open Tabs (debug)",
+        "shortTitle": "Dump Tabs (debug)"
       },
       {
         "command": "claudeSessionMonitor.focusNextNeedsYou",
         "title": "Claude Sessions: Focus Next Needs-You",
-        "icon": "$(arrow-right)"
+        "icon": "$(arrow-right)",
+        "shortTitle": "Focus Next Needs-You"
       },
       {
         "command": "claudeSessionMonitor.copySessionId",
@@ -155,12 +166,14 @@
       },
       {
         "command": "claudeSessionMonitor.forgetOtherAccounts",
-        "title": "Claude Sessions: Forget Other Accounts (delete stored tokens)"
+        "title": "Claude Sessions: Forget Other Accounts (delete stored tokens)",
+        "shortTitle": "Forget Other Accounts"
       },
       {
         "command": "claudeSessionMonitor.refreshUsage",
         "title": "Claude Sessions: Refresh Usage Limits",
-        "icon": "$(refresh)"
+        "icon": "$(refresh)",
+        "shortTitle": "Refresh Usage"
       }
     ],
     "menus": {

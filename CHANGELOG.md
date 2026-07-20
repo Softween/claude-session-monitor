@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 1.10.2
+
+- Added `shortTitle` to every command, so the view's "…" overflow menu shows compact labels ("Set Effort (All)…") instead of the full "Claude Sessions: Set Effort for All Sessions…" strings that got clipped at narrow menu widths. The Command Palette keeps the full prefixed titles.
+
 ## 1.10.1
 
 - The v3 bucket-store wipe now also drops the stale byte offsets, so instead of every token total restarting from zero, the recent window (last 4MB per transcript) is re-counted with requestId dedup over the next few scan ticks (~7 minutes to fully rebuild on a busy machine). Verified against real data: rebuilt 5h total matches the independent deduped ground-truth recompute.

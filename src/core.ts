@@ -1,5 +1,5 @@
 /**
- * core.ts — pure Node data layer for the Claude Session Monitor.
+ * core.ts — pure Node data layer for the Claude provider.
  *
  * No `vscode` import lives here on purpose: this module is unit-testable on its
  * own (see verify.ts) and is consumed by extension.ts for the UI.
@@ -18,6 +18,15 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import {
+  defaultCapabilities,
+  sessionKey,
+  type SessionBucket,
+  type SessionHookStatus,
+  type SessionView,
+} from "./providers/types";
+
+export type { AgentProvider, SessionView } from "./providers/types";
 
 export const HOME = os.homedir();
 export const MONITOR_DIR = path.join(HOME, ".claude", "session-monitor");
@@ -31,7 +40,7 @@ const STALE_SECONDS = 120;
 export const DEFAULT_ENTRYPOINTS = ["claude-vscode", "cli"];
 const EXCLUDED_DIR_HINTS = ["observer-sessions", "claude-mem"];
 
-export type Bucket = "limited" | "attention" | "working" | "ended" | "unknown";
+export type Bucket = SessionBucket;
 
 export type ConvKind =
   | "end_turn"
@@ -42,22 +51,7 @@ export type ConvKind =
   | "api_error"
   | "none";
 
-export interface HookStatus {
-  session_id: string;
-  state: string; // working | idle | waiting | ended | unknown
-  event?: string;
-  ts: number; // epoch seconds
-  cwd?: string;
-  transcript_path?: string;
-  permission_mode?: string;
-  message?: string;
-  notif_type?: string;
-  prompt?: string;
-  source?: string;
-  stop_reason?: string;
-  reason?: string;
-  pid?: number;
-}
+export type HookStatus = SessionHookStatus;
 
 export interface LimitInfo {
   kind: "session" | "rate" | "error";
@@ -79,28 +73,6 @@ export interface TxInfo {
   sizeBytes: number;
   cwd?: string;
   model?: string; // model id of the newest assistant line (message.model)
-}
-
-export interface SessionView {
-  sessionId: string;
-  title: string;
-  bucket: Bucket;
-  sub: string; // short status label
-  detail: string; // tree row description
-  tooltip: string;
-  cwd?: string;
-  cwdLabel?: string;
-  transcriptPath?: string;
-  lastActivityMs: number;
-  resetText?: string;
-  permissionMode?: string;
-  notifMessage?: string;
-  entrypoint?: string;
-  pid?: number;
-  stale: boolean;
-  model?: string; // model id in use (from the newest assistant transcript line)
-  effort?: string; // reasoning effort level (global effortLevel from settings.json)
-  matchLabels: string[]; // deduped, cleaned title candidates for tolerant tab-label matching
 }
 
 export const BUCKET_ORDER: Record<Bucket, number> = {
@@ -128,7 +100,11 @@ export function readHookStatuses(dir = MONITOR_DIR): Map<string, HookStatus> {
     try {
       const raw = fs.readFileSync(path.join(dir, f), "utf8");
       const obj = JSON.parse(raw) as HookStatus;
-      if (obj && obj.session_id) map.set(obj.session_id, obj);
+      const transcript = typeof obj?.transcript_path === "string" ? obj.transcript_path : "";
+      const belongsToCodex = obj?.provider === "codex" || /[/\\]\.codex[/\\]/.test(transcript);
+      if (obj && obj.session_id && !belongsToCodex) {
+        map.set(obj.session_id, { ...obj, provider: "claude" });
+      }
     } catch {
       // ignore unreadable/partial files
     }
@@ -541,6 +517,7 @@ function resolve(
 
   const tipLines = [
     title,
+    "provider: Claude",
     `status: ${sub}`,
     model ? `model: ${model}` : "",
     effort ? `effort: ${effort}` : "",
@@ -554,12 +531,18 @@ function resolve(
   ].filter(Boolean);
 
   return {
+    key: sessionKey("claude", sessionId),
+    provider: "claude",
     sessionId,
     title,
     bucket,
     sub,
     detail,
     tooltip: tipLines.join("\n"),
+    capabilities: defaultCapabilities("claude", {
+      transcript: !!transcriptPath,
+      kill: typeof hook?.pid === "number",
+    }),
     cwd,
     cwdLabel,
     transcriptPath,
@@ -770,6 +753,17 @@ export function countBuckets(views: SessionView[]): BucketCounts {
   return c;
 }
 
+function isMonitorInfrastructureFile(file: string): boolean {
+  return (
+    file === "accounts.json" ||
+    file === "limits.json" ||
+    file === "statusline-last-raw.json" ||
+    file === "token-offsets.json" ||
+    file === "token-buckets.json" ||
+    file.startsWith("official-usage")
+  );
+}
+
 /** Delete monitor json files older than maxAgeMs (keeps the dir tidy). */
 export function cleanupMonitorFiles(maxAgeMs: number, now: number, dir = MONITOR_DIR): number {
   let removed = 0;
@@ -784,7 +778,7 @@ export function cleanupMonitorFiles(maxAgeMs: number, now: number, dir = MONITOR
     // Infrastructure files are state, not per-session status — age never
     // invalidates them (accounts.json in particular may legitimately sit
     // untouched for days between account switches).
-    if (f === "accounts.json" || f.startsWith("official-usage")) continue;
+    if (isMonitorInfrastructureFile(f)) continue;
     const full = path.join(dir, f);
     try {
       const st = fs.statSync(full);
@@ -814,6 +808,7 @@ export function cleanupEndedMonitorFiles(now: number, staleMs = 12 * 3600 * 1000
   }
   for (const f of files) {
     if (!f.endsWith(".json")) continue;
+    if (isMonitorInfrastructureFile(f)) continue;
     const full = path.join(dir, f);
     try {
       const st = fs.statSync(full);

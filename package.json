@@ -1,8 +1,8 @@
 {
   "name": "claude-code-session-monitor",
-  "displayName": "Claude Code Session Monitor",
-  "description": "Live monitor for all your Claude Code sessions: which is working, which is waiting for you, which hit a limit, plus per-session CPU/RAM and 5h/7d usage limits.",
-  "version": "1.10.2",
+  "displayName": "Agent Session Monitor: Claude + Codex",
+  "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
+  "version": "2.0.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -37,6 +37,9 @@
     "claude",
     "claude code",
     "anthropic",
+    "codex",
+    "openai",
+    "agent",
     "sessions",
     "usage",
     "rate limit",
@@ -59,7 +62,7 @@
       "activitybar": [
         {
           "id": "claudeSessionMonitor",
-          "title": "Claude Sessions",
+          "title": "Agent Sessions",
           "icon": "media/icon.svg"
         }
       ]
@@ -81,97 +84,109 @@
     "commands": [
       {
         "command": "claudeSessionMonitor.refresh",
-        "title": "Claude Sessions: Refresh",
+        "title": "Agent Sessions: Refresh",
         "icon": "$(refresh)",
         "shortTitle": "Refresh"
       },
       {
         "command": "claudeSessionMonitor.focus",
-        "title": "Claude Sessions: Open Panel"
+        "title": "Agent Sessions: Open Panel"
+      },
+      {
+        "command": "claudeSessionMonitor.toggleProvider",
+        "title": "Agent Sessions: Switch Provider",
+        "icon": "$(server-environment)",
+        "shortTitle": "Provider"
       },
       {
         "command": "claudeSessionMonitor.openTranscript",
-        "title": "Claude Sessions: Open Transcript",
+        "title": "Agent Sessions: Open Transcript",
         "shortTitle": "Open Transcript"
       },
       {
+        "command": "claudeSessionMonitor.resumeSession",
+        "title": "Agent Sessions: Resume Session in Terminal",
+        "icon": "$(debug-restart)",
+        "shortTitle": "Resume Session"
+      },
+      {
         "command": "claudeSessionMonitor.toggleWorkspaceOnly",
-        "title": "Claude Sessions: This Workspace Only",
+        "title": "Agent Sessions: This Workspace Only",
         "icon": "$(filter)",
         "shortTitle": "This Workspace Only"
       },
       {
         "command": "claudeSessionMonitor.toggleNeedsYouOnly",
-        "title": "Claude Sessions: Needs-You Only",
+        "title": "Agent Sessions: Needs-You Only",
         "icon": "$(bell)",
         "shortTitle": "Needs-You Only"
       },
       {
         "command": "claudeSessionMonitor.clearEnded",
-        "title": "Claude Sessions: Clear Ended",
+        "title": "Agent Sessions: Clear Ended",
         "icon": "$(trash)",
         "shortTitle": "Clear Ended"
       },
       {
         "command": "claudeSessionMonitor.removeSession",
-        "title": "Remove from list",
+        "title": "Agent Sessions: Remove from List",
         "icon": "$(close)"
       },
       {
         "command": "claudeSessionMonitor.resumeAll",
-        "title": "Claude Sessions: Resume All (staggered)",
+        "title": "Agent Sessions: Resume All Claude Sessions (staggered)",
         "icon": "$(debug-restart)",
         "shortTitle": "Resume All"
       },
       {
         "command": "claudeSessionMonitor.stopResumeAll",
-        "title": "Claude Sessions: Stop Resume Sweep",
+        "title": "Agent Sessions: Stop Claude Resume Sweep",
         "icon": "$(debug-stop)",
         "shortTitle": "Stop Sweep"
       },
       {
         "command": "claudeSessionMonitor.setModelAll",
-        "title": "Claude Sessions: Set Model for All Sessions\u2026",
+        "title": "Agent Sessions: Set Model for All Claude Sessions\u2026",
         "icon": "$(chip)",
         "shortTitle": "Set Model (All)\u2026"
       },
       {
         "command": "claudeSessionMonitor.setEffortAll",
-        "title": "Claude Sessions: Set Effort for All Sessions\u2026",
+        "title": "Agent Sessions: Set Effort for All Claude Sessions\u2026",
         "icon": "$(dashboard)",
         "shortTitle": "Set Effort (All)\u2026"
       },
       {
         "command": "claudeSessionMonitor.dumpTabs",
-        "title": "Claude Sessions: Dump Open Tabs (debug)",
+        "title": "Agent Sessions: Dump Open Tabs (debug)",
         "shortTitle": "Dump Tabs (debug)"
       },
       {
         "command": "claudeSessionMonitor.focusNextNeedsYou",
-        "title": "Claude Sessions: Focus Next Needs-You",
+        "title": "Agent Sessions: Focus Next Needs-You",
         "icon": "$(arrow-right)",
         "shortTitle": "Focus Next Needs-You"
       },
       {
         "command": "claudeSessionMonitor.copySessionId",
-        "title": "Copy Session ID"
+        "title": "Agent Sessions: Copy Session ID"
       },
       {
         "command": "claudeSessionMonitor.revealCwd",
-        "title": "Reveal Working Folder"
+        "title": "Agent Sessions: Reveal Working Folder"
       },
       {
         "command": "claudeSessionMonitor.killProcess",
-        "title": "Kill Process (SIGTERM)"
+        "title": "Agent Sessions: Kill Process (SIGTERM)"
       },
       {
         "command": "claudeSessionMonitor.forgetOtherAccounts",
-        "title": "Claude Sessions: Forget Other Accounts (delete stored tokens)",
+        "title": "Agent Sessions: Forget Other Claude Accounts (delete stored tokens)",
         "shortTitle": "Forget Other Accounts"
       },
       {
         "command": "claudeSessionMonitor.refreshUsage",
-        "title": "Claude Sessions: Refresh Usage Limits",
+        "title": "Agent Sessions: Refresh Usage",
         "icon": "$(refresh)",
         "shortTitle": "Refresh Usage"
       }
@@ -179,29 +194,34 @@
     "menus": {
       "view/title": [
         {
-          "command": "claudeSessionMonitor.resumeAll",
+          "command": "claudeSessionMonitor.toggleProvider",
           "when": "view == claudeSessionMonitor.view",
           "group": "navigation@0"
         },
         {
-          "command": "claudeSessionMonitor.toggleNeedsYouOnly",
+          "command": "claudeSessionMonitor.resumeAll",
           "when": "view == claudeSessionMonitor.view",
           "group": "navigation@1"
         },
         {
-          "command": "claudeSessionMonitor.toggleWorkspaceOnly",
+          "command": "claudeSessionMonitor.toggleNeedsYouOnly",
           "when": "view == claudeSessionMonitor.view",
           "group": "navigation@2"
         },
         {
-          "command": "claudeSessionMonitor.refresh",
+          "command": "claudeSessionMonitor.toggleWorkspaceOnly",
           "when": "view == claudeSessionMonitor.view",
           "group": "navigation@3"
         },
         {
-          "command": "claudeSessionMonitor.clearEnded",
+          "command": "claudeSessionMonitor.refresh",
           "when": "view == claudeSessionMonitor.view",
           "group": "navigation@4"
+        },
+        {
+          "command": "claudeSessionMonitor.clearEnded",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "navigation@5"
         },
         {
           "command": "claudeSessionMonitor.stopResumeAll",
@@ -236,8 +256,30 @@
       ]
     },
     "configuration": {
-      "title": "Claude Session Monitor",
+      "title": "Agent Session Monitor",
       "properties": {
+        "claudeSessionMonitor.enableClaude": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show and monitor Claude Code sessions."
+        },
+        "claudeSessionMonitor.enableCodex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show and monitor Codex sessions through the official local Codex app-server."
+        },
+        "claudeSessionMonitor.codexExecutable": {
+          "type": "string",
+          "default": "codex",
+          "scope": "machine",
+          "markdownDescription": "Codex CLI executable used to launch the local official app-server. Use an absolute path when `codex` is not available on VS Code's `PATH`."
+        },
+        "claudeSessionMonitor.codexPollSeconds": {
+          "type": "number",
+          "default": 5,
+          "minimum": 3,
+          "description": "How often to refresh Codex thread and account-usage metadata from the local app-server, in seconds."
+        },
         "claudeSessionMonitor.notifyOnWaiting": {
           "type": "boolean",
           "default": true,
@@ -262,12 +304,12 @@
         "claudeSessionMonitor.trackAllAccounts": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Remember every Claude account you log into (identity in `~/.claude/session-monitor/accounts.json`, access token in VS Code Secret Storage, i.e. your OS keychain) and keep fetching usage for non-active accounts in the background, so the Usage limits panel can show each account and switch between them. Turn off to track only the current login; run **Claude Sessions: Forget Other Accounts** to also delete already-stored tokens."
+          "markdownDescription": "Remember every Claude account you log into (identity in `~/.claude/session-monitor/accounts.json`, access token in VS Code Secret Storage, i.e. your OS keychain) and keep fetching usage for non-active accounts in the background, so the Usage limits panel can show each account and switch between them. Turn off to track only the current login; run **Agent Sessions: Forget Other Claude Accounts** to also delete already-stored tokens."
         },
         "claudeSessionMonitor.usageWarnPercent": {
           "type": "number",
           "default": 85,
-          "description": "Warn (toast + native notification) when any usage gauge (5h, 7d, per-model) reaches this percent. 0 disables."
+          "description": "Warn (toast + native notification) when any Claude usage gauge (5h, 7d, per-model) reaches this percent. 0 disables."
         },
         "claudeSessionMonitor.pollIntervalMs": {
           "type": "number",
@@ -318,13 +360,13 @@
         "claudeSessionMonitor.resumeStaggerSeconds": {
           "type": "number",
           "default": 60,
-          "description": "Seconds between sessions during a staggered resume sweep (avoids hitting the rate limit by resuming all at once)."
+          "description": "Seconds between Claude sessions during a staggered resume sweep (avoids hitting the rate limit by resuming all at once)."
         },
         "claudeSessionMonitor.commandStaggerSeconds": {
           "type": "number",
           "default": 8,
           "minimum": 3,
-          "description": "Seconds between sessions when sweeping a slash command like /model or /effort into every open session."
+          "description": "Seconds between Claude sessions when sweeping a slash command like /model or /effort into every open Claude session."
         },
         "claudeSessionMonitor.resumeAutoType": {
           "type": "boolean",
@@ -334,12 +376,12 @@
         "claudeSessionMonitor.resumePrompt": {
           "type": "string",
           "default": "resume",
-          "description": "Text typed into each session during a resume sweep."
+          "description": "Text typed into each Claude session during a resume sweep."
         },
         "claudeSessionMonitor.autoResumeAfterReset": {
           "type": "boolean",
           "default": false,
-          "description": "When sessions hit the usage limit (or the 5h window is at 99%+), automatically run the staggered resume sweep ~90s after the window resets."
+          "description": "When Claude sessions hit the usage limit (or the Claude 5h window is at 99%+), automatically run the staggered resume sweep ~90s after the window resets."
         },
         "claudeSessionMonitor.idleRamWarnMb": {
           "type": "number",

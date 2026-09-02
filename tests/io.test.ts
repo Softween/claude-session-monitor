@@ -89,12 +89,16 @@ describe("cleanupEndedMonitorFiles", () => {
   it("removes ended + stale sessions but keeps live ones", () => {
     fs.writeFileSync(path.join(tmp, "ended.json"), JSON.stringify({ session_id: "e", state: "ended" }));
     fs.writeFileSync(path.join(tmp, "live.json"), JSON.stringify({ session_id: "l", state: "working" }));
+    const accounts = path.join(tmp, "accounts.json");
+    fs.writeFileSync(accounts, JSON.stringify({ v: 1, accounts: [] }));
     const staleLive = path.join(tmp, "stale.json");
     fs.writeFileSync(staleLive, JSON.stringify({ session_id: "s", state: "working" }));
     backdate(staleLive, 13 * 3600); // >12h old
+    backdate(accounts, 13 * 3600); // infrastructure state must never be treated as a session
     const removed = cleanupEndedMonitorFiles(nowSec(), 12 * 3600 * 1000, tmp);
     expect(removed).toBe(2);
     expect(fs.existsSync(path.join(tmp, "live.json"))).toBe(true);
     expect(fs.existsSync(path.join(tmp, "ended.json"))).toBe(false);
+    expect(fs.existsSync(accounts)).toBe(true);
   });
 });

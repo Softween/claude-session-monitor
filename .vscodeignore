@@ -7,6 +7,7 @@ media/hero.svg
 media/icon-marketplace.svg
 docs/**
 node_modules/**
+graphify-out/**
 dist/verify.cjs
 **/*.ts
 **/*.map

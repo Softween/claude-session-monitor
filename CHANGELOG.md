@@ -4,6 +4,53 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.0.0
+
+### Added
+
+- Codex as a first-class provider beside Claude Code. The extension uses the
+  official local `codex app-server --stdio` interface for thread state, rate limits,
+  and account usage rather than scraping Codex's state database.
+- Provider-qualified session identities, provider badges, All / Claude / Codex
+  filtering, and provider health messages in the existing Sessions and Usage views.
+- A shared provider hook layer. Claude lifecycle records stay under
+  `~/.claude/session-monitor/`; Codex lifecycle records use
+  `~/.codex/session-monitor/`. The installer now merges both hook configurations
+  with backups and asks users to review added or modified Codex hooks via `/hooks`.
+- `Agent Sessions: Switch Provider`
+  (`claudeSessionMonitor.toggleProvider`) and provider-aware
+  `Agent Sessions: Resume Session in Terminal`
+  (`claudeSessionMonitor.resumeSession`) commands.
+- `claudeSessionMonitor.enableClaude`, `claudeSessionMonitor.enableCodex`,
+  `claudeSessionMonitor.codexExecutable`, and
+  `claudeSessionMonitor.codexPollSeconds` settings.
+
+### Changed
+
+- Product name is now **Agent Session Monitor: Claude + Codex**.
+- Usage presentation is provider-aware. Claude keeps its measured transcript
+  5h/session breakdown and Anthropic gauges; Codex shows only the official
+  account/rate-limit data returned by its app-server.
+- Claude bulk resume/model/effort sweeps remain explicitly Claude-only. Individual
+  resume actions route through the selected session's provider.
+
+### Security and compatibility
+
+- Added or modified Codex hooks are not assumed trusted. Users must inspect and
+  approve the expected local lifecycle command with `/hooks`; command strings are
+  preserved, but bounded timeout migration can still require trust to be reviewed
+  again.
+- Hook state is written through unique, locked atomic files with private
+  `0700`/`0600` permissions. The installer validates both provider configs before
+  changing either one, refuses malformed JSON, quotes command paths, and atomically
+  replaces valid settings while keeping a backup.
+- Codex per-session token usage is left unavailable because the current official
+  interface does not expose a trustworthy value. No estimate is presented as a
+  measurement.
+- The package name, publisher, Marketplace extension id, and all existing
+  `claudeSessionMonitor.*` command/config/view ids are unchanged, so 1.x installs,
+  settings, and keybindings upgrade in place.
+
 ## 1.10.2
 
 - Added `shortTitle` to every command, so the view's "…" overflow menu shows compact labels ("Set Effort (All)…") instead of the full "Claude Sessions: Set Effort for All Sessions…" strings that got clipped at narrow menu widths. The Command Palette keeps the full prefixed titles.

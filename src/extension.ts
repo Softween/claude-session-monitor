@@ -1,8 +1,8 @@
 /**
- * extension.ts - VS Code UI for the Claude Session Monitor (v0.3).
+ * extension.ts - VS Code UI for the shared Claude + Codex session monitor.
  *
  * Activity Bar sidebar with two views:
- *  - a tree of all interactive Claude Code sessions grouped by live state
+ *  - a table of interactive Claude Code and Codex sessions grouped by live state
  *    (limited / waiting / your-turn / working / ended), each row showing
  *    CPU% + RAM, with an Activity Bar badge, toasts + native macOS
  *    notifications, a live limit-reset countdown, a stuck-session alert,
@@ -10,12 +10,13 @@
  *  - a webview charting the account usage limits (5-hour / 7-day) as gauges
  *    with reset countdowns and a burn-rate projection line.
  *
- * Session state comes from core.ts (hook status files + transcript tails).
- * Usage-limit data comes from limits.json (written by statusline.sh).
+ * Claude state comes from core.ts. Codex metadata/usage comes from its official
+ * app-server and is combined with provider-scoped lifecycle hook state.
  */
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
+import * as path from "path";
 import { execFile } from "child_process";
 import {
   collectSessions,
@@ -23,6 +24,7 @@ import {
   findRecentTranscripts,
   cleanupMonitorFiles,
   cleanupEndedMonitorFiles,
+  readHookStatuses,
   readLimits,
   readLimitsHistory,
   appendLimitsHistory,
@@ -47,6 +49,25 @@ import {
   type TxInfo,
   type TokenUsage,
 } from "./core";
+import {
+  CODEX_MONITOR_DIR,
+  CodexAppServerClient,
+  readCodexHookStatuses,
+  type CodexProviderSnapshot,
+} from "./providers/codex";
+import {
+  countProviders,
+  filterProvider,
+  mergeProviderSessions,
+  type ProviderCounts,
+} from "./providers/registry";
+import {
+  defaultCapabilities,
+  providerLabel,
+  sessionKey,
+  type AgentProvider,
+  type ProviderHealth,
+} from "./providers/types";
 import {
   GROUPS,
   NEEDS_YOU,
@@ -80,11 +101,45 @@ import {
 const LOG_FILE = `${MONITOR_DIR}/csm-debug.log`;
 let logCount = 0;
 
+function ensurePrivateDir(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {
+    /* chmod is best-effort on platforms without POSIX modes */
+  }
+}
+
+function writePrivateTextAtomic(file: string, text: string): void {
+  const dir = path.dirname(file);
+  ensurePrivateDir(dir);
+  const tmp = path.join(
+    dir,
+    `.${path.basename(file)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`,
+  );
+  try {
+    fs.writeFileSync(tmp, text, { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tmp, file);
+    try {
+      fs.chmodSync(file, 0o600);
+    } catch {
+      /* best-effort on non-POSIX filesystems */
+    }
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* temp may not have been created */
+    }
+    throw error;
+  }
+}
+
 function rotateLog(): void {
   try {
     if (fs.statSync(LOG_FILE).size > 1024 * 1024) {
       const buf = fs.readFileSync(LOG_FILE);
-      fs.writeFileSync(LOG_FILE, buf.subarray(buf.length - 128 * 1024));
+      writePrivateTextAtomic(LOG_FILE, buf.subarray(buf.length - 128 * 1024).toString("utf8"));
     }
   } catch {
     /* no log yet */
@@ -93,8 +148,20 @@ function rotateLog(): void {
 
 function log(msg: string): void {
   try {
+    ensurePrivateDir(MONITOR_DIR);
+    try {
+      if (fs.lstatSync(LOG_FILE).isSymbolicLink()) {
+        writePrivateTextAtomic(LOG_FILE, "");
+      }
+    } catch {
+      /* no log yet */
+    }
     if (logCount++ % 1000 === 0) rotateLog();
-    fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${msg}\n`);
+    fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${msg}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    fs.chmodSync(LOG_FILE, 0o600);
   } catch {
     /* ignore */
   }
@@ -119,7 +186,9 @@ interface ResStat {
 // ---------------------------------------------------------------------------
 
 interface SessionRow {
-  id: string;
+  id: string; // opaque provider-qualified key
+  provider: AgentProvider;
+  providerLabel: string;
   title: string;
   sub: string; // extra status ("" when it just restates the group)
   reset: string; // formatted limit reset ("" when none)
@@ -135,6 +204,9 @@ interface SessionRow {
   cpuHog: boolean;
   stale: boolean; // "working" but silent — warning tint on the state dot
   ended: boolean;
+  canTranscript: boolean;
+  canKill: boolean;
+  canResume: boolean;
   tip: string; // full tooltip (title, status, model, cwd, id, ...)
 }
 
@@ -145,6 +217,10 @@ interface SessionsPayload {
   totalRss: number | null;
   effort: string; // "" when unknown
   filter: string; // active list filter label, "" when none
+  providerCounts: ProviderCounts;
+  providerFilter: AgentProvider | "all";
+  health: ProviderHealth[];
+  emptyMessage: string;
 }
 
 class SessionsView implements vscode.WebviewViewProvider {
@@ -194,6 +270,14 @@ function sessionsHtml(): string {
   .meta { display:flex; gap:12px; padding:5px 10px 3px; font-size:10px;
     color: var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; }
   .meta b { font-weight:600; color: var(--vscode-foreground); }
+  .providers { display:flex; gap:4px; padding:4px 10px 3px; }
+  .pfilter { border:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35));
+    background:transparent; color:var(--vscode-foreground); border-radius:999px;
+    padding:2px 8px; font:inherit; font-size:10px; cursor:pointer; opacity:.72; }
+  .pfilter:hover { opacity:1; }
+  .pfilter.active { opacity:1; background:var(--vscode-badge-background, rgba(127,127,127,.25));
+    color:var(--vscode-badge-foreground, var(--vscode-foreground)); border-color:transparent; }
+  .health { padding:3px 10px 5px; color:var(--vscode-descriptionForeground); font-size:10px; line-height:1.4; }
   .thead { position: sticky; top: 0; z-index: 2; display:grid; grid-template-columns: var(--cols);
     gap: 0 6px; align-items:baseline; padding: 3px 10px; font-size: 9px; font-weight:600;
     text-transform: uppercase; letter-spacing: .08em; color: var(--vscode-descriptionForeground);
@@ -212,6 +296,12 @@ function sessionsHtml(): string {
   .dot { width:7px; height:7px; border-radius:50%; }
   .dot.stale { box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-charts-yellow, #e6b800) 35%, transparent); }
   .c-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pbadge { display:inline-block; min-width:25px; margin-right:5px; padding:1px 3px;
+    border:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35));
+    border-radius:3px; font-size:8px; font-weight:700; letter-spacing:.04em;
+    text-align:center; vertical-align:1px; color:var(--vscode-descriptionForeground); }
+  .pbadge.codex { color:var(--vscode-charts-blue, #3794ff); }
+  .pbadge.claude { color:var(--vscode-charts-orange, #d18616); }
   .sub { color: var(--vscode-descriptionForeground); font-size: 11px; }
   .c-model, .c-eff, .c-dir { overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
     font-size:11px; color: var(--vscode-descriptionForeground); }
@@ -233,7 +323,7 @@ function sessionsHtml(): string {
 </style>
 </head>
 <body>
-  <div id="root"><div class="empty">No Claude Code sessions in the last few hours. Start one in a terminal or the Claude panel and it appears here live.</div></div>
+  <div id="root" aria-live="polite"><div class="empty">Loading Claude and Codex sessions…</div></div>
 <script nonce="${nonce}">
 const vscodeApi = acquireVsCodeApi();
 const GCOLOR = {
@@ -264,12 +354,21 @@ function render(){
   if(last.effort) metaBits.push('effort '+esc(last.effort));
   if(last.filter) metaBits.push('⧩ '+esc(last.filter));
   if(metaBits.length) h += '<div class="meta"><span>'+metaBits.join('</span><span>')+'</span></div>';
+  const enabled = new Set((last.health||[]).map(x=>x.provider));
+  const pf = last.providerFilter || 'all';
+  h += '<div class="providers" role="toolbar" aria-label="Session provider filter">'
+    + '<button class="pfilter'+(pf==='all'?' active':'')+'" data-provider="all" aria-pressed="'+(pf==='all')+'">All '+last.providerCounts.all+'</button>'
+    + (enabled.has('claude')?'<button class="pfilter'+(pf==='claude'?' active':'')+'" data-provider="claude" aria-pressed="'+(pf==='claude')+'">Claude '+last.providerCounts.claude+'</button>':'')
+    + (enabled.has('codex')?'<button class="pfilter'+(pf==='codex'?' active':'')+'" data-provider="codex" aria-pressed="'+(pf==='codex')+'">Codex '+last.providerCounts.codex+'</button>':'')
+    + '</div>';
+  const health = (last.health||[]).filter(x=>x.state!=='ready' && x.message);
+  if(health.length) h += '<div class="health">'+health.map(x=>'<div><b>'+esc(x.provider==='codex'?'Codex':'Claude')+':</b> '+esc(x.message)+'</div>').join('')+'</div>';
   if(!last.groups.length){
-    h += '<div class="empty">No Claude Code sessions in the last few hours. Start one in a terminal or the Claude panel and it appears here live.</div>';
+    h += '<div class="empty">'+esc(last.emptyMessage || 'No recent agent sessions.')+'</div>';
     root.innerHTML = h;
     return;
   }
-  h += '<div class="thead"><span></span><span>session</span><span class="num">5h tok</span>'
+  h += '<div class="thead" role="row"><span></span><span>session</span><span class="num">tokens</span>'
     + '<span class="num c-pct">%</span><span class="c-model">model</span><span class="c-eff">eff</span><span class="c-dir">dir</span>'
     + '<span class="num">age</span><span class="num">cpu</span><span class="num c-ram">mem</span><span></span></div>';
   for(const g of last.groups){
@@ -277,9 +376,9 @@ function render(){
       + esc(g.label)+' <span class="gcount">'+g.count+'</span></div>';
     for(const r of g.rows){
       const extra = [r.sub, r.reset ? ('reset '+r.reset) : ''].filter(Boolean).join(' · ');
-      h += '<div class="row'+(r.ended?' ended':'')+'" tabindex="0" data-id="'+esc(r.id)+'" title="'+esc(r.tip)+'">'
+      h += '<div class="row'+(r.ended?' ended':'')+'" role="row" tabindex="0" data-id="'+esc(r.id)+'" title="'+esc(r.tip)+'">'
         + '<span><span class="dot'+(r.stale?' stale':'')+'" style="background:'+GCOLOR[g.key]+'"></span></span>'
-        + '<span class="c-title">'+esc(r.title)+(extra?' <span class="sub">· '+esc(extra)+'</span>':'')+'</span>'
+        + '<span class="c-title"><span class="pbadge '+esc(r.provider)+'" title="'+esc(r.providerLabel)+'">'+(r.provider==='codex'?'CDX':'CLD')+'</span>'+esc(r.title)+(extra?' <span class="sub">· '+esc(extra)+'</span>':'')+'</span>'
         + '<span class="num c-tok">'+esc(r.tokens)
         +   (r.tokens?'<i class="tokbar'+(r.hog?' hog':'')+'" style="width:'+Math.min(100,Math.max(2,r.share))+'%"></i>':'')
         + '</span>'
@@ -287,14 +386,16 @@ function render(){
         + '<span class="c-model" title="'+esc(r.model)+'">'+esc(r.model)+'</span>'
         + '<span class="c-eff" title="reasoning effort">'+esc(r.effort)+'</span>'
         + '<span class="c-dir" title="'+esc(r.dir)+'">'+esc(r.dir)+'</span>'
-        + '<span class="num">'+fmtAge(r.lastMs)+'</span>'
+        + '<span class="num age" data-last="'+r.lastMs+'">'+fmtAge(r.lastMs)+'</span>'
         + '<span class="num c-cpu'+(r.cpuHog?' hot':'')+'">'+(r.cpu!=null?r.cpu+'%':'')+'</span>'
         + '<span class="num c-ram">'+(r.rssMb!=null?esc(fmtMb(r.rssMb)):'')+'</span>'
         + '<span class="c-act">'
-        +   '<button class="act" data-act="transcript" title="Open transcript">▤</button>'
+        +   (r.canTranscript?'<button class="act" data-act="transcript" title="Open transcript" aria-label="Open transcript">▤</button>':'')
         +   (r.ended
-              ? '<button class="act" data-act="remove" title="Remove from list">✕</button>'
-              : '<button class="act" data-act="kill" title="Kill process (SIGTERM)">⊘</button>')
+              ? '<button class="act" data-act="remove" title="Remove from list" aria-label="Remove from list">✕</button>'
+              : (r.canKill
+                  ? '<button class="act" data-act="kill" title="Kill process (SIGTERM)" aria-label="Kill process">⊘</button>'
+                  : (r.canResume?'<button class="act" data-act="resume" title="Resume in terminal" aria-label="Resume in terminal">↻</button>':'')))
         + '</span>'
         + '</div>';
     }
@@ -304,8 +405,12 @@ function render(){
 function fmtMb(mb){ return mb >= 1024 ? (mb/1024).toFixed(1)+'GB' : mb+'MB'; }
 document.getElementById('root').addEventListener('click', (ev) => {
   let el = ev.target;
-  while(el && el !== ev.currentTarget && !(el.classList && (el.classList.contains('act') || el.classList.contains('row')))) el = el.parentElement;
+  while(el && el !== ev.currentTarget && !(el.classList && (el.classList.contains('pfilter') || el.classList.contains('act') || el.classList.contains('row')))) el = el.parentElement;
   if(!el || el === ev.currentTarget) return;
+  if(el.classList.contains('pfilter')){
+    vscodeApi.postMessage({ type: 'filterProvider', id: el.dataset.provider });
+    return;
+  }
   if(el.classList.contains('act')){
     const row = el.closest('.row');
     if(row) vscodeApi.postMessage({ type: el.dataset.act, id: row.dataset.id });
@@ -320,7 +425,11 @@ document.getElementById('root').addEventListener('keydown', (ev) => {
   if(row){ vscodeApi.postMessage({ type: 'open', id: row.dataset.id }); ev.preventDefault(); }
 });
 window.addEventListener('message', e => { if(e.data && e.data.type === 'update'){ last = e.data; render(); } });
-setInterval(render, 1000); // ages tick client-side between payloads
+setInterval(() => {
+  for(const el of document.querySelectorAll('.age[data-last]')){
+    el.textContent = fmtAge(Number(el.dataset.last));
+  }
+}, 1000);
 </script>
 </body>
 </html>`;
@@ -338,6 +447,7 @@ interface Gauge {
 }
 
 interface LimitedHit {
+  provider: AgentProvider;
   title: string;
   sub: string;
   resetText?: string;
@@ -349,6 +459,17 @@ interface ModelRow {
   tokens: number;
   pct: number;
   cost: number | null; // null = model not publicly priced
+}
+
+interface UsageProviderCard {
+  id: AgentProvider;
+  label: string;
+  ts: number | null;
+  official: boolean;
+  gauges: Gauge[];
+  note: string | null;
+  sevenDayTokens: number | null;
+  lifetimeTokens: number | null;
 }
 
 interface LimitsPayload {
@@ -365,6 +486,7 @@ interface LimitsPayload {
   accounts: AccountView[]; // account switcher pills ([] until 2+ accounts are known)
   accountNote: string | null; // honesty note when a non-active account is displayed
   usageNote: string | null; // honest status when the usage API is degraded
+  providers: UsageProviderCard[];
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +619,8 @@ function buildLimitsPayload(
   officialUsage: OfficialUsage | null, // usage of the SELECTED account
   usageNote: string | null = null,
   acctCtx: AccountCtx | null = null,
+  codexSnapshot: CodexProviderSnapshot | null = null,
+  enabledProviders: ReadonlyArray<AgentProvider> = ["claude"],
 ): LimitsPayload {
   const now = Date.now() / 1000;
   const gauges: Gauge[] = [];
@@ -534,7 +658,13 @@ function buildLimitsPayload(
     .filter((v) => v.bucket === "limited")
     .map((v) => {
       const e = v.resetText ? parseResetToEpoch(v.resetText, now) : undefined;
-      return { title: v.title, sub: v.sub, resetText: v.resetText, resetMs: e ? e * 1000 : null };
+      return {
+        provider: v.provider,
+        title: v.title,
+        sub: v.sub,
+        resetText: v.resetText,
+        resetMs: e ? e * 1000 : null,
+      };
     });
 
   const g5 = gauges.find((g) => g.key === "session" || g.key === "5h");
@@ -570,6 +700,46 @@ function buildLimitsPayload(
     }
   }
 
+  const providers: UsageProviderCard[] = [];
+  if (enabledProviders.includes("claude")) {
+    const unavailable =
+      !official && !usageNote && !accountNote
+        ? 'Official Claude usage unavailable (macOS keychain access to "Claude Code-credentials" is required).'
+        : null;
+    providers.push({
+      id: "claude",
+      label: "Claude",
+      ts,
+      official,
+      gauges,
+      note: accountNote ?? (selectedIsActive ? usageNote : null) ?? unavailable,
+      sevenDayTokens: tokens?.sevenDay ?? null,
+      lifetimeTokens: null,
+    });
+  }
+  if (enabledProviders.includes("codex")) {
+    const usage = codexSnapshot?.usage;
+    providers.push({
+      id: "codex",
+      label: "Codex",
+      ts: usage?.ts ?? null,
+      official: !!usage,
+      gauges:
+        usage?.gauges.map((g) => ({
+          key: g.key,
+          label: g.label,
+          pct: g.pct,
+          resetMs: g.resetMs,
+        })) ?? [],
+      note:
+        usage?.note ??
+        (codexSnapshot?.health.state === "degraded" ? codexSnapshot.health.message ?? null : null) ??
+        (!usage ? "Codex account usage is not available yet." : null),
+      sevenDayTokens: usage?.sevenDayTokens ?? null,
+      lifetimeTokens: usage?.lifetimeTokens ?? null,
+    });
+  }
+
   return {
     type: "update",
     ts,
@@ -586,6 +756,7 @@ function buildLimitsPayload(
     // API-status notes describe the ACTIVE login's fetch loop; suppress them
     // while another account is displayed so they cannot be misattributed.
     usageNote: selectedIsActive ? usageNote : null,
+    providers,
   };
 }
 
@@ -639,6 +810,14 @@ function limitsHtml(): string {
   .segs { display:flex; gap:2px; margin:3px 0; }
   .seg { flex:1; height:10px; border-radius:2px; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
   .accts { display:flex; flex-wrap:wrap; gap:5px; margin:0 0 10px 0; }
+  .uproviders { display:flex; gap:5px; margin:0 0 9px 0; }
+  .upill { border:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35));
+    background:transparent; color:var(--vscode-foreground); border-radius:999px;
+    padding:3px 10px; font:inherit; font-size:11px; cursor:pointer; opacity:.72; }
+  .upill:hover { opacity:1; }
+  .upill.sel { opacity:1; font-weight:600; border-color:transparent;
+    background:var(--vscode-badge-background, rgba(127,127,127,.25));
+    color:var(--vscode-badge-foreground, var(--vscode-foreground)); }
   .pill { display:inline-flex; align-items:center; gap:5px; max-width:100%; overflow:hidden; white-space:nowrap;
     padding:2px 9px; border-radius:999px; cursor:pointer; font-size:11px; user-select:none;
     border:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35));
@@ -654,6 +833,7 @@ function limitsHtml(): string {
   .sec { margin-top:8px; }
   .sec h4 { margin:0 0 4px 0; font-size:11px; opacity:.7; font-weight:600; }
   .sech { display:flex; align-items:baseline; gap:6px; cursor:pointer; user-select:none; padding:1px 0; }
+  button.sech { width:100%; border:0; background:transparent; color:inherit; font:inherit; text-align:left; }
   .sech h4 { margin:0; }
   .sech:hover h4 { opacity:1; }
   .chev { font-size:9px; opacity:.55; width:9px; flex:none; }
@@ -720,11 +900,11 @@ function acctRow(accounts){
       + (a.stale ? ' — token expired, log in once to refresh' : '')
       + (age!=null ? ' — updated '+fmtAge(age)+' ago' : ' — no data yet')
       + ' — click to view';
-    h += '<span class="pill'+(a.selected?' sel':'')+'" data-id="'+esc(a.id)+'" title="'+esc(tip)+'">'
+    h += '<button type="button" class="pill'+(a.selected?' sel':'')+'" data-id="'+esc(a.id)+'" title="'+esc(tip)+'">'
       + (a.active ? '<span class="adot"></span>' : '')
       + esc(a.label)
       + (a.stale ? ' ⚠' : '')
-      + '</span>';
+      + '</button>';
   }
   h += '</div>';
   return h;
@@ -754,12 +934,15 @@ function fmtPct(p){
 // Collapsible sections: the panel shares a sidebar with the session table, so
 // every block below the gauges can be folded to one header line. State is kept
 // in the webview state store (survives hide/show and window reloads).
-let collapsed = (vscodeApi.getState() && vscodeApi.getState().collapsed) || { sessions:false, models:true };
+const savedState = vscodeApi.getState() || {};
+let collapsed = savedState.collapsed || { sessions:false, models:true };
+let activeProvider = savedState.activeProvider || 'claude';
+function saveState(){ vscodeApi.setState({ collapsed, activeProvider }); }
 function secHeader(id, title, hint){
-  return '<div class="sech" data-sec="'+id+'"><span class="chev">'+(collapsed[id]?'▸':'▾')+'</span>'
+  return '<button type="button" class="sech" data-sec="'+id+'" aria-expanded="'+(!collapsed[id])+'"><span class="chev">'+(collapsed[id]?'▸':'▾')+'</span>'
     + '<h4>'+title+'</h4>'
     + (collapsed[id] && hint ? '<span class="hint">'+hint+'</span>' : '')
-    + '</div>';
+    + '</button>';
 }
 function truncLbl(s){ return s.length>16 ? s.slice(0,15)+'…' : s; }
 function sessionSection(rows){
@@ -806,15 +989,36 @@ function tokenSection(t, multiAcct){
     + '<span class="glabel" title="in + out + cache-write'+(multiAcct?', all logins on this Mac':'')+'">Tokens'+(multiAcct?' <span class="hint">all logins</span>':'')+'</span>'
     + '<span class="gpct">5h '+fmtTokens(t.fiveHour)+' · 7d '+fmtTokens(t.sevenDay)+'</span></div></div>';
 }
+function providerRow(cards){
+  if(!cards || cards.length < 2) return '';
+  return '<div class="uproviders" role="tablist" aria-label="Usage provider">'
+    + cards.map(c=>'<button type="button" role="tab" aria-selected="'+(c.id===activeProvider)+'" class="upill'+(c.id===activeProvider?' sel':'')+'" data-usage-provider="'+esc(c.id)+'">'+esc(c.label)+'</button>').join('')
+    + '</div>';
+}
+function providerTokenSection(card){
+  if(!card || (card.sevenDayTokens==null && card.lifetimeTokens==null)) return '';
+  const parts=[];
+  if(card.sevenDayTokens!=null) parts.push('7d '+fmtTokens(card.sevenDayTokens));
+  if(card.lifetimeTokens!=null) parts.push('lifetime '+fmtTokens(card.lifetimeTokens));
+  return '<div class="sec"><div class="grow"><span class="glabel">Tokens</span><span class="gpct">'+parts.join(' · ')+'</span></div></div>';
+}
 function render(){
   const root = document.getElementById('root');
   if(!last){ return; }
   let h='';
+  const cards = last.providers || [];
+  if(cards.length && !cards.some(c=>c.id===activeProvider)) activeProvider=cards[0].id;
+  const card = cards.find(c=>c.id===activeProvider) || cards[0] || {
+    id:'claude', label:'Claude', ts:last.ts, official:last.official, gauges:last.gauges||[],
+    note:last.usageNote||last.accountNote||null, sevenDayTokens:last.tokens&&last.tokens.sevenDay, lifetimeTokens:null
+  };
+  const isClaude = card.id === 'claude';
+  h += providerRow(cards);
   const multiAcct = !!(last.accounts && last.accounts.length > 1);
-  h += acctRow(last.accounts);
+  if(isClaude) h += acctRow(last.accounts);
   // Official 5h / 7d gauges: live for the selected account (or the statusline fallback).
-  if(last.official){
-    for(const g of last.gauges){
+  if(card.official){
+    for(const g of card.gauges){
       const p = g.pct;
       // Two lines per gauge: header (label + used% + reset countdown) and the
       // bar. "% left" was dropped — it restated 100-used on a line of its own.
@@ -822,36 +1026,37 @@ function render(){
          + '<span class="gpct">'+fmtPct(p)+'%'+(g.resetMs?(' <span class="greset">· '+fmtLeft(g.resetMs)+'</span>'):'')+'</span></div>'
          + segRow(p)
          + '</div>';
-      if((g.key==='session'||g.key==='5h')) h += etaLine(last.eta);
+      if(isClaude && (g.key==='session'||g.key==='5h')) h += etaLine(last.eta);
     }
-    if(last.ts){
-      const age = Math.max(0, Math.round(Date.now()/1000 - last.ts));
-      h += '<div class="foot">official account usage · updated '+fmtAge(age)+' ago</div>';
+    if(card.ts){
+      const age = Math.max(0, Math.round(Date.now()/1000 - card.ts));
+      h += '<div class="foot">'+esc(card.label)+' official account usage · updated '+fmtAge(age)+' ago</div>';
     }
   }
-  if(last.accountNote){
-    h += '<div class="note">'+esc(last.accountNote)+'</div>';
+  if(card.note){
+    h += '<div class="note">'+esc(card.note)+'</div>';
   }
-  // Token usage (real proxy; always shown when available).
-  h += tokenSection(last.tokens, multiAcct);
-  h += sessionSection(last.sessions);
-  h += modelSection(last.models);
+  if(isClaude){
+    // Claude token usage is a rolling local proxy with per-session/model detail.
+    h += tokenSection(last.tokens, multiAcct);
+    h += sessionSection(last.sessions);
+    h += modelSection(last.models);
+  } else {
+    h += providerTokenSection(card);
+  }
   // Reactive limit hits: always real, derived from session transcripts (429).
-  if(last.limited && last.limited.length){
+  const providerLimited = (last.limited||[]).filter(l=>l.provider===card.id);
+  if(providerLimited.length){
     h += '<div class="sec"><h4>Active limit hits</h4>';
-    for(const l of last.limited){
+    for(const l of providerLimited){
       const reset = l.resetMs ? (' · '+fmtLeft(l.resetMs)) : (l.resetText? (' · resets '+esc(l.resetText)) : '');
       h += '<div class="hit"><span class="hitt">'+esc(l.title)+'</span> <span class="greset">'+esc(l.sub)+reset+'</span></div>';
     }
     h += '</div>';
   }
   // Honest status when the usage API is degraded (rate-limit backoff etc.).
-  if(last.usageNote){
-    h += '<div class="note">'+esc(last.usageNote)+'</div>';
-  }
-  // Honest note when the official live gauges are unavailable (VS Code app mode).
-  if(!last.official && !last.usageNote && !last.accountNote){
-    h += '<div class="note">Official 5h / 7d usage unavailable (needs macOS keychain access to "Claude Code-credentials" + network). The token-usage proxy below still works; sessions also appear under "Active limit hits" the moment they hit a limit.</div>';
+  if(!card.official && !card.note){
+    h += '<div class="note">Official '+esc(card.label)+' usage is unavailable. Session state remains available.</div>';
   }
   root.innerHTML = h;
 }
@@ -863,13 +1068,19 @@ function render(){
 document.getElementById('root').addEventListener('click', (ev) => {
   let el = ev.target;
   while(el && el !== ev.currentTarget){
+    if(el.dataset && el.dataset.usageProvider){
+      activeProvider = el.dataset.usageProvider;
+      saveState();
+      render();
+      return;
+    }
     if(el.classList && el.classList.contains('pill') && el.dataset.id){
       vscodeApi.postMessage({ type: 'selectAccount', id: el.dataset.id });
       return;
     }
     if(el.classList && el.classList.contains('sech') && el.dataset.sec){
       collapsed[el.dataset.sec] = !collapsed[el.dataset.sec];
-      vscodeApi.setState({ collapsed });
+      saveState();
       render();
       return;
     }
@@ -893,13 +1104,31 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const cfg = () => vscode.workspace.getConfiguration("claudeSessionMonitor");
   const workspaceCwd = () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const trackAllAccounts = () => cfg().get<boolean>("trackAllAccounts", true);
+  const claudeEnabled = () => cfg().get<boolean>("enableClaude", true);
+  const codexEnabled = () => cfg().get<boolean>("enableCodex", true);
+  const enabledProviders = (): AgentProvider[] => [
+    ...(claudeEnabled() ? (["claude"] as const) : []),
+    ...(codexEnabled() ? (["codex"] as const) : []),
+  ];
+  const savedProviderFilter = ctx.globalState.get<string>("providerFilter", "all");
+  let providerFilter: AgentProvider | "all" =
+    savedProviderFilter === "claude" || savedProviderFilter === "codex" ? savedProviderFilter : "all";
 
   const resourceCache = new Map<number, ResStat>();
   const sessionsView = new SessionsView((action, sessionId) => {
-    const v = lastViews.find((s) => s.sessionId === sessionId);
+    if (action === "filterProvider") {
+      if (sessionId === "all" || sessionId === "claude" || sessionId === "codex") {
+        providerFilter = sessionId;
+        void ctx.globalState.update("providerFilter", providerFilter);
+        refresh();
+      }
+      return;
+    }
+    const v = lastAllViews.find((session) => session.key === sessionId);
     if (!v) return;
     if (action === "open") void jumpToSession(v);
     else if (action === "transcript") openTranscript(v);
+    else if (action === "resume") void resumeInTerminal(v);
     else if (action === "kill") void vscode.commands.executeCommand("claudeSessionMonitor.killProcess", v);
     else if (action === "remove") void vscode.commands.executeCommand("claudeSessionMonitor.removeSession", v);
   });
@@ -940,6 +1169,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const stuckNotified = new Set<string>();
   let recentCache: RecentTranscript[] = [];
   let lastViews: SessionView[] = [];
+  let lastAllViews: SessionView[] = [];
   let lastRecentScan = 0;
   let lastCleanup = 0;
   let lastResourceSample = 0;
@@ -950,6 +1180,18 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let usageNote: string | null = null;
   let lastUsageCheck = 0;
   let usageFetchInflight = false;
+  let codexClient: CodexAppServerClient | undefined;
+  let codexExecutable = "";
+  let codexRefreshInflight = false;
+  let lastCodexRefresh = 0;
+  let codexFailureCount = 0;
+  let codexRetryAfter = 0;
+  let disposed = false;
+  let codexSnapshot: CodexProviderSnapshot = {
+    sessions: [],
+    usage: null,
+    health: { provider: "codex", state: "loading", message: "Connecting to Codex app-server…" },
+  };
 
   // Boot from the shared snapshots so gauges render immediately (with an honest
   // "updated Xs ago" age) even before the first live fetch succeeds.
@@ -962,7 +1204,43 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let firstPaintDone = false;
   let needsYouOnly = false;
   let workspaceOnlyOverride: boolean | undefined;
-  const dismissed = new Set<string>();
+  const dismissalTtlMs = 30 * 24 * 3600 * 1000;
+  const storedDismissals = ctx.globalState.get<Array<{ key: string; at: number }>>(
+    "dismissedSessionsV2",
+    [],
+  );
+  const dismissed = new Map<string, number>();
+  const dismissalLoadNow = Date.now();
+  if (Array.isArray(storedDismissals)) {
+    for (const entry of storedDismissals.slice(-5000)) {
+      if (
+        entry &&
+        typeof entry.key === "string" &&
+        /^(claude|codex):/.test(entry.key) &&
+        entry.key.length <= 256 &&
+        typeof entry.at === "number" &&
+        entry.at > dismissalLoadNow - dismissalTtlMs &&
+        entry.at < dismissalLoadNow + 60_000
+      ) {
+        dismissed.set(entry.key, entry.at);
+      }
+    }
+  }
+  const persistDismissals = async (): Promise<void> => {
+    const cutoff = Date.now() - dismissalTtlMs;
+    for (const [key, at] of dismissed) {
+      if (at < cutoff) dismissed.delete(key);
+    }
+    if (dismissed.size > 5000) {
+      const keep = [...dismissed].sort((a, b) => b[1] - a[1]).slice(0, 5000);
+      dismissed.clear();
+      for (const [key, at] of keep) dismissed.set(key, at);
+    }
+    await ctx.globalState.update(
+      "dismissedSessionsV2",
+      [...dismissed].map(([key, at]) => ({ key, at })),
+    );
+  };
   let resumeTimer: ReturnType<typeof setTimeout> | undefined;
   let resumeActive = false;
   let autoResumeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -979,14 +1257,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
   }
 
   function maybeScheduleAutoResume(views: SessionView[]): void {
-    if (!cfg().get<boolean>("autoResumeAfterReset", false)) {
+    if (!claudeEnabled() || !cfg().get<boolean>("autoResumeAfterReset", false)) {
       clearAutoResume();
       return;
     }
     const nowMs = Date.now();
     const g5 = officialUsage?.gauges.find((g) => g.key === "session");
     let target = 0;
-    const limitedViews = views.filter((v) => groupOf(v) === "limited");
+    const limitedViews = views.filter((v) => v.provider === "claude" && groupOf(v) === "limited");
     if (limitedViews.length) {
       for (const v of limitedViews) {
         const e = v.resetText ? parseResetToEpoch(v.resetText, nowMs / 1000) : undefined;
@@ -1009,7 +1287,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
     autoResumeTimer = setTimeout(() => {
       autoResumeTimer = undefined;
       autoResumeAt = 0;
-      if (!cfg().get<boolean>("autoResumeAfterReset", false) || resumeActive) return;
+      if (
+        disposed ||
+        !claudeEnabled() ||
+        !cfg().get<boolean>("autoResumeAfterReset", false) ||
+        resumeActive
+      ) {
+        return;
+      }
       vscode.window.showInformationMessage("Claude Sessions: limit reset — starting auto resume sweep.");
       vscode.commands.executeCommand("claudeSessionMonitor.resumeAll");
     }, delay);
@@ -1208,7 +1493,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           usageByAccount.set(a.id, { usage: r.usage, stale: false });
           writeOfficialSnapshot({ gauges: r.usage.gauges, ts: r.usage.ts, attemptTs: now2 }, file);
           changed = true;
-          log(`usage ok (acct ${a.email}): ${r.usage.gauges.map((g) => `${g.key}=${Math.round(g.pct)}`).join(" ")}`);
+          log(`usage ok (acct ${a.id.slice(0, 8)}): ${r.usage.gauges.map((g) => `${g.key}=${Math.round(g.pct)}`).join(" ")}`);
         } else if (r.status === 401 || r.status === 403) {
           // Token revoked/expired server-side: keep last-known data, mark stale,
           // and retry no sooner than 30 minutes (a re-login refreshes instantly).
@@ -1219,7 +1504,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           const cur = usageByAccount.get(a.id);
           usageByAccount.set(a.id, { usage: cur?.usage ?? null, stale: true });
           changed = true;
-          log(`usage acct ${a.email}: token rejected (${r.status})`);
+          log(`usage acct ${a.id.slice(0, 8)}: token rejected (${r.status})`);
         } else if (r.status === 429) {
           const b = nextUsageBackoffSec(cur2.backoffSec, r.retryAfterSec);
           writeOfficialSnapshot({ ...cur2, attemptTs: now2, backoffUntil: now2 + b, backoffSec: b }, file);
@@ -1280,8 +1565,71 @@ export function activate(ctx: vscode.ExtensionContext): void {
     };
   }
 
+  function currentCodexClient(): CodexAppServerClient {
+    const executable = cfg().get<string>("codexExecutable", "codex").trim() || "codex";
+    if (!codexClient || codexExecutable !== executable) {
+      codexClient?.dispose();
+      codexExecutable = executable;
+      codexClient = new CodexAppServerClient(executable);
+    }
+    return codexClient;
+  }
+
+  async function pollCodex(force: boolean): Promise<void> {
+    if (disposed) return;
+    if (!codexEnabled()) {
+      codexClient?.dispose();
+      codexClient = undefined;
+      codexExecutable = "";
+      codexFailureCount = 0;
+      codexRetryAfter = 0;
+      return;
+    }
+    const now = Date.now() / 1000;
+    const cadence = Math.max(3, cfg().get<number>("codexPollSeconds", 5));
+    if (!force && now < codexRetryAfter) return;
+    if (!force && now - lastCodexRefresh < cadence) return;
+    if (codexRefreshInflight) return;
+    codexRefreshInflight = true;
+    lastCodexRefresh = now;
+    try {
+      const c = cfg();
+      const wsOnly =
+        workspaceOnlyOverride !== undefined
+          ? workspaceOnlyOverride
+          : c.get<boolean>("workspaceOnly", false);
+      const client = currentCodexClient();
+      const next = await client.refresh({
+        now,
+        maxAgeSec: c.get<number>("recentScanMaxAgeHours", 6) * 3600,
+        hideEndedOlderThanSec: c.get<number>("hideEndedAfterMinutes", 30) * 60,
+        showEnded: c.get<boolean>("showEnded", false),
+        workspaceCwd: wsOnly ? workspaceCwd() : undefined,
+      });
+      // Ignore a late response from an executable/provider instance that was
+      // disabled or replaced while its request was in flight.
+      if (client === codexClient && codexEnabled()) {
+        codexSnapshot = next;
+        if (next.health.state === "degraded") {
+          codexFailureCount++;
+          const delay = Math.min(
+            300,
+            cadence * 2 ** Math.min(codexFailureCount - 1, 6),
+          );
+          codexRetryAfter = Date.now() / 1000 + delay;
+        } else {
+          codexFailureCount = 0;
+          codexRetryAfter = 0;
+        }
+      }
+    } finally {
+      codexRefreshInflight = false;
+    }
+    if (!disposed) refresh();
+  }
+
   /** Rebuild the sessions table payload (grouping, per-row stats, badge) and post it. */
-  function pushSessions(views: SessionView[]): void {
+  function pushSessions(views: SessionView[], allViews: SessionView[] = views): void {
     // Token hog: the biggest 5h consumer, only when it is a meaningful share.
     let hogId: string | null = null;
     if (tokenUsage?.bySession5h) {
@@ -1294,8 +1642,27 @@ export function activate(ctx: vscode.ExtensionContext): void {
         resourceCache,
         tokenUsage,
         hogId,
-        needsYouOnly ? "needs-you only" : "",
+        [
+          needsYouOnly ? "needs-you only" : "",
+          providerFilter !== "all" ? providerLabel(providerFilter) : "",
+        ]
+          .filter(Boolean)
+          .join(" · "),
         cfg().get<number>("cpuHogThreshold", 60),
+        countProviders(allViews),
+        providerFilter,
+        enabledProviders().map((provider) =>
+          provider === "codex"
+            ? codexSnapshot.health
+            : { provider: "claude", state: "ready" as const, updatedAt: Date.now() / 1000 },
+        ),
+        views.length
+          ? ""
+          : enabledProviders().length === 0
+            ? "Both providers are disabled. Enable Claude or Codex in Settings."
+            : providerFilter !== "all" || needsYouOnly
+              ? "No sessions match the active filters."
+              : "No recent Claude or Codex sessions. Start one and it will appear here.",
       ),
     );
     let badge = 0;
@@ -1309,19 +1676,40 @@ export function activate(ctx: vscode.ExtensionContext): void {
   function pushUsagePayload(): void {
     try {
       const c = currentAccountCtx();
-      limitsView.update(buildLimitsPayload(lastViews, tokenUsage, c.usage, usageNote, c));
-      updateStatusBar(statusBar, lastViews, resourceCache, officialUsage);
+      limitsView.update(
+        buildLimitsPayload(
+          lastAllViews,
+          tokenUsage,
+          c.usage,
+          usageNote,
+          c,
+          codexEnabled() ? codexSnapshot : null,
+          enabledProviders(),
+        ),
+      );
+      updateStatusBar(
+        statusBar,
+        lastAllViews,
+        resourceCache,
+        claudeEnabled() ? officialUsage : null,
+      );
     } catch {
       /* ignore */
     }
   }
 
   function refresh(): void {
+    if (disposed) return;
     const now = Date.now() / 1000;
     const c = cfg();
+    if (providerFilter !== "all" && !enabledProviders().includes(providerFilter)) {
+      providerFilter = "all";
+      void ctx.globalState.update("providerFilter", providerFilter);
+    }
+    if (codexEnabled()) void pollCodex(false);
 
     const maxAgeHours = c.get<number>("recentScanMaxAgeHours", 6);
-    if (now - lastRecentScan > 25) {
+    if (claudeEnabled() && now - lastRecentScan > 25) {
       try {
         recentCache = findRecentTranscripts(maxAgeHours * 3600 * 1000, 120, now);
       } catch {
@@ -1333,6 +1721,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (now - lastCleanup > 600) {
       try {
         cleanupMonitorFiles(12 * 3600 * 1000, now);
+        cleanupMonitorFiles(12 * 3600 * 1000, now, CODEX_MONITOR_DIR);
         pruneLimitsHistory(3000);
       } catch {
         /* ignore */
@@ -1340,7 +1729,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       lastCleanup = now;
     }
 
-    if (now - lastTokenScan > 60) {
+    if (claudeEnabled() && now - lastTokenScan > 60) {
       lastTokenScan = now;
       try {
         const tx7 = findRecentTranscripts(7 * 86400 * 1000, 400, now);
@@ -1352,14 +1741,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
     // Official usage poll — coordinated across ALL VS Code windows through the
     // shared snapshot file (see pollUsage).
-    if (now - lastUsageCheck > 5) {
+    if (claudeEnabled() && now - lastUsageCheck > 5) {
       lastUsageCheck = now;
       void pollUsage(false);
     }
 
     // Non-active accounts: pick up registry changes other windows wrote, then
     // refresh their usage in the background on a slower cadence.
-    if (now - lastOthersCheck > 30) {
+    if (claudeEnabled() && now - lastOthersCheck > 30) {
       lastOthersCheck = now;
       accountsFile = readAccountsFile();
       void pollOtherAccounts(false);
@@ -1368,43 +1757,66 @@ export function activate(ctx: vscode.ExtensionContext): void {
     const wsOnly =
       workspaceOnlyOverride !== undefined ? workspaceOnlyOverride : c.get<boolean>("workspaceOnly", false);
 
-    let views: SessionView[];
-    try {
-      views = collectSessions({
-        now,
-        extraTranscripts: recentCache,
-        txCache,
-        allowedEntrypoints: DEFAULT_ENTRYPOINTS,
-        maxAgeSec: maxAgeHours * 3600,
-        hideEndedOlderThanSec: c.get<number>("hideEndedAfterMinutes", 30) * 60,
-        workspaceCwd: wsOnly ? workspaceCwd() : undefined,
-        showEnded: c.get<boolean>("showEnded", false),
-      });
-    } catch {
-      views = [];
+    let claudeViews: SessionView[] = [];
+    if (claudeEnabled()) {
+      try {
+        claudeViews = collectSessions({
+          now,
+          extraTranscripts: recentCache,
+          txCache,
+          allowedEntrypoints: DEFAULT_ENTRYPOINTS,
+          maxAgeSec: maxAgeHours * 3600,
+          hideEndedOlderThanSec: c.get<number>("hideEndedAfterMinutes", 30) * 60,
+          workspaceCwd: wsOnly ? workspaceCwd() : undefined,
+          showEnded: c.get<boolean>("showEnded", false),
+        });
+      } catch {
+        claudeViews = [];
+      }
     }
 
-    for (const v of views) if (dismissed.has(v.sessionId) && groupOf(v) !== "ended") dismissed.delete(v.sessionId);
-    if (dismissed.size) views = views.filter((v) => !dismissed.has(v.sessionId));
+    let allViews = mergeProviderSessions(
+      claudeViews,
+      codexEnabled() ? codexSnapshot.sessions : [],
+    );
+    let dismissalsChanged = false;
+    for (const v of allViews) {
+      const dismissedAt = dismissed.get(v.key);
+      if (
+        dismissedAt != null &&
+        groupOf(v) !== "ended" &&
+        v.lastActivityMs > dismissedAt + 500
+      ) {
+        dismissed.delete(v.key);
+        dismissalsChanged = true;
+      }
+    }
+    if (dismissalsChanged) void persistDismissals();
+    if (dismissed.size) allViews = allViews.filter((v) => !dismissed.has(v.key));
+    lastAllViews = allViews;
+
+    let views = filterProvider(allViews, providerFilter);
     if (needsYouOnly) views = views.filter((v) => NEEDS_YOU.includes(groupOf(v)));
     lastViews = views;
 
     if (now - lastSessLog > 20) {
       lastSessLog = now;
-      log(`sessions=${views.length} ${JSON.stringify(countBuckets(views))} dismissed=${dismissed.size} needsYouOnly=${needsYouOnly}`);
+      log(
+        `sessions=${allViews.length} ${JSON.stringify(countBuckets(allViews))} providers=${JSON.stringify(countProviders(allViews))} dismissed=${dismissed.size}`,
+      );
     }
 
-    pushSessions(views);
+    pushSessions(views, allViews);
     pushUsagePayload();
 
-    maybeScheduleAutoResume(views);
+    maybeScheduleAutoResume(allViews);
 
     // Idle RAM advisory: waiting/your-turn sessions silent >1h holding real memory.
     const idleThr = c.get<number>("idleRamWarnMb", 2000);
     if (idleThr > 0 && now - lastIdleRamWarn > 3600) {
       let rss = 0;
       let cnt = 0;
-      for (const v of views) {
+      for (const v of allViews) {
         const g = groupOf(v);
         if ((g === "done" || g === "waiting") && now - v.lastActivityMs / 1000 > 3600) {
           const r = freshRes(v, resourceCache);
@@ -1418,7 +1830,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         lastIdleRamWarn = now;
         vscode.window
           .showInformationMessage(
-            `Claude Sessions: ${cnt} idle session(s) holding ${fmtMb(rss)} RAM — consider closing finished tabs.`,
+            `Agent Sessions: ${cnt} idle session(s) holding ${fmtMb(rss)} RAM — consider closing finished tabs.`,
             "Show",
           )
           .then((ch) => {
@@ -1427,16 +1839,25 @@ export function activate(ctx: vscode.ExtensionContext): void {
       }
     }
 
-    detectTransitions(views, lastSeen, firstPaintDone, c);
-    if (firstPaintDone) checkStuck(views, stuckNotified, c, resourceCache);
+    // Run on the first snapshot as well: checkStuck silently seeds sessions
+    // that were already stale before monitoring began. This also covers a
+    // provider whose first asynchronous snapshot arrives after first paint.
+    checkStuck(allViews, stuckNotified, c, resourceCache, lastSeen);
+    detectTransitions(allViews, lastSeen, firstPaintDone, c);
     firstPaintDone = true;
 
     if (now - lastResourceSample > Math.max(1000, c.get<number>("resourceSampleMs", 3000)) / 1000) {
       lastResourceSample = now;
-      const pids = views.map((v) => v.pid).filter((p): p is number => !!p);
+      const pids = allViews.map((v) => v.pid).filter((p): p is number => !!p);
       sampleResources(pids, resourceCache, () => {
-        updateStatusBar(statusBar, lastViews, resourceCache, officialUsage);
-        pushSessions(lastViews);
+        if (disposed) return;
+        updateStatusBar(
+          statusBar,
+          lastAllViews,
+          resourceCache,
+          claudeEnabled() ? officialUsage : null,
+        );
+        pushSessions(lastViews, lastAllViews);
       });
     }
   }
@@ -1456,6 +1877,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     text: string,
     opts: { staggerSec: number; doneLabel: string; submitDelayMs?: number; autoType?: boolean },
   ): void {
+    // These commands type Claude slash-commands into the focused Claude input.
+    // Keep this guard even when the caller already filtered by capability so a
+    // mixed-provider command argument can never receive unattended keystrokes.
+    queue = queue.filter((v) => v.provider === "claude" && v.capabilities.bulkInput);
     if (!queue.length) {
       vscode.window.showInformationMessage(`Claude Sessions: no open sessions to ${opts.doneLabel}.`);
       return;
@@ -1513,7 +1938,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
           if (!resumeActive) return;
           if (!front || !a || !matchCandidates(v).some((c) => labelsMatch(a, c))) {
             skipped++;
-            log(`${opts.doneLabel} skip "${truncate(v.title, 40)}": front=${front} active=${a ?? "?"}`);
+            log(
+              `${opts.doneLabel} skip ${v.key}: front=${front} activeMatched=${
+                !!a && matchCandidates(v).some((candidate) => labelsMatch(a, candidate))
+              }`,
+            );
           } else {
             const r = await typeAndSubmit(text, opts.submitDelayMs);
             if (!r.ok) {
@@ -1585,31 +2014,85 @@ export function activate(ctx: vscode.ExtensionContext): void {
       workspaceOnlyOverride = !current;
       vscode.window.showInformationMessage(
         workspaceOnlyOverride
-          ? "Claude Sessions: this workspace only."
-          : "Claude Sessions: all workspaces.",
+          ? "Agent Sessions: this workspace only."
+          : "Agent Sessions: all workspaces.",
       );
       refresh();
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.toggleNeedsYouOnly", () => {
       needsYouOnly = !needsYouOnly;
       vscode.window.showInformationMessage(
-        needsYouOnly ? "Claude Sessions: needs-you only." : "Claude Sessions: all sessions.",
+        needsYouOnly ? "Agent Sessions: needs-you only." : "Agent Sessions: all sessions.",
       );
       refresh();
     }),
-    vscode.commands.registerCommand("claudeSessionMonitor.clearEnded", () => {
+    vscode.commands.registerCommand("claudeSessionMonitor.toggleProvider", () => {
+      const order: Array<AgentProvider | "all"> = ["all", ...enabledProviders()];
+      providerFilter = order[(order.indexOf(providerFilter) + 1) % order.length];
+      void ctx.globalState.update("providerFilter", providerFilter);
+      vscode.window.showInformationMessage(
+        providerFilter === "all"
+          ? "Agent Sessions: showing Claude and Codex."
+          : `Agent Sessions: showing ${providerLabel(providerFilter)} only.`,
+      );
+      refresh();
+    }),
+    vscode.commands.registerCommand("claudeSessionMonitor.clearEnded", async () => {
       const now = Date.now() / 1000;
-      for (const v of lastViews) if (groupOf(v) === "ended") dismissed.add(v.sessionId);
-      const removed = cleanupEndedMonitorFiles(now);
-      vscode.window.showInformationMessage(`Claude Sessions: cleared ${removed} ended session(s).`);
+      const dismissedAt = Date.now();
+      const previousDismissals = new Map(dismissed);
+      for (const v of lastAllViews) {
+        if (groupOf(v) === "ended") dismissed.set(v.key, dismissedAt);
+      }
+      // Ended rows are normally hidden before they reach lastAllViews. Capture
+      // their provider-scoped identities before deleting the lifecycle files,
+      // otherwise transcript/app-server fallback can resurrect them as unknown
+      // immediately (or after a VS Code reload).
+      for (const [sessionId, status] of readHookStatuses()) {
+        if (status.state === "ended") {
+          dismissed.set(sessionKey("claude", sessionId), dismissedAt);
+        }
+      }
+      for (const [sessionId, status] of readCodexHookStatuses()) {
+        if (status.state === "ended") {
+          dismissed.set(sessionKey("codex", sessionId), dismissedAt);
+        }
+      }
+      try {
+        await persistDismissals();
+      } catch {
+        dismissed.clear();
+        for (const [key, at] of previousDismissals) dismissed.set(key, at);
+        vscode.window.showErrorMessage(
+          "Agent Sessions: could not persist the cleared-session state; no status files were removed.",
+        );
+        return;
+      }
+      const removed =
+        cleanupEndedMonitorFiles(now) + cleanupEndedMonitorFiles(now, 12 * 3600 * 1000, CODEX_MONITOR_DIR);
+      vscode.window.showInformationMessage(`Agent Sessions: cleared ${removed} ended status file(s).`);
       txCache.clear();
       refresh();
     }),
-    vscode.commands.registerCommand("claudeSessionMonitor.removeSession", (v?: SessionView) => {
-      if (!v?.sessionId) return;
-      dismissed.add(v.sessionId);
+    vscode.commands.registerCommand("claudeSessionMonitor.removeSession", async (arg?: SessionView) => {
+      const ref = asView(arg);
+      const v = ref ? lastAllViews.find((session) => session.key === ref.key) : undefined;
+      if (!v) return;
+      const previousDismissal = dismissed.get(v.key);
+      dismissed.set(v.key, Date.now());
       try {
-        fs.unlinkSync(`${MONITOR_DIR}/${v.sessionId}.json`);
+        await persistDismissals();
+      } catch {
+        if (previousDismissal == null) dismissed.delete(v.key);
+        else dismissed.set(v.key, previousDismissal);
+        vscode.window.showErrorMessage(
+          "Agent Sessions: could not persist the removed-session state; the session was kept.",
+        );
+        return;
+      }
+      try {
+        const dir = v.provider === "codex" ? CODEX_MONITOR_DIR : MONITOR_DIR;
+        fs.unlinkSync(`${dir}/${v.sessionId}.json`);
       } catch {
         /* may not exist */
       }
@@ -1618,14 +2101,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claudeSessionMonitor.dumpTabs", () => {
       const total = dumpTabsTo(`${MONITOR_DIR}/tabs-debug.json`);
       vscode.window.showInformationMessage(
-        `Claude Sessions: wrote ${total} tabs to ~/.claude/session-monitor/tabs-debug.json`,
+        `Agent Sessions: wrote ${total} tabs to ~/.claude/session-monitor/tabs-debug.json`,
       );
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.stopResumeAll", () =>
       stopResume("Claude Sessions: resume sweep stopped."),
     ),
     vscode.commands.registerCommand("claudeSessionMonitor.resumeAll", () => {
-      const queue = lastViews.filter((v) => groupOf(v) !== "ended");
+      const queue = lastAllViews.filter(
+        (v) => v.provider === "claude" && v.capabilities.bulkInput && groupOf(v) !== "ended",
+      );
       const c = cfg();
       // Collapse newlines so a single resumePrompt value can never encode more
       // than one Return keystroke (osascript `keystroke` submits on each \n).
@@ -1637,7 +2122,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
       });
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.setModelAll", async () => {
-      const queue = lastViews.filter((v) => groupOf(v) !== "ended");
+      const queue = lastAllViews.filter(
+        (v) => v.provider === "claude" && v.capabilities.bulkInput && groupOf(v) !== "ended",
+      );
       const items: { label: string; value: string }[] = [
         { label: "Opus 4.8", value: "opus" },
         { label: "Sonnet 5", value: "sonnet" },
@@ -1668,7 +2155,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
       });
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.setEffortAll", async () => {
-      const queue = lastViews.filter((v) => groupOf(v) !== "ended");
+      const queue = lastAllViews.filter(
+        (v) => v.provider === "claude" && v.capabilities.bulkInput && groupOf(v) !== "ended",
+      );
       const level = await vscode.window.showQuickPick(["low", "medium", "high", "xhigh", "max"], {
         placeHolder: "Reasoning effort to set for every open session",
       });
@@ -1691,13 +2180,22 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claudeSessionMonitor.openTranscript", (arg?: SessionView) =>
       openTranscript(arg),
     ),
-    vscode.commands.registerCommand("claudeSessionMonitor.openSession", (v: SessionView) =>
-      jumpToSession(v),
-    ),
+    vscode.commands.registerCommand("claudeSessionMonitor.openSession", (arg?: SessionView) => {
+      const v = asView(arg);
+      if (v) void jumpToSession(v);
+    }),
+    vscode.commands.registerCommand("claudeSessionMonitor.resumeSession", (v?: SessionView) => {
+      const session = asView(v);
+      if (session) resumeInTerminal(session);
+    }),
     vscode.commands.registerCommand("claudeSessionMonitor.refreshUsage", async () => {
-      vscode.window.setStatusBarMessage("Claude Sessions: refreshing usage…", 2500);
-      await pollUsage(true);
-      await pollOtherAccounts(true);
+      vscode.window.setStatusBarMessage("Agent Sessions: refreshing usage…", 2500);
+      await Promise.all([
+        claudeEnabled()
+          ? pollUsage(true).then(() => pollOtherAccounts(true))
+          : Promise.resolve(),
+        codexEnabled() ? pollCodex(true) : Promise.resolve(),
+      ]);
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.forgetOtherAccounts", async () => {
       accountsFile = readAccountsFile(); // another window may have a fresher registry
@@ -1736,19 +2234,19 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.focusNextNeedsYou", () => {
       const order: Record<string, number> = { limited: 0, waiting: 1, done: 2 };
-      const cand = lastViews
+      const cand = lastAllViews
         .filter((v) => NEEDS_YOU.includes(groupOf(v)))
         .sort(
           (a, b) =>
             (order[groupOf(a)] ?? 9) - (order[groupOf(b)] ?? 9) || a.lastActivityMs - b.lastActivityMs,
         );
       if (!cand.length) {
-        vscode.window.setStatusBarMessage("Claude Sessions: nothing needs you 🎉", 3000);
+        vscode.window.setStatusBarMessage("Agent Sessions: nothing needs you 🎉", 3000);
         return;
       }
-      const idx = cand.findIndex((v) => v.sessionId === focusCursor);
+      const idx = cand.findIndex((v) => v.key === focusCursor);
       const next = cand[(idx + 1) % cand.length];
-      focusCursor = next.sessionId;
+      focusCursor = next.key;
       void jumpToSession(next);
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.copySessionId", (arg?: SessionView) => {
@@ -1766,8 +2264,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
       vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(v.cwd));
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.killProcess", async (arg?: SessionView) => {
-      const v = asView(arg);
-      if (!v?.pid) {
+      const ref = asView(arg);
+      const v = ref ? lastAllViews.find((session) => session.key === ref.key) : undefined;
+      if (!v?.pid || !v.capabilities.kill) {
         vscode.window.showWarningMessage("No process id known for this session.");
         return;
       }
@@ -1777,6 +2276,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
         "Kill",
       );
       if (pick !== "Kill") return;
+      if (!(await verifyKillTarget(v))) {
+        vscode.window.showWarningMessage(
+          "The recorded process has exited or no longer matches this session provider; nothing was killed.",
+        );
+        return;
+      }
       try {
         process.kill(v.pid, "SIGTERM");
         vscode.window.showInformationMessage(`Sent SIGTERM to pid ${v.pid}.`);
@@ -1787,16 +2292,26 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }),
     { dispose: () => stopResume() },
     { dispose: () => clearAutoResume() },
+    {
+      dispose: () => {
+        disposed = true;
+        codexClient?.dispose();
+        codexClient = undefined;
+      },
+    },
   );
 
   const debouncedRefresh = debounce(refresh, 200);
-  try {
-    fs.mkdirSync(MONITOR_DIR, { recursive: true });
-    const w = fs.watch(MONITOR_DIR, debouncedRefresh);
-    w.on("error", () => {});
-    ctx.subscriptions.push({ dispose: () => w.close() });
-  } catch {
-    /* polling still covers it */
+  ctx.subscriptions.push({ dispose: () => debouncedRefresh.cancel() });
+  for (const monitorDir of [MONITOR_DIR, CODEX_MONITOR_DIR]) {
+    try {
+      ensurePrivateDir(monitorDir);
+      const w = fs.watch(monitorDir, debouncedRefresh);
+      w.on("error", () => {});
+      ctx.subscriptions.push({ dispose: () => w.close() });
+    } catch {
+      /* polling still covers it */
+    }
   }
   try {
     const w2 = fs.watch(PROJECTS_DIR, { recursive: true }, debouncedRefresh);
@@ -1815,18 +2330,41 @@ export function activate(ctx: vscode.ExtensionContext): void {
         clearInterval(pollTimer);
         pollTimer = setInterval(refresh, Math.max(500, cfg().get<number>("pollIntervalMs", 1500)));
       }
+      if (
+        e.affectsConfiguration("claudeSessionMonitor.enableClaude") ||
+        e.affectsConfiguration("claudeSessionMonitor.enableCodex") ||
+        e.affectsConfiguration("claudeSessionMonitor.codexExecutable") ||
+        e.affectsConfiguration("claudeSessionMonitor.codexPollSeconds")
+      ) {
+        if (e.affectsConfiguration("claudeSessionMonitor.enableClaude") && !claudeEnabled()) {
+          clearAutoResume();
+          stopResume();
+        }
+        lastCodexRefresh = 0;
+        if (
+          e.affectsConfiguration("claudeSessionMonitor.enableCodex") ||
+          e.affectsConfiguration("claudeSessionMonitor.codexExecutable")
+        ) {
+          codexClient?.dispose();
+          codexClient = undefined;
+          codexExecutable = "";
+          codexFailureCount = 0;
+          codexRetryAfter = 0;
+          codexSnapshot = {
+            sessions: [],
+            usage: null,
+            health: {
+              provider: "codex",
+              state: "loading",
+              message: "Connecting to Codex app-server…",
+            },
+          };
+        }
+        void pollCodex(true);
+        refresh();
+      }
     }),
   );
-
-  // One-shot tab dump a few seconds after startup so jump matching can be diagnosed.
-  const dumpTimer = setTimeout(() => {
-    try {
-      dumpTabsTo(`${MONITOR_DIR}/tabs-debug.json`);
-    } catch {
-      /* ignore */
-    }
-  }, 5000);
-  ctx.subscriptions.push({ dispose: () => clearTimeout(dumpTimer) });
 
   refresh();
 }
@@ -1858,6 +2396,32 @@ function sampleResources(pids: number[], cache: Map<number, ResStat>, done: () =
     }
     for (const [pid, v] of cache) if (now - v.ts > 60) cache.delete(pid);
     done();
+  });
+}
+
+function verifyKillTarget(view: SessionView): Promise<boolean> {
+  if (!view.pid || !view.capabilities.kill) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    execFile(
+      "ps",
+      ["-p", String(view.pid), "-o", "command="],
+      { timeout: 3000 },
+      (error, stdout) => {
+        if (error || !stdout) {
+          resolve(false);
+          return;
+        }
+        const command = String(stdout).trim().toLowerCase();
+        if (view.provider === "codex") {
+          resolve(
+            /(?:^|[/\s])codex(?:\s|$)/.test(command) &&
+              !/(?:^|\s)app-server(?:\s|$)/.test(command),
+          );
+          return;
+        }
+        resolve(command.includes("anthropic.claude-code") && command.includes("resources"));
+      },
+    );
   });
 }
 
@@ -1894,9 +2458,9 @@ function updateStatusBar(
 
   // Surface 5h usage in the bar once it is worth watching (>= 70%).
   const g5 = usage?.gauges.find((g) => g.key === "session");
-  if (g5 && g5.pct >= 70) segs.push(`$(dashboard) ${Math.round(g5.pct)}%`);
+  if (g5 && g5.pct >= 70) segs.push(`$(dashboard) C ${Math.round(g5.pct)}%`);
 
-  item.text = segs.length ? `$(pulse) ${segs.join("  ")}` : "$(pulse) Claude: no sessions";
+  item.text = segs.length ? `$(pulse) ${segs.join("  ")}` : "$(pulse) Agent: no sessions";
 
   let totalCpu = 0;
   let totalRss = 0;
@@ -1909,9 +2473,10 @@ function updateStatusBar(
   }
   const resLine = totalRss ? `\ntotal: CPU ${Math.round(totalCpu)}% · ${fmtMb(totalRss)}` : "";
   const usageLine = usage?.gauges.length
-    ? `\nusage: ${usage.gauges.map((g) => `${g.label} ${Math.round(g.pct)}%`).join(" · ")}`
+    ? `\nClaude usage: ${usage.gauges.map((g) => `${g.label} ${Math.round(g.pct)}%`).join(" · ")}`
     : "";
-  item.tooltip = `Claude sessions\nworking: ${counts.working}\nwaiting: ${waiting}\nyour turn: ${done}\nlimited: ${counts.limited}${resLine}${usageLine}\n(click to open the panel)`;
+  const providers = countProviders(views);
+  item.tooltip = `Agent sessions\nClaude: ${providers.claude} · Codex: ${providers.codex}\nworking: ${counts.working}\nwaiting: ${waiting}\nyour turn: ${done}\nlimited: ${counts.limited}${resLine}${usageLine}\n(click to open the panel)`;
 
   if (counts.limited > 0) {
     item.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
@@ -1929,6 +2494,10 @@ function buildSessionsPayload(
   hogId: string | null,
   filter: string,
   cpuHogThreshold: number,
+  providerCounts: ProviderCounts,
+  providerFilter: AgentProvider | "all",
+  health: ProviderHealth[],
+  emptyMessage: string,
 ): SessionsPayload {
   const nowSec = Date.now() / 1000;
   const grouped = new Map<GroupKey, SessionRow[]>();
@@ -1943,22 +2512,30 @@ function buildSessionsPayload(
       totalRss += res.rssMb;
       anyRes = true;
     }
-    const tok = tokens?.bySession5h?.[v.sessionId] ?? 0;
+    const rollingClaudeTokens =
+      v.provider === "claude" ? (tokens?.bySession5h?.[v.sessionId] ?? 0) : 0;
+    const tok = v.tokens ?? rollingClaudeTokens;
+    const tokenScope = v.tokenScope ?? (v.provider === "claude" ? "rolling-5h" : undefined);
     const total5h = tokens?.fiveHour ?? 0;
-    const share = tok && total5h > 0 ? Math.round((tok / total5h) * 100) : 0;
+    const share =
+      tokenScope === "rolling-5h" && tok && total5h > 0
+        ? Math.round((tok / total5h) * 100)
+        : 0;
     const resTip = res ? `\nCPU: ${Math.round(res.cpu)}%  RAM: ${res.rssMb}MB  (pid ${v.pid})` : "";
     const tokTip =
       tok >= 10_000
-        ? `\ntokens (5h): ${fmtTokensCompact(tok)}${share >= 1 ? ` · ${share}% of this Mac's total` : ""}${v.sessionId === hogId ? " · top consumer" : ""}`
+        ? `\ntokens (${tokenScope === "thread-total" ? "thread total" : "rolling 5h"}): ${fmtTokensCompact(tok)}${share >= 1 ? ` · ${share}% of this Mac's total` : ""}${v.provider === "claude" && v.sessionId === hogId ? " · top consumer" : ""}`
         : "";
     const row: SessionRow = {
-      id: v.sessionId,
+      id: v.key,
+      provider: v.provider,
+      providerLabel: providerLabel(v.provider),
       title: v.title,
       sub: isRedundantSub(v.sub) ? "" : v.sub,
       reset: v.resetText ? formatReset(v.resetText, nowSec) : "",
       tokens: tok >= 10_000 ? fmtTokensCompact(tok) : "",
       share,
-      hog: v.sessionId === hogId,
+      hog: v.provider === "claude" && v.sessionId === hogId,
       model: v.model ? shortModelName(v.model) : "",
       effort: shortEffort(v.effort) ?? "",
       lastMs: v.lastActivityMs,
@@ -1968,6 +2545,9 @@ function buildSessionsPayload(
       cpuHog: !!res && res.cpu >= cpuHogThreshold,
       stale: g === "working" && v.stale,
       ended: g === "ended",
+      canTranscript: v.capabilities.transcript,
+      canKill: v.capabilities.kill,
+      canResume: v.capabilities.resume,
       tip: v.tooltip + resTip + tokTip,
     };
     const arr = grouped.get(g) ?? [];
@@ -1990,6 +2570,10 @@ function buildSessionsPayload(
     totalRss: anyRes ? totalRss : null,
     effort,
     filter,
+    providerCounts,
+    providerFilter,
+    health,
+    emptyMessage,
   };
 }
 
@@ -2009,24 +2593,27 @@ function detectTransitions(
 
   const present = new Set<string>();
   for (const v of views) {
-    present.add(v.sessionId);
+    present.add(v.key);
     const g = groupOf(v);
-    const prev = lastSeen.get(v.sessionId);
-    lastSeen.set(v.sessionId, g);
+    const prev = lastSeen.get(v.key);
+    lastSeen.set(v.key, g);
 
-    if (!firstPaintDone) continue;
+    // A provider may deliver its first snapshot after the panel's first paint.
+    // Seed that row silently: only a transition from a state we have actually
+    // observed should notify.
+    if (!firstPaintDone || prev === undefined) continue;
     if (prev === g) continue;
 
     if (g === "limited" && notifyLimited) {
       const reset = v.resetText ? ` (reset ${v.resetText})` : "";
-      toast("error", `🔴 Limited: "${truncate(v.title, 48)}" · ${v.sub}${reset}`, v);
-      nativeNotify(c, "Claude: limited", `${truncate(v.title, 48)} · ${v.sub}${reset}`);
+      toast("error", `🔴 ${providerLabel(v.provider)} limited: "${truncate(v.title, 48)}" · ${v.sub}${reset}`, v);
+      nativeNotify(c, `${providerLabel(v.provider)}: limited`, `${truncate(v.title, 48)} · ${v.sub}${reset}`);
     } else if (g === "waiting" && notifyWaiting) {
       const msg = v.notifMessage ? ` · ${truncate(v.notifMessage, 60)}` : "";
-      toast("warn", `🟡 Waiting: "${truncate(v.title, 48)}"${msg}`, v);
-      nativeNotify(c, "Claude: waiting for you", `${truncate(v.title, 48)}${msg}`);
+      toast("warn", `🟡 ${providerLabel(v.provider)} waiting: "${truncate(v.title, 48)}"${msg}`, v);
+      nativeNotify(c, `${providerLabel(v.provider)}: waiting for you`, `${truncate(v.title, 48)}${msg}`);
     } else if (g === "done" && notifyDone) {
-      toast("info", `🔵 Your turn: "${truncate(v.title, 48)}"`, v);
+      toast("info", `🔵 ${providerLabel(v.provider)} — your turn: "${truncate(v.title, 48)}"`, v);
     }
   }
   for (const id of [...lastSeen.keys()]) if (!present.has(id)) lastSeen.delete(id);
@@ -2037,32 +2624,41 @@ function checkStuck(
   stuckNotified: Set<string>,
   c: vscode.WorkspaceConfiguration,
   cache: Map<number, ResStat>,
+  seenBefore: ReadonlyMap<string, GroupKey>,
 ): void {
   const mins = c.get<number>("stuckAlertMinutes", 5);
   if (mins <= 0) return;
   const now = Date.now() / 1000;
   const present = new Set<string>();
   for (const v of views) {
-    present.add(v.sessionId);
+    present.add(v.key);
     if (groupOf(v) === "working") {
       // A silent transcript with real CPU load means "still computing", not stuck.
       const r = freshRes(v, cache);
       const cpuBusy = !!r && r.cpu >= 5;
       const age = v.lastActivityMs ? now - v.lastActivityMs / 1000 : 0;
       if (age > mins * 60 && !cpuBusy) {
-        if (!stuckNotified.has(v.sessionId)) {
-          stuckNotified.add(v.sessionId);
+        // When a provider's first asynchronous snapshot is already stale,
+        // remember it without producing a startup alert. Once it becomes
+        // active/non-working the sentinel is cleared, so a later real crossing
+        // of the threshold can still notify.
+        if (!seenBefore.has(v.key)) {
+          stuckNotified.add(v.key);
+          continue;
+        }
+        if (!stuckNotified.has(v.key)) {
+          stuckNotified.add(v.key);
           const msg = `${truncate(v.title, 48)} · ${Math.round(age / 60)}m silent`;
           vscode.window.showWarningMessage(`⚠️ Possibly stuck: ${msg}`, "Show").then((ch) => {
             if (ch === "Show") vscode.commands.executeCommand("claudeSessionMonitor.focus");
           });
-          nativeNotify(c, "Claude: possibly stuck", msg);
+          nativeNotify(c, `${providerLabel(v.provider)}: possibly stuck`, msg);
         }
       } else {
-        stuckNotified.delete(v.sessionId);
+        stuckNotified.delete(v.key);
       }
     } else {
-      stuckNotified.delete(v.sessionId);
+      stuckNotified.delete(v.key);
     }
   }
   for (const id of [...stuckNotified]) if (!present.has(id)) stuckNotified.delete(id);
@@ -2106,7 +2702,7 @@ const FOCUS_GROUP_CMDS = [
 
 function writeTabDebug(dbg: unknown): void {
   try {
-    fs.writeFileSync(MONITOR_DIR + "/tabs-debug.json", JSON.stringify(dbg, null, 2));
+    writePrivateTextAtomic(MONITOR_DIR + "/tabs-debug.json", JSON.stringify(dbg, null, 2));
   } catch {
     /* ignore */
   }
@@ -2118,7 +2714,15 @@ function matchCandidates(v: SessionView): string[] {
 }
 
 async function jumpToSession(v: SessionView): Promise<void> {
-  const dbg: any = { ts: new Date().toISOString(), title: v.title, groups: [], matched: null, action: null, error: null };
+  const dbg: any = {
+    ts: new Date().toISOString(),
+    provider: v.provider,
+    title: v.title,
+    groups: [],
+    matched: null,
+    action: null,
+    error: null,
+  };
   const candidates = matchCandidates(v);
   try {
     const groups = vscode.window.tabGroups.all;
@@ -2172,18 +2776,39 @@ async function jumpToSession(v: SessionView): Promise<void> {
  * session in a fresh terminal, or just copy its id.
  */
 async function promptNoTabMatch(v: SessionView): Promise<void> {
+  let canOpenCodex = false;
+  if (v.provider === "codex") {
+    try {
+      canOpenCodex = (await vscode.commands.getCommands(true)).includes("chatgpt.openSidebar");
+    } catch {
+      canOpenCodex = false;
+    }
+  }
+  const choices =
+    v.provider === "codex"
+      ? [
+          ...(canOpenCodex ? ["Open Codex"] : []),
+          "Resume in Terminal",
+          "Open Transcript",
+          "Copy ID",
+        ]
+      : ["Open Transcript", "Resume in Terminal", "Copy ID"];
   const choice = await vscode.window.showInformationMessage(
     `Session "${truncate(v.title, 60)}" has no open tab in this window.`,
-    "Open Transcript",
-    "Resume in Terminal",
-    "Copy ID",
+    ...choices,
   );
-  if (choice === "Open Transcript") {
+  if (choice === "Open Codex") {
+    try {
+      await vscode.commands.executeCommand("chatgpt.openSidebar");
+    } catch {
+      vscode.window.showWarningMessage(
+        "The Codex sidebar command is unavailable. Resume this session in a terminal instead.",
+      );
+    }
+  } else if (choice === "Open Transcript") {
     openTranscript(v);
   } else if (choice === "Resume in Terminal") {
-    const term = vscode.window.createTerminal({ name: truncate(v.title, 40), cwd: v.cwd });
-    term.sendText(`claude --resume ${v.sessionId}`);
-    term.show();
+    resumeInTerminal(v);
   } else if (choice === "Copy ID") {
     await vscode.env.clipboard.writeText(v.sessionId);
     vscode.window.setStatusBarMessage(`Copied session id ${v.sessionId.slice(0, 8)}…`, 3000);
@@ -2192,7 +2817,43 @@ async function promptNoTabMatch(v: SessionView): Promise<void> {
 
 /** Normalize a command argument to a SessionView (undefined when absent/foreign). */
 function asView(arg?: SessionView): SessionView | undefined {
-  return arg && typeof arg.sessionId === "string" ? arg : undefined;
+  if (!arg || typeof arg.sessionId !== "string" || !arg.sessionId.trim()) return undefined;
+  const provider: AgentProvider = arg.provider === "codex" ? "codex" : "claude";
+  return {
+    ...arg,
+    provider,
+    key: typeof arg.key === "string" && arg.key ? arg.key : sessionKey(provider, arg.sessionId),
+    capabilities: {
+      ...defaultCapabilities(provider),
+      ...(arg.capabilities ?? {}),
+    },
+  };
+}
+
+function resumeInTerminal(arg: SessionView): void {
+  const v = asView(arg);
+  if (!v || !v.capabilities.resume) {
+    vscode.window.showWarningMessage("This provider cannot resume the selected session.");
+    return;
+  }
+  const codexExecutable =
+    vscode.workspace
+      .getConfiguration("claudeSessionMonitor")
+      .get<string>("codexExecutable", "codex")
+      .trim() || "codex";
+  // Launch the provider directly instead of composing text for the user's
+  // configured terminal shell. This is safe for paths/ids containing quoting
+  // characters and works consistently across POSIX shells, PowerShell and cmd.
+  const term = vscode.window.createTerminal({
+    name: `${providerLabel(v.provider)} · ${truncate(v.title, 32)}`,
+    cwd: v.cwd,
+    shellPath: v.provider === "codex" ? codexExecutable : "claude",
+    shellArgs:
+      v.provider === "codex"
+        ? ["resume", v.sessionId]
+        : ["--resume", v.sessionId],
+  });
+  term.show();
 }
 
 function openTranscript(arg?: SessionView): void {
@@ -2211,12 +2872,25 @@ function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
-function debounce(fn: () => void, ms: number): () => void {
+interface CancelableDebounced {
+  (): void;
+  cancel(): void;
+}
+
+function debounce(fn: () => void, ms: number): CancelableDebounced {
   let t: ReturnType<typeof setTimeout> | undefined;
-  return () => {
+  const wrapped = (() => {
     if (t) clearTimeout(t);
-    t = setTimeout(fn, ms);
+    t = setTimeout(() => {
+      t = undefined;
+      fn();
+    }, ms);
+  }) as CancelableDebounced;
+  wrapped.cancel = () => {
+    if (t) clearTimeout(t);
+    t = undefined;
   };
+  return wrapped;
 }
 
 // --- OS-level keystroke helpers (macOS) for fully-automated resume ----------
@@ -2294,7 +2968,7 @@ function dumpTabsTo(file: string): number {
     });
   });
   try {
-    fs.writeFileSync(file, JSON.stringify(dbg, null, 2));
+    writePrivateTextAtomic(file, JSON.stringify(dbg, null, 2));
   } catch {
     /* ignore */
   }

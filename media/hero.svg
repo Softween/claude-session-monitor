@@ -1,24 +1,28 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 700" font-family="-apple-system, 'Segoe UI', Roboto, sans-serif">
   <rect x="0.5" y="0.5" width="459" height="699" rx="16" fill="#0d1117" stroke="#21262d"/>
 
-  <text x="20" y="34" fill="#7d8590" font-size="12" font-weight="700" letter-spacing="1.2">CLAUDE SESSIONS</text>
-  <text x="20" y="62" fill="#8b949e" font-size="12">total load: CPU 12% · 1.4GB</text>
+  <text x="20" y="34" fill="#7d8590" font-size="12" font-weight="700" letter-spacing="1.2">AGENT SESSIONS</text>
+  <text x="20" y="62" fill="#8b949e" font-size="12">Claude + Codex · CPU 12% · 1.4GB</text>
 
   <!-- Your turn -->
   <circle cx="24" cy="88" r="5" fill="#58a6ff"/>
   <text x="38" y="92" fill="#e6edf3" font-size="13" font-weight="600">Your turn (2)</text>
-  <text x="44" y="120" fill="#e6edf3" font-size="13">Refactor auth middleware<tspan fill="#8b949e" font-size="11">   your turn · 1m · my-app</tspan></text>
-  <text x="44" y="146" fill="#e6edf3" font-size="13">Update API docs<tspan fill="#8b949e" font-size="11">   your turn · 4m · my-app</tspan></text>
+  <text x="44" y="120" fill="#d18616" font-size="9" font-weight="700">CLD</text>
+  <text x="70" y="120" fill="#e6edf3" font-size="13">Refactor auth<tspan dx="10" fill="#8b949e" font-size="11">your turn · 1m · my-app</tspan></text>
+  <text x="44" y="146" fill="#58a6ff" font-size="9" font-weight="700">CDX</text>
+  <text x="70" y="146" fill="#e6edf3" font-size="13">Update API docs<tspan dx="10" fill="#8b949e" font-size="11">your turn · 4m · my-app</tspan></text>
 
   <!-- Working -->
   <circle cx="24" cy="174" r="5" fill="#3fb950"/>
   <text x="38" y="178" fill="#e6edf3" font-size="13" font-weight="600">Working (1)</text>
-  <text x="44" y="206" fill="#e6edf3" font-size="13">Generate test fixtures<tspan fill="#8b949e" font-size="11">   working · CPU 22% · 240MB</tspan></text>
+  <text x="44" y="206" fill="#58a6ff" font-size="9" font-weight="700">CDX</text>
+  <text x="70" y="206" fill="#e6edf3" font-size="13">Generate fixtures<tspan dx="10" fill="#8b949e" font-size="11">working · CPU 22% · 240MB</tspan></text>
 
   <!-- Limited -->
   <circle cx="24" cy="234" r="5" fill="#f85149"/>
   <text x="38" y="238" fill="#e6edf3" font-size="13" font-weight="600">Limited (1)</text>
-  <text x="44" y="266" fill="#e6edf3" font-size="13">Bulk data import<tspan fill="#8b949e" font-size="11">   rate limited · resets 2h 10m</tspan></text>
+  <text x="44" y="266" fill="#d18616" font-size="9" font-weight="700">CLD</text>
+  <text x="70" y="266" fill="#e6edf3" font-size="13">Bulk data import<tspan dx="10" fill="#8b949e" font-size="11">rate limited · resets 2h 10m</tspan></text>
 
   <line x1="20" y1="294" x2="440" y2="294" stroke="#21262d"/>
   <text x="20" y="320" fill="#7d8590" font-size="12" font-weight="700" letter-spacing="1.2">USAGE LIMITS</text>

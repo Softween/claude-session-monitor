@@ -3,3 +3,5 @@ dist/
 *.vsix
 __pycache__/
 *.pyc
+.DS_Store
+graphify-out/

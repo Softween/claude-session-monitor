@@ -841,12 +841,31 @@ function limitsHtml(): string {
   .greset { opacity:.7; font-size:11px; }
   .bar { height:8px; border-radius:4px; background: var(--vscode-editorWidget-background, rgba(127,127,127,.18)); overflow:hidden; }
   .fill { height:100%; border-radius:4px; transition: width .4s ease; }
-  .card { padding:5px 0 3px; border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.2)); }
-  .card:first-child { border-top:0; padding-top:0; }
-  .chead { display:flex; align-items:center; gap:6px; margin-bottom:3px; }
-  .ctitle { font-weight:700; font-size:11px; opacity:.85; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .card .grow { margin-bottom:2px; }
+  /* One card per account/provider. The left rule carries the card's worst
+     gauge color, so pressure reads at a glance even when the text is skimmed. */
+  .card { position:relative; margin:0 0 8px; padding:5px 0 4px 9px; border-radius:3px;
+    border-left:2px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35));
+    background: color-mix(in srgb, var(--vscode-editorWidget-background, rgba(127,127,127,.12)) 55%, transparent); }
+  .card.warn { border-left-color: var(--vscode-charts-yellow, #e6b800); }
+  .card.bad { border-left-color: var(--vscode-charts-red, #f14c4c); }
+  .chead { display:flex; align-items:center; gap:6px; margin-bottom:4px; min-width:0; }
+  .ctitle { font-weight:700; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pbadge { display:inline-block; min-width:25px; padding:1px 3px; flex:none;
+    border:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35));
+    border-radius:3px; font-size:8px; font-weight:700; letter-spacing:.04em;
+    text-align:center; color:var(--vscode-descriptionForeground); }
+  .pbadge.codex { color:var(--vscode-charts-blue, #3794ff); }
+  .pbadge.claude { color:var(--vscode-charts-orange, #d18616); }
+  .cage { margin-left:auto; font-size:10px; opacity:.5; white-space:nowrap; }
+  .card .grow { margin-bottom:1px; }
+  .card .glabel { font-weight:500; font-size:11px; }
+  .num { font-family: var(--vscode-editor-font-family, monospace); font-size:11px; font-variant-numeric: tabular-nums; }
+  .meter { height:2px; border-radius:1px; margin:0 0 5px; overflow:hidden;
+    background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
+  .meter i { display:block; height:100%; border-radius:1px; }
+  @media (prefers-reduced-motion: no-preference) { .meter i { transition: width .4s ease; } }
   .card .note { margin-top:3px; }
+  .card .eta { margin:-2px 0 5px 0; }
   .adot { width:7px; height:7px; border-radius:50%; background:var(--vscode-charts-green,#4caf50); flex:none; }
   .legend { font-size:11px; opacity:.7; display:flex; gap:12px; margin-top:2px; flex-wrap:wrap; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; vertical-align:middle; }
@@ -981,22 +1000,33 @@ function providerTokenLine(card){
   if(card.lifetimeTokens!=null) parts.push('lifetime '+fmtTokens(card.lifetimeTokens));
   return '<div class="grow"><span class="glabel">Tokens</span><span class="gpct">'+parts.join(' · ')+'</span></div>';
 }
-// One compact line per gauge: label, used% (colored by pressure) and the reset
-// countdown. The segment bars were dropped so every account fits on screen.
+// One gauge = a text line (label · used% · reset countdown) over a 2px hairline
+// meter — the same geometry the session table uses for token share, so both
+// views read the same way. The old 20-segment bars were dropped so every
+// account fits on screen.
 function gaugeRow(g){
   const p = g.pct;
   return '<div class="grow"><span class="glabel">'+esc(g.label)+'</span>'
-    + '<span class="gpct"><span style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
-    + (g.resetMs?(' <span class="greset">· '+fmtLeft(g.resetMs)+'</span>'):'')+'</span></div>';
+    + '<span class="gpct num"><span style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
+    + (g.resetMs?(' <span class="greset">· '+fmtLeft(g.resetMs)+'</span>'):'')+'</span></div>'
+    + '<div class="meter"><i style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%;background:'+color(p)+'"></i></div>';
+}
+function pressure(card){
+  let worst = null;
+  for(const g of card.gauges||[]) if(g.pct!=null && (worst==null || g.pct>worst)) worst = g.pct;
+  if(worst==null) return '';
+  return worst>=90 ? ' bad' : (worst>=70 ? ' warn' : '');
 }
 // One card per provider/account, all stacked: every Claude login and Codex are
 // visible at once, no tabs.
 function providerCard(card){
   const age = card.ts ? Math.max(0, Math.round(Date.now()/1000 - card.ts)) : null;
-  let h='<div class="card"><div class="chead">'
+  const badge = card.provider==='codex' ? '<span class="pbadge codex">CDX</span>' : '<span class="pbadge claude">CLD</span>';
+  let h='<div class="card'+pressure(card)+'"><div class="chead">'
+    + badge
+    + '<span class="ctitle" title="'+esc(card.label)+'">'+esc(card.label.replace(/^(Claude|Codex) · /,''))+'</span>'
     + (card.provider==='claude' && card.active ? '<span class="adot" title="active login"></span>' : '')
-    + '<span class="ctitle">'+esc(card.label)+'</span>'
-    + (age!=null ? '<span class="hint" title="last official usage fetch">'+fmtAge(age)+' ago</span>' : '')
+    + (age!=null ? '<span class="cage num" title="last official usage fetch">'+fmtAge(age)+'</span>' : '')
     + '</div>';
   if(card.official){
     for(const g of card.gauges){

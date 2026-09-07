@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.1.1
+
+### Changed
+
+- Usage cards: provider badge (CLD / CDX) and account name in the header, a
+  2px hairline meter under every gauge (same geometry as the session table's
+  token-share line), and a left rule colored by the card's worst gauge.
+
 ## 2.1.0
 
 ### Changed

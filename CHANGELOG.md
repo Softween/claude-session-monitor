@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.1.0
+
+### Changed
+
+- Usage view shows every Claude login and Codex at the same time, one compact
+  card per account, instead of provider tabs and account pills. The segment bars
+  were dropped so all accounts fit on screen; used% is colored by pressure.
+- Sessions are always ordered by token spend (descending) inside each group;
+  ties fall back to the most recent activity.
+
+### Removed
+
+- The account pin (clicking an account pill) — every account is visible now, so
+  the panel always follows the active login for burn-rate and history.
+
 ## 2.0.0
 
 ### Added

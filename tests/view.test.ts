@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, subtreeTotals, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec, accountPillLabels, filterHistoryForAccount, topSessionRows } from "../src/view";
+import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, subtreeTotals, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec, accountPillLabels, filterHistoryForAccount, topSessionRows, sortByTokens } from "../src/view";
 import type { SessionView } from "../src/core";
 
 const v = (bucket: SessionView["bucket"], sub: string): SessionView =>
@@ -352,5 +352,19 @@ describe("topSessionRows", () => {
     expect(rows).toHaveLength(6);
     expect(rows.every((r) => r.pct <= 100)).toBe(true);
     expect(rows.find((r) => r.tokens === 0)).toBeUndefined();
+  });
+});
+
+describe("sortByTokens", () => {
+  it("orders by tokens descending, then by most recent activity, without mutating input", () => {
+    const rows = [
+      { id: "a", lastActivityMs: 100, tokens: 5 },
+      { id: "b", lastActivityMs: 300, tokens: 900 },
+      { id: "c", lastActivityMs: 200, tokens: 5 },
+      { id: "d", lastActivityMs: 50, tokens: 0 },
+    ];
+    const out = sortByTokens(rows, (r) => r.tokens);
+    expect(out.map((r) => r.id)).toEqual(["b", "c", "a", "d"]);
+    expect(rows.map((r) => r.id)).toEqual(["a", "b", "c", "d"]);
   });
 });

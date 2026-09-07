@@ -138,6 +138,7 @@ export interface AccountView {
   selected: boolean; // currently displayed in the panel
   ts: number | null; // epoch sec of its last successful usage fetch
   stale: boolean; // stored token expired/rejected — data is last-known only
+  gauges: { key: string; label: string; pct: number | null; resetMs: number | null }[]; // last-known official gauges ([] = none yet)
 }
 
 /**
@@ -222,6 +223,15 @@ export function labelsMatch(tabLabel: string, title: string): boolean {
   const b = normLabel(title);
   if (!a || !b) return false;
   return a === b || a.startsWith(b) || b.startsWith(a);
+}
+
+/**
+ * Session rows ordered by token spend (descending); ties fall back to the most
+ * recent activity. Stable, so group membership (which is decided per row) is
+ * unaffected — only the order inside each group changes.
+ */
+export function sortByTokens<T extends { lastActivityMs: number }>(views: ReadonlyArray<T>, tokOf: (v: T) => number): T[] {
+  return [...views].sort((a, b) => tokOf(b) - tokOf(a) || b.lastActivityMs - a.lastActivityMs);
 }
 
 export function fmtTokensCompact(n: number): string {

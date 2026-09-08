@@ -73,6 +73,7 @@ export interface ProviderUsageSnapshot {
   sevenDayTokens?: number;
   lifetimeTokens?: number;
   note?: string;
+  planType?: string; // e.g. "plus" | "pro" | "prolite" when the app-server reports it
 }
 
 export type ProviderHealthState = "loading" | "ready" | "setup-required" | "degraded";

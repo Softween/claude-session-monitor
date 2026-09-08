@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -305,6 +305,12 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Remember every Claude account you log into (identity in `~/.claude/session-monitor/accounts.json`, access token in VS Code Secret Storage, i.e. your OS keychain) and keep fetching usage for non-active accounts in the background, so the Usage limits panel can show each account and switch between them. Turn off to track only the current login; run **Agent Sessions: Forget Other Claude Accounts** to also delete already-stored tokens."
+        },
+        "claudeSessionMonitor.planLabels": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": { "type": "string" },
+          "markdownDescription": "Plan label shown on each usage card, keyed by Claude account email, or `claude` / `codex` for the provider card. Example: `{ \"me@example.com\": \"$200 Max\", \"codex\": \"$100 Pro Lite\" }`. When a key is missing the label is derived from the login's rate-limit tier (Claude keychain `rateLimitTier`, Codex `planType`) and left blank if unknown."
         },
         "claudeSessionMonitor.usageWarnPercent": {
           "type": "number",

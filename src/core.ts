@@ -969,6 +969,7 @@ export interface AccountInfo {
   email: string;
   lastSeenTs: number; // epoch sec this account was last seen as the active login
   tokenExpiresAt?: number; // epoch ms the stored access token expires (from the keychain payload)
+  tier?: string; // keychain rateLimitTier / subscriptionType seen while this was the active login
 }
 
 export interface AccountsFile {
@@ -990,7 +991,7 @@ export function readAccountsFile(file = ACCOUNTS_FILE): AccountsFile {
 /** Pure upsert: a NEW AccountsFile with `acct` recorded as the active login, newest first. */
 export function upsertActiveAccount(
   f: AccountsFile,
-  acct: { id: string; email: string; tokenExpiresAt?: number },
+  acct: { id: string; email: string; tokenExpiresAt?: number; tier?: string },
   nowSec: number,
 ): AccountsFile {
   const prev = f.accounts.find((a) => a.id === acct.id);
@@ -999,6 +1000,7 @@ export function upsertActiveAccount(
     email: acct.email,
     lastSeenTs: nowSec,
     tokenExpiresAt: acct.tokenExpiresAt ?? prev?.tokenExpiresAt,
+    tier: acct.tier ?? prev?.tier,
   };
   const rest = f.accounts.filter((a) => a.id !== acct.id);
   return { v: 1, accounts: [entry, ...rest].sort((a, b) => b.lastSeenTs - a.lastSeenTs), activeId: acct.id };

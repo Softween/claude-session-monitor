@@ -89,6 +89,8 @@ import {
   sortByTokens,
   nextUsageBackoffSec,
   accountPillLabels,
+  claudePlanLabel,
+  codexPlanLabel,
   filterHistoryForAccount,
   topSessionRows,
   type AccountView,
@@ -466,6 +468,7 @@ interface UsageProviderCard {
   id: string; // unique per card: "codex", "claude" or "claude:<accountId>"
   provider: AgentProvider;
   label: string;
+  plan: string | null; // "$200 Max", "$100 Pro Lite"… (planLabels setting or detected tier)
   active: boolean; // Claude: this account is the current login (green dot)
   ts: number | null;
   official: boolean;
@@ -507,6 +510,7 @@ interface OfficialUsage {
 interface ClaudeCredentials {
   token: string;
   expiresAt?: number; // epoch ms the access token expires (from the keychain payload)
+  tier?: string; // rateLimitTier (or subscriptionType) — used only for the plan label
 }
 
 // The keychain read spawns a `security` subprocess; with a 10s usage poll that
@@ -541,7 +545,13 @@ function readClaudeCredentials(): Promise<ClaudeCredentials | undefined> {
             resolve(undefined);
             return;
           }
-          resolve({ token, expiresAt: typeof oauth.expiresAt === "number" ? oauth.expiresAt : undefined });
+          const tier =
+            typeof oauth.rateLimitTier === "string" && oauth.rateLimitTier
+              ? oauth.rateLimitTier
+              : typeof oauth.subscriptionType === "string" && oauth.subscriptionType
+                ? oauth.subscriptionType
+                : undefined;
+          resolve({ token, expiresAt: typeof oauth.expiresAt === "number" ? oauth.expiresAt : undefined, tier });
         } catch {
           resolve(undefined);
         }
@@ -624,6 +634,7 @@ function buildLimitsPayload(
   acctCtx: AccountCtx | null = null,
   codexSnapshot: CodexProviderSnapshot | null = null,
   enabledProviders: ReadonlyArray<AgentProvider> = ["claude"],
+  planLabels: Record<string, string> = {},
 ): LimitsPayload {
   const now = Date.now() / 1000;
   const gauges: Gauge[] = [];
@@ -727,6 +738,7 @@ function buildLimitsPayload(
           id: `claude:${a.id}`,
           provider: "claude",
           label: `Claude · ${a.label}`,
+          plan: a.plan,
           active: a.id === acctCtx.activeId,
           ts: isSel ? ts : a.ts,
           official: aOfficial,
@@ -741,6 +753,7 @@ function buildLimitsPayload(
         id: "claude",
         provider: "claude",
         label: "Claude",
+        plan: planLabels["claude"] ?? null,
         active: true,
         ts,
         official,
@@ -757,6 +770,7 @@ function buildLimitsPayload(
       id: "codex",
       provider: "codex",
       label: "Codex",
+      plan: planLabels["codex"] ?? codexPlanLabel(usage?.planType) ?? null,
       active: false,
       ts: usage?.ts ?? null,
       official: !!usage,
@@ -856,6 +870,10 @@ function limitsHtml(): string {
     text-align:center; color:var(--vscode-descriptionForeground); }
   .pbadge.codex { color:var(--vscode-charts-blue, #3794ff); }
   .pbadge.claude { color:var(--vscode-charts-orange, #d18616); }
+  .plan { flex:none; padding:0 5px; border-radius:999px; font-size:9px; font-weight:600; line-height:14px;
+    font-variant-numeric: tabular-nums; white-space:nowrap;
+    background: var(--vscode-badge-background, rgba(127,127,127,.25));
+    color: var(--vscode-badge-foreground, var(--vscode-foreground)); }
   .cage { margin-left:auto; font-size:10px; opacity:.5; white-space:nowrap; }
   .card .grow { margin-bottom:1px; }
   .card .glabel { font-weight:500; font-size:11px; }
@@ -1025,6 +1043,7 @@ function providerCard(card){
   let h='<div class="card'+pressure(card)+'"><div class="chead">'
     + badge
     + '<span class="ctitle" title="'+esc(card.label)+'">'+esc(card.label.replace(/^(Claude|Codex) · /,''))+'</span>'
+    + (card.plan ? '<span class="plan" title="plan">'+esc(card.plan)+'</span>' : '')
     + (card.provider==='claude' && card.active ? '<span class="adot" title="active login"></span>' : '')
     + (age!=null ? '<span class="cage num" title="last official usage fetch">'+fmtAge(age)+'</span>' : '')
     + '</div>';
@@ -1102,6 +1121,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const cfg = () => vscode.workspace.getConfiguration("claudeSessionMonitor");
   const workspaceCwd = () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const trackAllAccounts = () => cfg().get<boolean>("trackAllAccounts", true);
+  // planLabels: { "<email>" | "claude" | "codex": "$200 Max" } — manual override
+  // for the plan shown on each usage card (keys are case-insensitive).
+  const planLabels = (): Record<string, string> => {
+    const raw = cfg().get<Record<string, unknown>>("planLabels", {}) ?? {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw)) if (typeof v === "string" && v.trim()) out[k.trim().toLowerCase()] = v.trim();
+    return out;
+  };
+  const planLabelFor = (key: string): string | null => planLabels()[key.toLowerCase()] ?? null;
   const claudeEnabled = () => cfg().get<boolean>("enableClaude", true);
   const codexEnabled = () => cfg().get<boolean>("enableCodex", true);
   const enabledProviders = (): AgentProvider[] => [
@@ -1384,7 +1412,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
         // snapshot, and (when enabled) the token vault that lets the extension
         // keep refreshing this account after the user logs into another one.
         const ident = (await readActiveIdentity(creds.token)) ?? { id: "default", email: "this account" };
-        accountsFile = upsertActiveAccount(readAccountsFile(), { ...ident, tokenExpiresAt: creds.expiresAt }, nowSec);
+        accountsFile = upsertActiveAccount(
+          readAccountsFile(),
+          { ...ident, tokenExpiresAt: creds.expiresAt, tier: creds.tier },
+          nowSec,
+        );
         writeAccountsFile(accountsFile);
         usageByAccount.set(ident.id, { usage: r.usage, stale: false });
         writeOfficialSnapshot({ gauges: r.usage.gauges, ts: r.usage.ts, attemptTs: nowSec }, officialUsageFileFor(ident.id));
@@ -1529,6 +1561,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         selected: a.id === selId,
         ts: e?.usage?.ts ?? null,
         gauges: (e?.usage?.gauges ?? []).map((g) => ({ key: g.key, label: g.label, pct: g.pct, resetMs: g.resetMs })),
+        plan: planLabelFor(a.email) ?? claudePlanLabel(a.tier),
         stale:
           a.id === activeId
             ? false
@@ -1665,6 +1698,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           c,
           codexEnabled() ? codexSnapshot : null,
           enabledProviders(),
+          planLabels(),
         ),
       );
       updateStatusBar(

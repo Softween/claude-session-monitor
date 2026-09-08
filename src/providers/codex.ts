@@ -473,6 +473,18 @@ function rateLimitSnapshots(response: unknown): Array<Record<string, unknown>> {
   return isRecord(response.rateLimits) ? [response.rateLimits] : [];
 }
 
+/** Plan type ("plus" | "pro" | "prolite"…) when the rate-limit response carries it. */
+function readPlanType(response: unknown): string | undefined {
+  if (!isRecord(response)) return undefined;
+  const direct = response.planType ?? response.plan_type;
+  if (typeof direct === "string" && direct) return direct;
+  for (const snap of rateLimitSnapshots(response)) {
+    const v = snap.planType ?? snap.plan_type;
+    if (typeof v === "string" && v) return v;
+  }
+  return undefined;
+}
+
 export function parseCodexUsage(
   rateLimitResponse: unknown,
   accountUsageResponse: unknown,
@@ -525,6 +537,7 @@ export function parseCodexUsage(
     }
   }
   if (!gauges.length && lifetimeTokens == null && sevenDayTokens == null) return null;
+  const planType = readPlanType(rateLimitResponse);
   return {
     provider: "codex",
     label: providerLabel("codex"),
@@ -532,6 +545,7 @@ export function parseCodexUsage(
     gauges,
     sevenDayTokens,
     lifetimeTokens,
+    ...(planType ? { planType } : {}),
   };
 }
 

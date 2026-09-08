@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.2.0
+
+### Added
+
+- Plan chip on every usage card ("$200 Max", "$100 Pro Lite"…). Derived from the
+  Claude keychain `rateLimitTier` / Codex `planType`, overridable per account with
+  the new `claudeSessionMonitor.planLabels` setting (keyed by email, `claude` or `codex`).
+
 ## 2.1.1
 
 ### Changed

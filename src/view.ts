@@ -139,6 +139,36 @@ export interface AccountView {
   ts: number | null; // epoch sec of its last successful usage fetch
   stale: boolean; // stored token expired/rejected — data is last-known only
   gauges: { key: string; label: string; pct: number | null; resetMs: number | null }[]; // last-known official gauges ([] = none yet)
+  plan: string | null; // "$200 Max" etc: planLabels setting, else derived from the login's rate-limit tier
+}
+
+/**
+ * Human plan label from the Claude Code keychain payload (`rateLimitTier`, e.g.
+ * "default_claude_max_20x", falling back to `subscriptionType`). Prices are the
+ * public monthly list prices; unknown tiers surface as-is rather than guessed.
+ */
+export function claudePlanLabel(tier: string | null | undefined, subscription?: string | null): string | null {
+  const t = (tier ?? "").toLowerCase();
+  if (t.includes("max_20x")) return "$200 Max";
+  if (t.includes("max_5x")) return "$100 Max";
+  if (t.includes("max")) return "Max";
+  if (t.includes("pro")) return "$20 Pro";
+  const s = (subscription ?? "").toLowerCase();
+  if (s === "max") return "Max";
+  if (s === "pro") return "$20 Pro";
+  if (s) return s.charAt(0).toUpperCase() + s.slice(1);
+  return null;
+}
+
+/** Human plan label from Codex's `planType` ("plus", "pro", "prolite", ...). */
+export function codexPlanLabel(plan: string | null | undefined): string | null {
+  const p = (plan ?? "").toLowerCase().replace(/[^a-z]/g, "");
+  if (!p) return null;
+  if (p === "prolite") return "$100 Pro Lite";
+  if (p === "pro") return "$200 Pro";
+  if (p === "plus") return "$20 Plus";
+  if (p === "free") return "Free";
+  return p.charAt(0).toUpperCase() + p.slice(1);
 }
 
 /**

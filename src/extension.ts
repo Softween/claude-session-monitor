@@ -851,26 +851,29 @@ function limitsHtml(): string {
   body { font-family: var(--vscode-font-family); font-size: 12px; color: var(--vscode-foreground); padding: 8px 12px 6px; margin: 0; }
   .empty { color: var(--vscode-descriptionForeground); padding: 6px 0; line-height:1.5; }
   .num { font-family: var(--vscode-editor-font-family, monospace); font-size:11px; font-variant-numeric: tabular-nums; }
-  /* One card per login/provider. The only color on the card is the pressure:
-     the left rule and the percentage of each gauge. Everything else is quiet. */
-  .card { position:relative; margin:0 0 14px; padding:0 0 0 10px;
-    border-left:2px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35)); }
-  .card.warn { border-left-color: var(--vscode-charts-yellow, #e6b800); }
-  .card.bad { border-left-color: var(--vscode-charts-red, #f14c4c); }
-  .chead { display:flex; align-items:baseline; gap:6px; margin-bottom:6px; min-width:0; }
+  /* One card per login/provider: a 64px ring stack on the left (Apple Health
+     style, one ring per window, fixed hue per window so the rings stay telling
+     apart, red only once a window is nearly spent) and the text rows on the
+     right. The rows keep the exact percentage and reset countdown; the rings
+     are the at-a-glance layer, not a replacement. */
+  .card { display:grid; grid-template-columns:64px minmax(0,1fr); column-gap:12px; margin:0 0 16px; }
+  .chead { grid-column:1 / -1; display:flex; align-items:baseline; gap:6px; margin-bottom:6px; min-width:0; }
+  .rings { width:64px; height:64px; align-self:center; }
+  .rings circle { fill:none; stroke-width:5; stroke-linecap:round; transform:rotate(-90deg); transform-origin:50% 50%; }
+  .rings .track { stroke: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
+  @media (prefers-reduced-motion: no-preference) { .rings circle { transition: stroke-dasharray .4s ease; } }
+  .rows { display:flex; flex-direction:column; justify-content:center; gap:7px; min-width:0; }
+  .swatch { width:6px; height:6px; border-radius:50%; flex:none; align-self:center; margin-right:2px; }
+  .span { grid-column:1 / -1; }
   .ctitle { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .cplan { color: var(--vscode-descriptionForeground); font-size:11px; white-space:nowrap; }
   .adot { align-self:center; width:6px; height:6px; border-radius:50%; background:var(--vscode-charts-green,#4caf50); flex:none; }
   .cage { margin-left:auto; font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
-  .g { margin:0 0 7px; }
-  .grow { display:flex; align-items:baseline; gap:8px; margin-bottom:3px; }
+  .grow { display:flex; align-items:baseline; gap:8px; }
   .glabel { font-size:11px; color: var(--vscode-descriptionForeground); }
   .gpct { margin-left:auto; font-size:12px; font-weight:600; }
   .greset { font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; min-width:58px; text-align:right; }
-  .meter { height:2px; border-radius:1px; overflow:hidden; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
-  .meter i { display:block; height:100%; border-radius:1px; }
-  @media (prefers-reduced-motion: no-preference) { .meter i { transition: width .4s ease; } }
-  .eta { font-size:11px; margin:-3px 0 7px; color: var(--vscode-charts-red, #f14c4c); }
+  .eta { font-size:11px; color: var(--vscode-charts-red, #f14c4c); }
   .note { font-size:10px; line-height:1.4; color: var(--vscode-descriptionForeground); margin-top:2px; }
   .foot { display:flex; gap:8px; align-items:baseline; margin:4px 0 2px; font-size:11px; color: var(--vscode-descriptionForeground); }
   .foot .num { margin-left:auto; color: var(--vscode-foreground); }
@@ -895,10 +898,34 @@ const vscodeApi = acquireVsCodeApi();
 const C_OK = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-green') || '#4caf50';
 const C_WARN = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-yellow') || '#e6b800';
 const C_BAD = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-red') || '#f14c4c';
+const C_BLUE = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-blue') || '#3794ff';
+const C_PURPLE = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-purple') || '#b180d7';
 let last = null;
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function color(p){ if(p==null) return 'gray'; if(p>=90) return C_BAD; if(p>=70) return C_WARN; return C_OK; }
+// Ring hue is the window's identity (session blue, weekly green, per-model purple),
+// so three rings never blur into one; it flips to red only once the window is
+// nearly spent. The percentage text keeps the usual green/yellow/red pressure color.
+function hue(g){
+  if(g.pct!=null && g.pct>=90) return C_BAD;
+  const k = String(g.key||'');
+  if(k==='session' || k==='5h') return C_BLUE;
+  if(k==='weekly' || k==='7d') return C_OK;
+  if(k.indexOf('weekly-')===0) return C_PURPLE;
+  return C_BLUE;
+}
+// Up to three concentric rings (outer = first gauge). Radii leave a 5px stroke
+// plus a 2px gap; a fourth gauge stays a text row only.
+function ringSvg(gauges){
+  const R=[28,21,14]; let h='<svg class="rings" viewBox="0 0 64 64" aria-hidden="true">';
+  gauges.slice(0,3).forEach((g,i)=>{
+    const r=R[i], c=2*Math.PI*r, p=g.pct==null?0:Math.min(100,Math.max(0,g.pct));
+    h+='<circle class="track" cx="32" cy="32" r="'+r+'"/>'
+     +'<circle cx="32" cy="32" r="'+r+'" stroke="'+hue(g)+'" stroke-dasharray="'+(c*Math.max(p,1.5)/100).toFixed(1)+' '+c.toFixed(1)+'"/>';
+  });
+  return h+'</svg>';
+}
 function fmtLeft(ms){
   if(ms==null) return '';
   let s = Math.round((ms - Date.now())/1000);
@@ -969,20 +996,14 @@ function tokenFoot(t, multiAcct){
   return '<div class="foot"><span title="in + out + cache-write'+(multiAcct?', all logins on this Mac':'')+'">Tokens'+(multiAcct?', all logins':'')+'</span>'
     + '<span class="num">5h '+fmtTokens(t.fiveHour)+' · 7d '+fmtTokens(t.sevenDay)+'</span></div>';
 }
-// One gauge = label · used% · reset countdown over a 2px hairline meter, the same
-// geometry the session list uses for token share.
-function gaugeRow(g){
+// One gauge row = ring swatch · label · used% · reset countdown. Rows past the
+// third have no ring, so no swatch.
+function gaugeRow(g, i){
   const p = g.pct;
-  return '<div class="g"><div class="grow"><span class="glabel">'+esc(gaugeLabel(g.label))+'</span>'
+  return '<div class="grow">'+(i<3?'<span class="swatch" style="background:'+hue(g)+'"></span>':'')
+    + '<span class="glabel">'+esc(gaugeLabel(g.label))+'</span>'
     + '<span class="gpct num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
-    + '<span class="greset">'+(g.resetMs?fmtLeft(g.resetMs):'')+'</span></div>'
-    + '<div class="meter"><i style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%;background:'+color(p)+'"></i></div></div>';
-}
-function pressure(card){
-  let worst = null;
-  for(const g of card.gauges||[]) if(g.pct!=null && (worst==null || g.pct>worst)) worst = g.pct;
-  if(worst==null) return '';
-  return worst>=90 ? ' bad' : (worst>=70 ? ' warn' : '');
+    + '<span class="greset">'+(g.resetMs?fmtLeft(g.resetMs):'')+'</span></div>';
 }
 // One card per provider/account, stacked. The header is "who · plan"; the fetch
 // age only shows once the data is older than ten minutes, so a healthy card
@@ -990,20 +1011,19 @@ function pressure(card){
 function providerCard(card){
   const age = card.ts ? Math.max(0, Math.round(Date.now()/1000 - card.ts)) : null;
   const name = card.label.replace(/^(Claude|Codex) · /,'');
-  let h='<div class="card'+pressure(card)+'"><div class="chead">'
+  let h='<div class="card"><div class="chead">'
     + '<span class="ctitle" title="'+esc(card.label)+'">'+esc(name)+'</span>'
     + (card.provider==='claude' && card.active ? '<span class="adot" title="active login"></span>' : '')
     + (card.plan ? '<span class="cplan">'+esc(card.plan)+'</span>' : '')
     + (age!=null && age>600 ? '<span class="cage num" title="last official usage fetch">'+fmtAge(age)+' ago</span>' : '')
     + '</div>';
-  if(card.official){
-    for(const g of card.gauges){
-      h += gaugeRow(g);
-      if(card.provider==='claude' && card.active && (g.key==='session'||g.key==='5h')) h += etaLine(last.eta);
-    }
+  const gauges = card.official ? (card.gauges||[]) : [];
+  if(gauges.length){
+    h += ringSvg(gauges) + '<div class="rows">' + gauges.map(gaugeRow).join('') + '</div>';
+    if(card.provider==='claude' && card.active && gauges.some(g=>g.key==='session'||g.key==='5h')) h += '<div class="span">'+etaLine(last.eta)+'</div>';
   }
-  if(card.note) h += '<div class="note">'+esc(card.note)+'</div>';
-  else if(!card.official) h += '<div class="note">Official '+esc(card.label)+' usage is unavailable. Session state remains available.</div>';
+  if(card.note) h += '<div class="note span">'+esc(card.note)+'</div>';
+  else if(!card.official) h += '<div class="note span">Official '+esc(card.label)+' usage is unavailable. Session state remains available.</div>';
   return h+'</div>';
 }
 function render(){

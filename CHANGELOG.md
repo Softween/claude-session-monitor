@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.4.0
+
+### Changed
+
+- Usage view: every account card now carries an Apple Health style ring stack on
+  the left, one ring per rate-limit window (outer = session, then weekly, then
+  the per-model weekly window). Each ring keeps a fixed hue (session blue, weekly
+  green, per-model purple) so the rings stay distinguishable, and turns red only
+  once that window is at 90% or more. The text rows on the right keep the exact
+  percentage (still green/yellow/red by pressure) and the reset countdown; a
+  fourth window shows as a text row only. The hairline meters and the colored
+  left rule are gone, the rings are the card's single accent.
+
 ## 2.3.0
 
 ### Changed

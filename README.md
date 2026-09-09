@@ -26,7 +26,7 @@ differences instead of flattening them into misleading data.
 
 ## Features
 
-- **One provider-aware session table** — filter All / Claude / Codex, group sessions
+- **One provider-aware session list** — filter All / Claude / Codex, group sessions
   by Limited / Waiting / Your turn / Working / Ended, and keep provider-qualified
   session identities distinct.
 - **Official Codex integration** — launches the configured Codex CLI as

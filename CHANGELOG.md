@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.3.0
+
+### Changed
+
+- Sessions view redesigned for calm: the eleven-column table is gone. Each session
+  is two lines (state dot · title · age, then model · effort · folder with 5h tokens
+  and share on the right) and the hairline share bar now runs the full row width.
+  CPU and memory appear on a row only when they matter (CPU above the hog threshold,
+  memory ≥ 1 GB); everything else stays in the tooltip. Ended and Unknown groups fold
+  to a single line by default (state persists), so the long Codex tail no longer
+  pushes the live sessions off screen. The filter pills and machine totals share
+  one top strip.
+- Usage view: provider badges, plan pills and the fetch age are replaced by a quiet
+  "name · plan" header (age only shows once data is older than 10 minutes). Reset
+  countdowns sit in their own column, the burn-rate line appears only when the
+  window would fill before its own reset, and gauge labels drop the "(5h)/(7d)"
+  parentheticals.
+
+### Removed
+
+- Usage view: the "Sessions (5h tokens)" section (it duplicated the token column
+  of the session list) and the per-provider "7d · lifetime" token line. The
+  5h/7d token total survives as one footer line; "Models (7d share)" stays, folded.
+
 ## 2.2.0
 
 ### Added

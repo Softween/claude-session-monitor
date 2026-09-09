@@ -263,64 +263,50 @@ function sessionsHtml(): string {
   * { box-sizing: border-box; }
   body { font-family: var(--vscode-font-family); font-size: 12px; color: var(--vscode-foreground); padding: 0; margin: 0; }
   .num { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px;
-    font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
-  /* Column tracks — the single source of the table geometry. Order:
-     dot · title · 5h tok · share · model · eff · dir · age · cpu · mem · actions */
-  :root { --cols: 14px minmax(40px,1fr) 62px 34px 60px 34px 56px 30px 36px 46px 36px; }
-  @media (max-width: 503px) { :root { --cols: 14px minmax(40px,1fr) 62px 34px 60px 34px 30px 36px 46px 36px; } .c-dir { display:none; } }
-  @media (max-width: 443px) { :root { --cols: 14px minmax(40px,1fr) 62px 34px 30px 36px 46px 36px; } .c-dir,.c-model,.c-eff { display:none; } }
-  @media (max-width: 349px) { :root { --cols: 14px minmax(40px,1fr) 62px 30px 36px 36px; } .c-dir,.c-model,.c-eff,.c-pct,.c-ram { display:none; } }
-  .meta { display:flex; gap:12px; padding:5px 10px 3px; font-size:10px;
-    color: var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; }
-  .meta b { font-weight:600; color: var(--vscode-foreground); }
-  .providers { display:flex; gap:4px; padding:4px 10px 3px; }
-  .pfilter { border:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35));
-    background:transparent; color:var(--vscode-foreground); border-radius:999px;
-    padding:2px 8px; font:inherit; font-size:10px; cursor:pointer; opacity:.72; }
-  .pfilter:hover { opacity:1; }
-  .pfilter.active { opacity:1; background:var(--vscode-badge-background, rgba(127,127,127,.25));
-    color:var(--vscode-badge-foreground, var(--vscode-foreground)); border-color:transparent; }
-  .health { padding:3px 10px 5px; color:var(--vscode-descriptionForeground); font-size:10px; line-height:1.4; }
-  .thead { position: sticky; top: 0; z-index: 2; display:grid; grid-template-columns: var(--cols);
-    gap: 0 6px; align-items:baseline; padding: 3px 10px; font-size: 9px; font-weight:600;
-    text-transform: uppercase; letter-spacing: .08em; color: var(--vscode-descriptionForeground);
-    background: var(--vscode-sideBar-background, var(--vscode-editor-background, #1e1e1e));
-    border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
-  .thead .num { font-family: inherit; font-size: 9px; }
-  .ghead { display:flex; align-items:center; gap:6px; padding: 7px 10px 2px; font-size:10px;
-    font-weight:700; text-transform: uppercase; letter-spacing:.06em; }
-  .gdot { width:8px; height:8px; border-radius:50%; flex:none; }
-  .gcount { font-weight:400; opacity:.6; }
-  .row { display:grid; grid-template-columns: var(--cols); gap: 0 6px; align-items:center;
-    padding: 3px 10px; cursor: pointer; border-radius: 3px; }
+    font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* Top strip: provider filter on the left, machine totals on the right. */
+  .top { display:flex; align-items:center; gap:4px; padding:8px 12px 6px; }
+  .pfilter { border:0; background:transparent; color:var(--vscode-descriptionForeground); border-radius:999px;
+    padding:2px 8px; font:inherit; font-size:11px; cursor:pointer; }
+  .pfilter:hover { color:var(--vscode-foreground); }
+  .pfilter.active { color:var(--vscode-foreground); background:var(--vscode-badge-background, rgba(127,127,127,.25)); }
+  .totals { margin-left:auto; font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
+  .health { padding:2px 12px 6px; color:var(--vscode-descriptionForeground); font-size:10px; line-height:1.4; }
+  /* Group header: quiet label + count; a chevron only when it is collapsible. */
+  .ghead { display:flex; align-items:center; gap:6px; width:100%; padding:10px 12px 3px; border:0; background:transparent;
+    color: var(--vscode-descriptionForeground); font:inherit; font-size:10px; font-weight:600; text-transform:uppercase;
+    letter-spacing:.08em; text-align:left; cursor:default; }
+  .ghead.fold { cursor:pointer; }
+  .ghead.fold:hover { color: var(--vscode-foreground); }
+  .ghead .n { font-weight:400; opacity:.7; }
+  .ghead .chev { margin-left:auto; font-size:9px; opacity:.6; }
+  /* Row = two lines. Line 1: state dot · title · age (actions replace the age on hover).
+     Line 2: model · effort · dir, tokens on the right. The hairline under the row is
+     this chat's share of the machine's 5h total — who is eating the limit reads as geometry. */
+  .row { position:relative; display:grid; grid-template-columns: 8px minmax(0,1fr) auto; grid-template-rows:auto auto;
+    column-gap:8px; row-gap:1px; align-items:center; padding:5px 12px 6px; cursor:pointer; }
   .row:hover { background: var(--vscode-list-hoverBackground, rgba(127,127,127,.12)); }
   .row:focus { outline: 1px solid var(--vscode-focusBorder, #007fd4); outline-offset: -1px; }
-  .row.ended { opacity: .55; }
-  .dot { width:7px; height:7px; border-radius:50%; }
+  .row.ended { opacity: .5; }
+  .dot { grid-row:1; width:7px; height:7px; border-radius:50%; }
   .dot.stale { box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-charts-yellow, #e6b800) 35%, transparent); }
-  .c-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .pbadge { display:inline-block; min-width:25px; margin-right:5px; padding:1px 3px;
-    border:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35));
-    border-radius:3px; font-size:8px; font-weight:700; letter-spacing:.04em;
-    text-align:center; vertical-align:1px; color:var(--vscode-descriptionForeground); }
-  .pbadge.codex { color:var(--vscode-charts-blue, #3794ff); }
-  .pbadge.claude { color:var(--vscode-charts-orange, #d18616); }
-  .sub { color: var(--vscode-descriptionForeground); font-size: 11px; }
-  .c-model, .c-eff, .c-dir { overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  .title { grid-row:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .right { grid-row:1; display:flex; align-items:center; gap:2px; color: var(--vscode-descriptionForeground); }
+  .meta { grid-row:2; grid-column:2; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
     font-size:11px; color: var(--vscode-descriptionForeground); }
-  /* Signature: the token cell carries a hairline bar = this chat's share of the
-     machine's 5h total, so "who is eating the limit" reads as geometry. */
-  .c-tok { position: relative; padding-bottom: 3px; }
-  .tokbar { position:absolute; left:0; bottom:0; height:2px; border-radius:1px;
-    background: var(--vscode-charts-blue, #3794ff); opacity:.45; }
+  .meta .sub { color: var(--vscode-foreground); opacity:.85; }
+  .meta .hot { color: var(--vscode-charts-red, #f14c4c); }
+  .tok { grid-row:2; grid-column:3; color: var(--vscode-descriptionForeground); text-align:right; }
+  .tok b { font-weight:500; color: var(--vscode-foreground); }
+  .tokbar { position:absolute; left:12px; bottom:0; height:2px; border-radius:1px;
+    background: var(--vscode-charts-blue, #3794ff); opacity:.4; }
   .tokbar.hog { background: var(--vscode-charts-yellow, #e6b800); opacity:.9; }
-  .c-cpu.hot { color: var(--vscode-charts-red, #f14c4c); font-weight:600; }
-  .c-act { display:flex; gap:2px; justify-content:flex-end; visibility:hidden; }
-  .row:hover .c-act, .row:focus-within .c-act { visibility:visible; }
+  .acts { display:none; gap:2px; }
+  .row:hover .acts, .row:focus-within .acts { display:flex; }
+  .row:hover .age, .row:focus-within .age { display:none; }
   .act { border:0; background:transparent; color: var(--vscode-descriptionForeground);
-    cursor:pointer; font-size:11px; line-height:1; padding:2px 3px; border-radius:3px; }
-  .act:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.25));
-    color: var(--vscode-foreground); }
+    cursor:pointer; font-size:11px; line-height:1; padding:2px 4px; border-radius:3px; }
+  .act:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.25)); color: var(--vscode-foreground); }
   .empty { padding: 14px 12px; color: var(--vscode-descriptionForeground); line-height:1.5; }
   @media (prefers-reduced-motion: no-preference) { .tokbar { transition: width .5s ease; } }
 </style>
@@ -337,6 +323,10 @@ const GCOLOR = {
   ended: 'var(--vscode-disabledForeground, #888)',
   unknown: 'var(--vscode-disabledForeground, #888)'
 };
+// Ended and unknown sessions are the long tail; they fold to one line by default.
+const FOLDABLE = { ended:true, unknown:true };
+const saved = vscodeApi.getState() || {};
+let folded = saved.folded || { ended:true, unknown:true };
 let last = null;
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function fmtAge(ms){
@@ -347,22 +337,50 @@ function fmtAge(ms){
   if(s<172800) return Math.floor(s/3600)+'h';
   return Math.floor(s/86400)+'d';
 }
+function fmtMb(mb){ return mb >= 1024 ? (mb/1024).toFixed(1)+'GB' : mb+'MB'; }
+function metaLine(r){
+  const bits = [];
+  const extra = [r.sub, r.reset ? ('reset '+r.reset) : ''].filter(Boolean).join(' · ');
+  if(extra) bits.push('<span class="sub">'+esc(extra)+'</span>');
+  if(r.model) bits.push(esc(r.model)+(r.effort?' · '+esc(r.effort):''));
+  else bits.push(esc(r.providerLabel));
+  if(r.dir) bits.push(esc(r.dir));
+  if(r.cpuHog && r.cpu!=null) bits.push('<span class="hot">cpu '+r.cpu+'%</span>');
+  if(r.rssMb!=null && r.rssMb>=1024) bits.push(esc(fmtMb(r.rssMb)));
+  return bits.join(' · ');
+}
+function rowHtml(r, gkey){
+  const acts = (r.canTranscript?'<button class="act" data-act="transcript" title="Open transcript" aria-label="Open transcript">▤</button>':'')
+    + (r.ended
+        ? '<button class="act" data-act="remove" title="Remove from list" aria-label="Remove from list">✕</button>'
+        : (r.canKill
+            ? '<button class="act" data-act="kill" title="Kill process (SIGTERM)" aria-label="Kill process">⊘</button>'
+            : (r.canResume?'<button class="act" data-act="resume" title="Resume in terminal" aria-label="Resume in terminal">↻</button>':'')));
+  return '<div class="row'+(r.ended?' ended':'')+'" role="row" tabindex="0" data-id="'+esc(r.id)+'" title="'+esc(r.tip)+'">'
+    + '<span class="dot'+(r.stale?' stale':'')+'" style="background:'+GCOLOR[gkey]+'"></span>'
+    + '<span class="title">'+esc(r.title)+'</span>'
+    + '<span class="right"><span class="num age" data-last="'+r.lastMs+'">'+fmtAge(r.lastMs)+'</span><span class="acts">'+acts+'</span></span>'
+    + '<span class="meta">'+metaLine(r)+'</span>'
+    + '<span class="tok num">'+(r.tokens ? '<b>'+esc(r.tokens)+'</b>'+(r.share>=1?' · '+r.share+'%':'') : '')+'</span>'
+    + (r.tokens?'<i class="tokbar'+(r.hog?' hog':'')+'" style="width:calc((100% - 24px) * '+Math.min(100,Math.max(2,r.share))/100+')"></i>':'')
+    + '</div>';
+}
 function render(){
   if(!last) return;
   const root = document.getElementById('root');
   let h = '';
-  const metaBits = [];
-  if(last.totalCpu != null) metaBits.push('CPU <b class="num">'+last.totalCpu+'%</b>');
-  if(last.totalRss != null) metaBits.push('<b class="num">'+esc(fmtMb(last.totalRss))+'</b>');
-  if(last.effort) metaBits.push('effort '+esc(last.effort));
-  if(last.filter) metaBits.push('⧩ '+esc(last.filter));
-  if(metaBits.length) h += '<div class="meta"><span>'+metaBits.join('</span><span>')+'</span></div>';
   const enabled = new Set((last.health||[]).map(x=>x.provider));
   const pf = last.providerFilter || 'all';
-  h += '<div class="providers" role="toolbar" aria-label="Session provider filter">'
-    + '<button class="pfilter'+(pf==='all'?' active':'')+'" data-provider="all" aria-pressed="'+(pf==='all')+'">All '+last.providerCounts.all+'</button>'
-    + (enabled.has('claude')?'<button class="pfilter'+(pf==='claude'?' active':'')+'" data-provider="claude" aria-pressed="'+(pf==='claude')+'">Claude '+last.providerCounts.claude+'</button>':'')
-    + (enabled.has('codex')?'<button class="pfilter'+(pf==='codex'?' active':'')+'" data-provider="codex" aria-pressed="'+(pf==='codex')+'">Codex '+last.providerCounts.codex+'</button>':'')
+  const pill = (key, label, n) => '<button class="pfilter'+(pf===key?' active':'')+'" data-provider="'+key+'" aria-pressed="'+(pf===key)+'">'+label+' '+n+'</button>';
+  const totals = [];
+  if(last.totalCpu != null) totals.push('CPU '+last.totalCpu+'%');
+  if(last.totalRss != null) totals.push(esc(fmtMb(last.totalRss)));
+  if(last.filter) totals.push('⧩ '+esc(last.filter));
+  h += '<div class="top" role="toolbar" aria-label="Session provider filter">'
+    + pill('all','All',last.providerCounts.all)
+    + (enabled.has('claude')?pill('claude','Claude',last.providerCounts.claude):'')
+    + (enabled.has('codex')?pill('codex','Codex',last.providerCounts.codex):'')
+    + (totals.length?'<span class="totals num">'+totals.join(' · ')+'</span>':'')
     + '</div>';
   const health = (last.health||[]).filter(x=>x.state!=='ready' && x.message);
   if(health.length) h += '<div class="health">'+health.map(x=>'<div><b>'+esc(x.provider==='codex'?'Codex':'Claude')+':</b> '+esc(x.message)+'</div>').join('')+'</div>';
@@ -371,47 +389,30 @@ function render(){
     root.innerHTML = h;
     return;
   }
-  h += '<div class="thead" role="row"><span></span><span>session</span><span class="num">tokens</span>'
-    + '<span class="num c-pct">%</span><span class="c-model">model</span><span class="c-eff">eff</span><span class="c-dir">dir</span>'
-    + '<span class="num">age</span><span class="num">cpu</span><span class="num c-ram">mem</span><span></span></div>';
   for(const g of last.groups){
-    h += '<div class="ghead"><span class="gdot" style="background:'+GCOLOR[g.key]+'"></span>'
-      + esc(g.label)+' <span class="gcount">'+g.count+'</span></div>';
-    for(const r of g.rows){
-      const extra = [r.sub, r.reset ? ('reset '+r.reset) : ''].filter(Boolean).join(' · ');
-      h += '<div class="row'+(r.ended?' ended':'')+'" role="row" tabindex="0" data-id="'+esc(r.id)+'" title="'+esc(r.tip)+'">'
-        + '<span><span class="dot'+(r.stale?' stale':'')+'" style="background:'+GCOLOR[g.key]+'"></span></span>'
-        + '<span class="c-title"><span class="pbadge '+esc(r.provider)+'" title="'+esc(r.providerLabel)+'">'+(r.provider==='codex'?'CDX':'CLD')+'</span>'+esc(r.title)+(extra?' <span class="sub">· '+esc(extra)+'</span>':'')+'</span>'
-        + '<span class="num c-tok">'+esc(r.tokens)
-        +   (r.tokens?'<i class="tokbar'+(r.hog?' hog':'')+'" style="width:'+Math.min(100,Math.max(2,r.share))+'%"></i>':'')
-        + '</span>'
-        + '<span class="num c-pct">'+(r.tokens && r.share>=1 ? r.share+'%' : '')+'</span>'
-        + '<span class="c-model" title="'+esc(r.model)+'">'+esc(r.model)+'</span>'
-        + '<span class="c-eff" title="reasoning effort">'+esc(r.effort)+'</span>'
-        + '<span class="c-dir" title="'+esc(r.dir)+'">'+esc(r.dir)+'</span>'
-        + '<span class="num age" data-last="'+r.lastMs+'">'+fmtAge(r.lastMs)+'</span>'
-        + '<span class="num c-cpu'+(r.cpuHog?' hot':'')+'">'+(r.cpu!=null?r.cpu+'%':'')+'</span>'
-        + '<span class="num c-ram">'+(r.rssMb!=null?esc(fmtMb(r.rssMb)):'')+'</span>'
-        + '<span class="c-act">'
-        +   (r.canTranscript?'<button class="act" data-act="transcript" title="Open transcript" aria-label="Open transcript">▤</button>':'')
-        +   (r.ended
-              ? '<button class="act" data-act="remove" title="Remove from list" aria-label="Remove from list">✕</button>'
-              : (r.canKill
-                  ? '<button class="act" data-act="kill" title="Kill process (SIGTERM)" aria-label="Kill process">⊘</button>'
-                  : (r.canResume?'<button class="act" data-act="resume" title="Resume in terminal" aria-label="Resume in terminal">↻</button>':'')))
-        + '</span>'
-        + '</div>';
-    }
+    const fold = !!FOLDABLE[g.key];
+    const closed = fold && folded[g.key];
+    h += (fold?'<button type="button" class="ghead fold" data-group="'+g.key+'" aria-expanded="'+(!closed)+'">':'<div class="ghead">')
+      + esc(g.label)+' <span class="n">'+g.count+'</span>'
+      + (fold?'<span class="chev">'+(closed?'▸':'▾')+'</span>':'')
+      + (fold?'</button>':'</div>');
+    if(closed) continue;
+    for(const r of g.rows) h += rowHtml(r, g.key);
   }
   root.innerHTML = h;
 }
-function fmtMb(mb){ return mb >= 1024 ? (mb/1024).toFixed(1)+'GB' : mb+'MB'; }
 document.getElementById('root').addEventListener('click', (ev) => {
   let el = ev.target;
-  while(el && el !== ev.currentTarget && !(el.classList && (el.classList.contains('pfilter') || el.classList.contains('act') || el.classList.contains('row')))) el = el.parentElement;
+  while(el && el !== ev.currentTarget && !(el.classList && (el.classList.contains('pfilter') || el.classList.contains('act') || el.classList.contains('row') || el.classList.contains('fold')))) el = el.parentElement;
   if(!el || el === ev.currentTarget) return;
   if(el.classList.contains('pfilter')){
     vscodeApi.postMessage({ type: 'filterProvider', id: el.dataset.provider });
+    return;
+  }
+  if(el.classList.contains('fold')){
+    folded[el.dataset.group] = !folded[el.dataset.group];
+    vscodeApi.setState({ folded });
+    render();
     return;
   }
   if(el.classList.contains('act')){
@@ -846,67 +847,45 @@ function limitsHtml(): string {
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <style>
-  body { font-family: var(--vscode-font-family); font-size: 12px; color: var(--vscode-foreground); padding: 6px 10px 4px; }
-  .empty { opacity: .65; padding: 6px 0; }
-  .gauge { margin: 0 0 7px 0; }
-  .grow { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:3px; }
-  .glabel { font-weight:600; }
-  .gpct { font-variant-numeric: tabular-nums; }
-  .greset { opacity:.7; font-size:11px; }
-  .bar { height:8px; border-radius:4px; background: var(--vscode-editorWidget-background, rgba(127,127,127,.18)); overflow:hidden; }
-  .fill { height:100%; border-radius:4px; transition: width .4s ease; }
-  /* One card per account/provider. The left rule carries the card's worst
-     gauge color, so pressure reads at a glance even when the text is skimmed. */
-  .card { position:relative; margin:0 0 8px; padding:5px 0 4px 9px; border-radius:3px;
-    border-left:2px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35));
-    background: color-mix(in srgb, var(--vscode-editorWidget-background, rgba(127,127,127,.12)) 55%, transparent); }
+  * { box-sizing: border-box; }
+  body { font-family: var(--vscode-font-family); font-size: 12px; color: var(--vscode-foreground); padding: 8px 12px 6px; margin: 0; }
+  .empty { color: var(--vscode-descriptionForeground); padding: 6px 0; line-height:1.5; }
+  .num { font-family: var(--vscode-editor-font-family, monospace); font-size:11px; font-variant-numeric: tabular-nums; }
+  /* One card per login/provider. The only color on the card is the pressure:
+     the left rule and the percentage of each gauge. Everything else is quiet. */
+  .card { position:relative; margin:0 0 14px; padding:0 0 0 10px;
+    border-left:2px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35)); }
   .card.warn { border-left-color: var(--vscode-charts-yellow, #e6b800); }
   .card.bad { border-left-color: var(--vscode-charts-red, #f14c4c); }
-  .chead { display:flex; align-items:center; gap:6px; margin-bottom:4px; min-width:0; }
-  .ctitle { font-weight:700; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .pbadge { display:inline-block; min-width:25px; padding:1px 3px; flex:none;
-    border:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35));
-    border-radius:3px; font-size:8px; font-weight:700; letter-spacing:.04em;
-    text-align:center; color:var(--vscode-descriptionForeground); }
-  .pbadge.codex { color:var(--vscode-charts-blue, #3794ff); }
-  .pbadge.claude { color:var(--vscode-charts-orange, #d18616); }
-  .plan { flex:none; padding:0 5px; border-radius:999px; font-size:9px; font-weight:600; line-height:14px;
-    font-variant-numeric: tabular-nums; white-space:nowrap;
-    background: var(--vscode-badge-background, rgba(127,127,127,.25));
-    color: var(--vscode-badge-foreground, var(--vscode-foreground)); }
-  .cage { margin-left:auto; font-size:10px; opacity:.5; white-space:nowrap; }
-  .card .grow { margin-bottom:1px; }
-  .card .glabel { font-weight:500; font-size:11px; }
-  .num { font-family: var(--vscode-editor-font-family, monospace); font-size:11px; font-variant-numeric: tabular-nums; }
-  .meter { height:2px; border-radius:1px; margin:0 0 5px; overflow:hidden;
-    background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
+  .chead { display:flex; align-items:baseline; gap:6px; margin-bottom:6px; min-width:0; }
+  .ctitle { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .cplan { color: var(--vscode-descriptionForeground); font-size:11px; white-space:nowrap; }
+  .adot { align-self:center; width:6px; height:6px; border-radius:50%; background:var(--vscode-charts-green,#4caf50); flex:none; }
+  .cage { margin-left:auto; font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
+  .g { margin:0 0 7px; }
+  .grow { display:flex; align-items:baseline; gap:8px; margin-bottom:3px; }
+  .glabel { font-size:11px; color: var(--vscode-descriptionForeground); }
+  .gpct { margin-left:auto; font-size:12px; font-weight:600; }
+  .greset { font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; min-width:58px; text-align:right; }
+  .meter { height:2px; border-radius:1px; overflow:hidden; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
   .meter i { display:block; height:100%; border-radius:1px; }
   @media (prefers-reduced-motion: no-preference) { .meter i { transition: width .4s ease; } }
-  .card .note { margin-top:3px; }
-  .card .eta { margin:-2px 0 5px 0; }
-  .adot { width:7px; height:7px; border-radius:50%; background:var(--vscode-charts-green,#4caf50); flex:none; }
-  .legend { font-size:11px; opacity:.7; display:flex; gap:12px; margin-top:2px; flex-wrap:wrap; }
-  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; vertical-align:middle; }
-  svg { width:100%; display:block; }
-  .foot { margin-top:8px; font-size:11px; opacity:.55; }
-  .sec { margin-top:8px; }
-  .sec h4 { margin:0 0 4px 0; font-size:11px; opacity:.7; font-weight:600; }
-  .sech { display:flex; align-items:baseline; gap:6px; cursor:pointer; user-select:none; padding:1px 0; }
-  button.sech { width:100%; border:0; background:transparent; color:inherit; font:inherit; text-align:left; }
-  .sech h4 { margin:0; }
-  .sech:hover h4 { opacity:1; }
-  .chev { font-size:9px; opacity:.55; width:9px; flex:none; }
-  .hint { font-size:10px; opacity:.5; margin-left:auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:55%; font-weight:400; }
-  .hit { padding:4px 0; border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.2)); }
-  .hitt { font-weight:600; }
-  .note { margin-top:10px; font-size:11px; opacity:.6; line-height:1.4; }
-  .eta { font-size:11px; margin:-3px 0 8px 0; opacity:.85; }
-  .eta.bad { color: var(--vscode-charts-red, #f14c4c); opacity:1; }
-  .mrow { display:flex; align-items:center; gap:6px; margin:3px 0; }
+  .eta { font-size:11px; margin:-3px 0 7px; color: var(--vscode-charts-red, #f14c4c); }
+  .note { font-size:10px; line-height:1.4; color: var(--vscode-descriptionForeground); margin-top:2px; }
+  .foot { display:flex; gap:8px; align-items:baseline; margin:4px 0 2px; font-size:11px; color: var(--vscode-descriptionForeground); }
+  .foot .num { margin-left:auto; color: var(--vscode-foreground); }
+  .sech { display:flex; align-items:baseline; gap:6px; width:100%; padding:6px 0 2px; border:0; background:transparent;
+    color: var(--vscode-descriptionForeground); font:inherit; font-size:11px; text-align:left; cursor:pointer; user-select:none; }
+  .sech:hover { color: var(--vscode-foreground); }
+  .chev { font-size:9px; width:9px; flex:none; }
+  .hint { margin-left:auto; font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:55%; }
+  .mrow { display:flex; align-items:center; gap:8px; margin:4px 0; }
   .mname { width:84px; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .mbar { flex:1; height:7px; border-radius:3px; background: var(--vscode-editorWidget-background, rgba(127,127,127,.18)); overflow:hidden; }
-  .mfill { height:100%; border-radius:3px; }
-  .mval { font-size:10px; font-variant-numeric: tabular-nums; opacity:.75; white-space:nowrap; }
+  .mbar { flex:1; height:2px; border-radius:1px; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); overflow:hidden; }
+  .mfill { display:block; height:100%; background: var(--vscode-charts-blue, #3794ff); opacity:.6; }
+  .mval { font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
+  .hit { padding:5px 0; border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.2)); font-size:11px; }
+  .hitt { font-weight:600; }
 </style>
 </head>
 <body>
@@ -916,7 +895,6 @@ const vscodeApi = acquireVsCodeApi();
 const C_OK = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-green') || '#4caf50';
 const C_WARN = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-yellow') || '#e6b800';
 const C_BAD = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-red') || '#f14c4c';
-const C_BLUE = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-blue') || '#3794ff';
 let last = null;
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -926,10 +904,10 @@ function fmtLeft(ms){
   let s = Math.round((ms - Date.now())/1000);
   if(s<=0) return 'resets now';
   const d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60);
-  if(d>0) return 'resets in '+d+'d '+h+'h';
-  if(h>0) return 'resets in '+h+'h '+m+'m';
-  if(m>0) return 'resets in '+m+'m';
-  return 'resets in <1m';
+  if(d>0) return d+'d '+h+'h';
+  if(h>0) return h+'h '+m+'m';
+  if(m>0) return m+'m';
+  return '<1m';
 }
 function fmtDur(ms){
   if(ms==null || ms<=0) return 'now';
@@ -937,12 +915,6 @@ function fmtDur(ms){
   if(h>0) return h+'h '+m+'m';
   if(m>0) return m+'m';
   return '<1m';
-}
-function etaLine(eta){
-  if(!eta) return '';
-  const cls = eta.beforeReset ? 'eta bad' : 'eta';
-  const tail = eta.beforeReset ? ' — before reset ⚠️' : ' (after reset, safe)';
-  return '<div class="'+cls+'">at this rate (+'+eta.perHour.toFixed(1)+'%/h): full in '+fmtDur(eta.fullAtMs-Date.now())+tail+'</div>';
 }
 function fmtAge(s){
   if(s<90) return s+'s';
@@ -954,80 +926,57 @@ function fmtPct(p){
   if(p==null) return '?';
   return p < 10 ? (Math.round(p*10)/10).toString() : String(Math.round(p));
 }
-// Collapsible sections: the panel shares a sidebar with the session table, so
-// every block below the gauges can be folded to one header line. State is kept
-// in the webview state store (survives hide/show and window reloads).
-const savedState = vscodeApi.getState() || {};
-let collapsed = savedState.collapsed || { sessions:false, models:true };
-function saveState(){ vscodeApi.setState({ collapsed }); }
-function secHeader(id, title, hint){
-  return '<button type="button" class="sech" data-sec="'+id+'" aria-expanded="'+(!collapsed[id])+'"><span class="chev">'+(collapsed[id]?'▸':'▾')+'</span>'
-    + '<h4>'+title+'</h4>'
-    + (collapsed[id] && hint ? '<span class="hint">'+hint+'</span>' : '')
-    + '</button>';
-}
-function truncLbl(s){ return s.length>16 ? s.slice(0,15)+'…' : s; }
-function sessionSection(rows){
-  if(!rows || !rows.length) return '';
-  let h='<div class="sec">'+secHeader('sessions','Sessions (5h tokens)', esc(truncLbl(rows[0].label))+' '+rows[0].pct+'%');
-  if(!collapsed.sessions){
-    for(const s of rows.slice(0,5)){
-      h += '<div class="mrow"><span class="mname" title="'+esc(s.label)+'">'+esc(s.label)+'</span>'
-        + '<span class="mbar"><span class="mfill" style="width:'+Math.max(2,s.pct)+'%;background:'+C_OK+'"></span></span>'
-        + '<span class="mval">'+s.pct+'% · '+fmtTokens(s.tokens)+'</span></div>';
-    }
-    h += '<div class="legend"><span>share of this Mac\\'s 5h token total</span></div>';
-  }
-  h += '</div>';
-  return h;
-}
-function modelSection(models){
-  if(!models || !models.length) return '';
-  let h='<div class="sec">'+secHeader('models','Models (7d share)', esc(models[0].name)+' '+models[0].pct+'%');
-  if(!collapsed.models){
-    let total=0, priced=true;
-    for(const m of models){
-      h += '<div class="mrow"><span class="mname" title="'+esc(m.name)+'">'+esc(m.name)+'</span>'
-        + '<span class="mbar"><span class="mfill" style="width:'+Math.max(2,m.pct)+'%;background:'+C_BLUE+'"></span></span>'
-        + '<span class="mval">'+m.pct+'% · '+fmtTokens(m.tokens)+(m.cost!=null?(' · ≈$'+m.cost.toFixed(2)):'')+'</span></div>';
-      if(m.cost!=null) total+=m.cost; else priced=false;
-    }
-    if(total>0) h += '<div class="legend"><span>≈$'+total.toFixed(2)+' total'+(priced?'':' (priced models only)')+' · rough, excl. cache reads</span></div>';
-  }
-  h += '</div>';
-  return h;
-}
 function fmtTokens(n){
   if(n==null) return '0';
   if(n<1000) return ''+Math.round(n);
   if(n<1e6) return (n/1e3).toFixed(n<1e4?1:0)+'K';
   return (n/1e6).toFixed(2)+'M';
 }
-function tokenSection(t, multiAcct){
+// Gauge label without the parenthetical window, the reset countdown carries it.
+function gaugeLabel(l){ return l.replace(/\\s*\\((5h|7d)\\)/, ''); }
+// The burn-rate line only appears when it is a warning: the window would fill
+// before its own reset. "Safe" projections are noise and stay off the panel.
+function etaLine(eta){
+  if(!eta || !eta.beforeReset) return '';
+  return '<div class="eta">full in '+fmtDur(eta.fullAtMs-Date.now())+' at +'+eta.perHour.toFixed(0)+'%/h, before the reset</div>';
+}
+const savedState = vscodeApi.getState() || {};
+let collapsed = savedState.collapsed || { models:true };
+function saveState(){ vscodeApi.setState({ collapsed }); }
+function secHeader(id, title, hint){
+  return '<button type="button" class="sech" data-sec="'+id+'" aria-expanded="'+(!collapsed[id])+'"><span class="chev">'+(collapsed[id]?'▸':'▾')+'</span>'
+    + '<span>'+title+'</span>'
+    + (collapsed[id] && hint ? '<span class="hint">'+hint+'</span>' : '')
+    + '</button>';
+}
+function modelSection(models){
+  if(!models || !models.length) return '';
+  let h=secHeader('models','Models, 7d share', esc(models[0].name)+' '+models[0].pct+'%');
+  if(!collapsed.models){
+    let total=0, priced=true;
+    for(const m of models){
+      h += '<div class="mrow"><span class="mname" title="'+esc(m.name)+'">'+esc(m.name)+'</span>'
+        + '<span class="mbar"><i class="mfill" style="width:'+Math.max(2,m.pct)+'%"></i></span>'
+        + '<span class="mval">'+m.pct+'% · '+fmtTokens(m.tokens)+(m.cost!=null?(' · ≈$'+m.cost.toFixed(2)):'')+'</span></div>';
+      if(m.cost!=null) total+=m.cost; else priced=false;
+    }
+    if(total>0) h += '<div class="note">≈$'+total.toFixed(2)+' total'+(priced?'':' (priced models only)')+' · rough, excl. cache reads</div>';
+  }
+  return h;
+}
+function tokenFoot(t, multiAcct){
   if(!t) return '';
-  // One line: totals carry all the signal (the 48h hourly bars were dropped in
-  // 1.9.1, and the two-row layout wasted a section on two numbers).
-  return '<div class="sec"><div class="grow">'
-    + '<span class="glabel" title="in + out + cache-write'+(multiAcct?', all logins on this Mac':'')+'">Tokens'+(multiAcct?' <span class="hint">all logins</span>':'')+'</span>'
-    + '<span class="gpct">5h '+fmtTokens(t.fiveHour)+' · 7d '+fmtTokens(t.sevenDay)+'</span></div></div>';
+  return '<div class="foot"><span title="in + out + cache-write'+(multiAcct?', all logins on this Mac':'')+'">Tokens'+(multiAcct?', all logins':'')+'</span>'
+    + '<span class="num">5h '+fmtTokens(t.fiveHour)+' · 7d '+fmtTokens(t.sevenDay)+'</span></div>';
 }
-function providerTokenLine(card){
-  if(card.sevenDayTokens==null && card.lifetimeTokens==null) return '';
-  const parts=[];
-  if(card.sevenDayTokens!=null) parts.push('7d '+fmtTokens(card.sevenDayTokens));
-  if(card.lifetimeTokens!=null) parts.push('lifetime '+fmtTokens(card.lifetimeTokens));
-  return '<div class="grow"><span class="glabel">Tokens</span><span class="gpct">'+parts.join(' · ')+'</span></div>';
-}
-// One gauge = a text line (label · used% · reset countdown) over a 2px hairline
-// meter — the same geometry the session table uses for token share, so both
-// views read the same way. The old 20-segment bars were dropped so every
-// account fits on screen.
+// One gauge = label · used% · reset countdown over a 2px hairline meter, the same
+// geometry the session list uses for token share.
 function gaugeRow(g){
   const p = g.pct;
-  return '<div class="grow"><span class="glabel">'+esc(g.label)+'</span>'
-    + '<span class="gpct num"><span style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
-    + (g.resetMs?(' <span class="greset">· '+fmtLeft(g.resetMs)+'</span>'):'')+'</span></div>'
-    + '<div class="meter"><i style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%;background:'+color(p)+'"></i></div>';
+  return '<div class="g"><div class="grow"><span class="glabel">'+esc(gaugeLabel(g.label))+'</span>'
+    + '<span class="gpct num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
+    + '<span class="greset">'+(g.resetMs?fmtLeft(g.resetMs):'')+'</span></div>'
+    + '<div class="meter"><i style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%;background:'+color(p)+'"></i></div></div>';
 }
 function pressure(card){
   let worst = null;
@@ -1035,17 +984,17 @@ function pressure(card){
   if(worst==null) return '';
   return worst>=90 ? ' bad' : (worst>=70 ? ' warn' : '');
 }
-// One card per provider/account, all stacked: every Claude login and Codex are
-// visible at once, no tabs.
+// One card per provider/account, stacked. The header is "who · plan"; the fetch
+// age only shows once the data is older than ten minutes, so a healthy card
+// carries nothing but its gauges.
 function providerCard(card){
   const age = card.ts ? Math.max(0, Math.round(Date.now()/1000 - card.ts)) : null;
-  const badge = card.provider==='codex' ? '<span class="pbadge codex">CDX</span>' : '<span class="pbadge claude">CLD</span>';
+  const name = card.label.replace(/^(Claude|Codex) · /,'');
   let h='<div class="card'+pressure(card)+'"><div class="chead">'
-    + badge
-    + '<span class="ctitle" title="'+esc(card.label)+'">'+esc(card.label.replace(/^(Claude|Codex) · /,''))+'</span>'
-    + (card.plan ? '<span class="plan" title="plan">'+esc(card.plan)+'</span>' : '')
+    + '<span class="ctitle" title="'+esc(card.label)+'">'+esc(name)+'</span>'
     + (card.provider==='claude' && card.active ? '<span class="adot" title="active login"></span>' : '')
-    + (age!=null ? '<span class="cage num" title="last official usage fetch">'+fmtAge(age)+'</span>' : '')
+    + (card.plan ? '<span class="cplan">'+esc(card.plan)+'</span>' : '')
+    + (age!=null && age>600 ? '<span class="cage num" title="last official usage fetch">'+fmtAge(age)+' ago</span>' : '')
     + '</div>';
   if(card.official){
     for(const g of card.gauges){
@@ -1053,7 +1002,6 @@ function providerCard(card){
       if(card.provider==='claude' && card.active && (g.key==='session'||g.key==='5h')) h += etaLine(last.eta);
     }
   }
-  h += providerTokenLine(card);
   if(card.note) h += '<div class="note">'+esc(card.note)+'</div>';
   else if(!card.official) h += '<div class="note">Official '+esc(card.label)+' usage is unavailable. Session state remains available.</div>';
   return h+'</div>';
@@ -1068,30 +1016,21 @@ function render(){
   }];
   for(const c of cards) h += providerCard(c);
   if(cards.some(c=>c.provider==='claude')){
-    // Claude token usage is a rolling local proxy with per-session/model detail.
     const multiAcct = !!(last.accounts && last.accounts.length > 1);
-    h += tokenSection(last.tokens, multiAcct);
-    h += sessionSection(last.sessions);
+    h += tokenFoot(last.tokens, multiAcct);
     h += modelSection(last.models);
   }
-  // Reactive limit hits: always real, derived from session transcripts (429).
   const limited = last.limited||[];
   if(limited.length){
-    h += '<div class="sec"><h4>Active limit hits</h4>';
+    h += '<div class="foot">Active limit hits</div>';
     for(const l of limited){
-      const reset = l.resetMs ? (' · '+fmtLeft(l.resetMs)) : (l.resetText? (' · resets '+esc(l.resetText)) : '');
+      const reset = l.resetMs ? (' · resets in '+fmtLeft(l.resetMs)) : (l.resetText? (' · resets '+esc(l.resetText)) : '');
       const prov = cards.length > 1 ? (l.provider==='codex' ? 'Codex · ' : 'Claude · ') : '';
-      h += '<div class="hit"><span class="hitt">'+prov+esc(l.title)+'</span> <span class="greset">'+esc(l.sub)+reset+'</span></div>';
+      h += '<div class="hit"><span class="hitt">'+prov+esc(l.title)+'</span> <span class="note">'+esc(l.sub)+reset+'</span></div>';
     }
-    h += '</div>';
   }
   root.innerHTML = h;
 }
-// Manual refresh lives in the view title bar (the ⟳ icon runs
-// claudeSessionMonitor.refreshUsage); the in-panel button was removed to give
-// the vertical space back to data. The "refreshing…" note still reports state.
-// Section headers are re-rendered every second, so their click handlers are
-// delegated from the stable root node.
 document.getElementById('root').addEventListener('click', (ev) => {
   let el = ev.target;
   while(el && el !== ev.currentTarget){

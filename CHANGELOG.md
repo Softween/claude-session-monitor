@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.5.0
+
+### Changed
+
+- Usage view: the 2.4.0 rings are gone after one day. They read badly under real
+  VS Code themes (charts colors vary widely) and stacked three color systems on
+  one card. Each account card now states one thing: the window that binds you
+  (highest used%) as a large figure with its label and reset countdown, and the
+  other windows as a single muted line beneath ("Session 2% · Fable 84%"). Color
+  is pressure only: amber from 70%, red from 90%, plain text below that.
+
 ## 2.4.0
 
 ### Changed

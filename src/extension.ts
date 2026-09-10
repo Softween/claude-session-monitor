@@ -851,29 +851,23 @@ function limitsHtml(): string {
   body { font-family: var(--vscode-font-family); font-size: 12px; color: var(--vscode-foreground); padding: 8px 12px 6px; margin: 0; }
   .empty { color: var(--vscode-descriptionForeground); padding: 6px 0; line-height:1.5; }
   .num { font-family: var(--vscode-editor-font-family, monospace); font-size:11px; font-variant-numeric: tabular-nums; }
-  /* One card per login/provider: a 64px ring stack on the left (Apple Health
-     style, one ring per window, fixed hue per window so the rings stay telling
-     apart, red only once a window is nearly spent) and the text rows on the
-     right. The rows keep the exact percentage and reset countdown; the rings
-     are the at-a-glance layer, not a replacement. */
-  .card { display:grid; grid-template-columns:64px minmax(0,1fr); column-gap:12px; margin:0 0 16px; }
-  .chead { grid-column:1 / -1; display:flex; align-items:baseline; gap:6px; margin-bottom:6px; min-width:0; }
-  .rings { width:64px; height:64px; align-self:center; }
-  .rings circle { fill:none; stroke-width:5; stroke-linecap:round; transform:rotate(-90deg); transform-origin:50% 50%; }
-  .rings .track { stroke: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
-  @media (prefers-reduced-motion: no-preference) { .rings circle { transition: stroke-dasharray .4s ease; } }
-  .rows { display:flex; flex-direction:column; justify-content:center; gap:7px; min-width:0; }
-  .swatch { width:6px; height:6px; border-radius:50%; flex:none; align-self:center; margin-right:2px; }
-  .span { grid-column:1 / -1; }
+  /* One card per login/provider, one idea per card: the window that binds you
+     (highest used%) is the big number, with its reset countdown; the other
+     windows are a single quiet line beneath. Color appears only as pressure
+     (amber from 70%, red from 90%); everything else is foreground/muted. */
+  .card { margin:0 0 16px; }
+  .chead { display:flex; align-items:baseline; gap:6px; margin-bottom:5px; min-width:0; }
+  .big { display:flex; align-items:baseline; gap:8px; min-width:0; }
+  .big .n { font-size:26px; font-weight:600; letter-spacing:-.02em; line-height:1; }
+  .big .l { font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .big .r { margin-left:auto; font-size:11px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
+  .rest { margin-top:5px; font-size:11px; color: var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .rest b { font-weight:500; color: var(--vscode-foreground); }
   .ctitle { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .cplan { color: var(--vscode-descriptionForeground); font-size:11px; white-space:nowrap; }
   .adot { align-self:center; width:6px; height:6px; border-radius:50%; background:var(--vscode-charts-green,#4caf50); flex:none; }
   .cage { margin-left:auto; font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
-  .grow { display:flex; align-items:baseline; gap:8px; }
-  .glabel { font-size:11px; color: var(--vscode-descriptionForeground); }
-  .gpct { margin-left:auto; font-size:12px; font-weight:600; }
-  .greset { font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; min-width:58px; text-align:right; }
-  .eta { font-size:11px; color: var(--vscode-charts-red, #f14c4c); }
+  .eta { margin-top:4px; font-size:11px; color: var(--vscode-charts-red, #f14c4c); }
   .note { font-size:10px; line-height:1.4; color: var(--vscode-descriptionForeground); margin-top:2px; }
   .foot { display:flex; gap:8px; align-items:baseline; margin:4px 0 2px; font-size:11px; color: var(--vscode-descriptionForeground); }
   .foot .num { margin-left:auto; color: var(--vscode-foreground); }
@@ -898,43 +892,21 @@ const vscodeApi = acquireVsCodeApi();
 const C_OK = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-green') || '#4caf50';
 const C_WARN = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-yellow') || '#e6b800';
 const C_BAD = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-red') || '#f14c4c';
-const C_BLUE = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-blue') || '#3794ff';
-const C_PURPLE = getComputedStyle(document.documentElement).getPropertyValue('--vscode-charts-purple') || '#b180d7';
 let last = null;
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function color(p){ if(p==null) return 'gray'; if(p>=90) return C_BAD; if(p>=70) return C_WARN; return C_OK; }
-// Ring hue is the window's identity (session blue, weekly green, per-model purple),
-// so three rings never blur into one; it flips to red only once the window is
-// nearly spent. The percentage text keeps the usual green/yellow/red pressure color.
-function hue(g){
-  if(g.pct!=null && g.pct>=90) return C_BAD;
-  const k = String(g.key||'');
-  if(k==='session' || k==='5h') return C_BLUE;
-  if(k==='weekly' || k==='7d') return C_OK;
-  if(k.indexOf('weekly-')===0) return C_PURPLE;
-  return C_BLUE;
-}
-// Up to three concentric rings (outer = first gauge). Radii leave a 5px stroke
-// plus a 2px gap; a fourth gauge stays a text row only.
-function ringSvg(gauges){
-  const R=[28,21,14]; let h='<svg class="rings" viewBox="0 0 64 64" aria-hidden="true">';
-  gauges.slice(0,3).forEach((g,i)=>{
-    const r=R[i], c=2*Math.PI*r, p=g.pct==null?0:Math.min(100,Math.max(0,g.pct));
-    h+='<circle class="track" cx="32" cy="32" r="'+r+'"/>'
-     +'<circle cx="32" cy="32" r="'+r+'" stroke="'+hue(g)+'" stroke-dasharray="'+(c*Math.max(p,1.5)/100).toFixed(1)+' '+c.toFixed(1)+'"/>';
-  });
-  return h+'</svg>';
-}
+// Pressure color: red from 90%, amber from 70%, otherwise plain foreground so a
+// healthy card carries no color at all.
+function color(p){ if(p==null) return 'inherit'; if(p>=90) return C_BAD; if(p>=70) return C_WARN; return 'inherit'; }
 function fmtLeft(ms){
   if(ms==null) return '';
   let s = Math.round((ms - Date.now())/1000);
   if(s<=0) return 'resets now';
   const d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60);
-  if(d>0) return d+'d '+h+'h';
-  if(h>0) return h+'h '+m+'m';
-  if(m>0) return m+'m';
-  return '<1m';
+  if(d>0) return 'resets in '+d+'d '+h+'h';
+  if(h>0) return 'resets in '+h+'h '+m+'m';
+  if(m>0) return 'resets in '+m+'m';
+  return 'resets in <1m';
 }
 function fmtDur(ms){
   if(ms==null || ms<=0) return 'now';
@@ -996,14 +968,24 @@ function tokenFoot(t, multiAcct){
   return '<div class="foot"><span title="in + out + cache-write'+(multiAcct?', all logins on this Mac':'')+'">Tokens'+(multiAcct?', all logins':'')+'</span>'
     + '<span class="num">5h '+fmtTokens(t.fiveHour)+' · 7d '+fmtTokens(t.sevenDay)+'</span></div>';
 }
-// One gauge row = ring swatch · label · used% · reset countdown. Rows past the
-// third have no ring, so no swatch.
-function gaugeRow(g, i){
-  const p = g.pct;
-  return '<div class="grow">'+(i<3?'<span class="swatch" style="background:'+hue(g)+'"></span>':'')
-    + '<span class="glabel">'+esc(gaugeLabel(g.label))+'</span>'
-    + '<span class="gpct num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
-    + '<span class="greset">'+(g.resetMs?fmtLeft(g.resetMs):'')+'</span></div>';
+// The binding window: highest used%; ties keep payload order (session first).
+function binding(gauges){
+  let best = null;
+  for(const g of gauges) if(g.pct!=null && (best==null || g.pct>best.pct)) best = g;
+  return best || gauges[0];
+}
+// Secondary windows read as one line, model windows shortened to the model name
+// ("Weekly · Fable" -> "Fable") since the line already sits under a Weekly figure.
+function restLabel(l){ return gaugeLabel(l).replace(/^Weekly · /, ''); }
+function gaugeBlock(gauges){
+  const b = binding(gauges);
+  let h = '<div class="big"><span class="n num" style="color:'+color(b.pct)+'">'+fmtPct(b.pct)+'%</span>'
+    + '<span class="l">'+esc(gaugeLabel(b.label))+'</span>'
+    + '<span class="r">'+(b.resetMs?fmtLeft(b.resetMs):'')+'</span></div>';
+  // Secondary values color only once spent (>=90%), so the big figure stays the one accent.
+  const rest = gauges.filter(g=>g!==b).map(g=>esc(restLabel(g.label))+' <b style="color:'+(g.pct!=null&&g.pct>=90?C_BAD:'inherit')+'">'+fmtPct(g.pct)+'%</b>');
+  if(rest.length) h += '<div class="rest">'+rest.join(' · ')+'</div>';
+  return h;
 }
 // One card per provider/account, stacked. The header is "who · plan"; the fetch
 // age only shows once the data is older than ten minutes, so a healthy card
@@ -1019,11 +1001,11 @@ function providerCard(card){
     + '</div>';
   const gauges = card.official ? (card.gauges||[]) : [];
   if(gauges.length){
-    h += ringSvg(gauges) + '<div class="rows">' + gauges.map(gaugeRow).join('') + '</div>';
-    if(card.provider==='claude' && card.active && gauges.some(g=>g.key==='session'||g.key==='5h')) h += '<div class="span">'+etaLine(last.eta)+'</div>';
+    h += gaugeBlock(gauges);
+    if(card.provider==='claude' && card.active && gauges.some(g=>g.key==='session'||g.key==='5h')) h += etaLine(last.eta);
   }
-  if(card.note) h += '<div class="note span">'+esc(card.note)+'</div>';
-  else if(!card.official) h += '<div class="note span">Official '+esc(card.label)+' usage is unavailable. Session state remains available.</div>';
+  if(card.note) h += '<div class="note">'+esc(card.note)+'</div>';
+  else if(!card.official) h += '<div class="note">Official '+esc(card.label)+' usage is unavailable. Session state remains available.</div>';
   return h+'</div>';
 }
 function render(){
@@ -1044,7 +1026,7 @@ function render(){
   if(limited.length){
     h += '<div class="foot">Active limit hits</div>';
     for(const l of limited){
-      const reset = l.resetMs ? (' · resets in '+fmtLeft(l.resetMs)) : (l.resetText? (' · resets '+esc(l.resetText)) : '');
+      const reset = l.resetMs ? (' · '+fmtLeft(l.resetMs)) : (l.resetText? (' · resets '+esc(l.resetText)) : '');
       const prov = cards.length > 1 ? (l.provider==='codex' ? 'Codex · ' : 'Claude · ') : '';
       h += '<div class="hit"><span class="hitt">'+prov+esc(l.title)+'</span> <span class="note">'+esc(l.sub)+reset+'</span></div>';
     }

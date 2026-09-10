@@ -265,7 +265,7 @@ function sessionsHtml(): string {
   .num { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px;
     font-variant-numeric: tabular-nums; white-space: nowrap; }
   /* Top strip: provider filter on the left, machine totals on the right. */
-  .top { display:flex; align-items:center; gap:4px; padding:8px 12px 6px; }
+  .top { display:flex; align-items:center; gap:4px; padding:5px 12px 3px; }
   .pfilter { border:0; background:transparent; color:var(--vscode-descriptionForeground); border-radius:999px;
     padding:2px 8px; font:inherit; font-size:11px; cursor:pointer; }
   .pfilter:hover { color:var(--vscode-foreground); }
@@ -273,18 +273,19 @@ function sessionsHtml(): string {
   .totals { margin-left:auto; font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .health { padding:2px 12px 6px; color:var(--vscode-descriptionForeground); font-size:10px; line-height:1.4; }
   /* Group header: quiet label + count; a chevron only when it is collapsible. */
-  .ghead { display:flex; align-items:center; gap:6px; width:100%; padding:10px 12px 3px; border:0; background:transparent;
+  .ghead { display:flex; align-items:center; gap:6px; width:100%; padding:7px 12px 2px; border:0; background:transparent;
     color: var(--vscode-descriptionForeground); font:inherit; font-size:10px; font-weight:600; text-transform:uppercase;
     letter-spacing:.08em; text-align:left; cursor:default; }
   .ghead.fold { cursor:pointer; }
   .ghead.fold:hover { color: var(--vscode-foreground); }
   .ghead .n { font-weight:400; opacity:.7; }
   .ghead .chev { margin-left:auto; font-size:9px; opacity:.6; }
-  /* Row = two lines. Line 1: state dot · title · age (actions replace the age on hover).
-     Line 2: model · effort · dir, tokens on the right. The hairline under the row is
-     this chat's share of the machine's 5h total — who is eating the limit reads as geometry. */
-  .row { position:relative; display:grid; grid-template-columns: 8px minmax(0,1fr) auto; grid-template-rows:auto auto;
-    column-gap:8px; row-gap:1px; align-items:center; padding:5px 12px 6px; cursor:pointer; }
+  /* Row = one line: state dot · title (model · dir muted inline) · tokens · age
+     (actions replace the age on hover). The hairline under the row is this chat's
+     share of the machine's 5h total — who is eating the limit reads as geometry.
+     Kept to one line so the list stays short; the usage view below is the main event. */
+  .row { position:relative; display:grid; grid-template-columns: 8px minmax(0,1fr) auto auto;
+    column-gap:8px; align-items:center; padding:3px 12px 4px; cursor:pointer; }
   .row:hover { background: var(--vscode-list-hoverBackground, rgba(127,127,127,.12)); }
   .row:focus { outline: 1px solid var(--vscode-focusBorder, #007fd4); outline-offset: -1px; }
   .row.ended { opacity: .5; }
@@ -292,11 +293,10 @@ function sessionsHtml(): string {
   .dot.stale { box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-charts-yellow, #e6b800) 35%, transparent); }
   .title { grid-row:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .right { grid-row:1; display:flex; align-items:center; gap:2px; color: var(--vscode-descriptionForeground); }
-  .meta { grid-row:2; grid-column:2; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-    font-size:11px; color: var(--vscode-descriptionForeground); }
+  .meta { font-size:11px; color: var(--vscode-descriptionForeground); }
   .meta .sub { color: var(--vscode-foreground); opacity:.85; }
   .meta .hot { color: var(--vscode-charts-red, #f14c4c); }
-  .tok { grid-row:2; grid-column:3; color: var(--vscode-descriptionForeground); text-align:right; }
+  .tok { grid-row:1; color: var(--vscode-descriptionForeground); }
   .tok b { font-weight:500; color: var(--vscode-foreground); }
   .tokbar { position:absolute; left:12px; bottom:0; height:2px; border-radius:1px;
     background: var(--vscode-charts-blue, #3794ff); opacity:.4; }
@@ -350,6 +350,7 @@ function metaLine(r){
   return bits.join(' · ');
 }
 function rowHtml(r, gkey){
+  const meta = metaLine(r);
   const acts = (r.canTranscript?'<button class="act" data-act="transcript" title="Open transcript" aria-label="Open transcript">▤</button>':'')
     + (r.ended
         ? '<button class="act" data-act="remove" title="Remove from list" aria-label="Remove from list">✕</button>'
@@ -358,10 +359,9 @@ function rowHtml(r, gkey){
             : (r.canResume?'<button class="act" data-act="resume" title="Resume in terminal" aria-label="Resume in terminal">↻</button>':'')));
   return '<div class="row'+(r.ended?' ended':'')+'" role="row" tabindex="0" data-id="'+esc(r.id)+'" title="'+esc(r.tip)+'">'
     + '<span class="dot'+(r.stale?' stale':'')+'" style="background:'+GCOLOR[gkey]+'"></span>'
-    + '<span class="title">'+esc(r.title)+'</span>'
-    + '<span class="right"><span class="num age" data-last="'+r.lastMs+'">'+fmtAge(r.lastMs)+'</span><span class="acts">'+acts+'</span></span>'
-    + '<span class="meta">'+metaLine(r)+'</span>'
+    + '<span class="title">'+esc(r.title)+(meta?' <span class="meta">· '+meta+'</span>':'')+'</span>'
     + '<span class="tok num">'+(r.tokens ? '<b>'+esc(r.tokens)+'</b>'+(r.share>=1?' · '+r.share+'%':'') : '')+'</span>'
+    + '<span class="right"><span class="num age" data-last="'+r.lastMs+'">'+fmtAge(r.lastMs)+'</span><span class="acts">'+acts+'</span></span>'
     + (r.tokens?'<i class="tokbar'+(r.hog?' hog':'')+'" style="width:calc((100% - 24px) * '+Math.min(100,Math.max(2,r.share))/100+')"></i>':'')
     + '</div>';
 }
@@ -851,23 +851,26 @@ function limitsHtml(): string {
   body { font-family: var(--vscode-font-family); font-size: 12px; color: var(--vscode-foreground); padding: 8px 12px 6px; margin: 0; }
   .empty { color: var(--vscode-descriptionForeground); padding: 6px 0; line-height:1.5; }
   .num { font-family: var(--vscode-editor-font-family, monospace); font-size:11px; font-variant-numeric: tabular-nums; }
-  /* One card per login/provider, one idea per card: the window that binds you
-     (highest used%) is the big number, with its reset countdown; the other
-     windows are a single quiet line beneath. Color appears only as pressure
-     (amber from 70%, red from 90%); everything else is foreground/muted. */
-  .card { margin:0 0 16px; }
-  .chead { display:flex; align-items:baseline; gap:6px; margin-bottom:5px; min-width:0; }
-  .big { display:flex; align-items:baseline; gap:8px; min-width:0; }
-  .big .n { font-size:26px; font-weight:600; letter-spacing:-.02em; line-height:1; }
-  .big .l { font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .big .r { margin-left:auto; font-size:11px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
-  .rest { margin-top:5px; font-size:11px; color: var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .rest b { font-weight:500; color: var(--vscode-foreground); }
+  /* One card per login/provider, separated by a hairline. Each window is a row:
+     label · monochrome 4px bar · used% · reset countdown. The bar is foreground
+     at half opacity; color appears only as pressure (used% amber from 70%, bar
+     and used% red from 90%), so a healthy card carries no color at all. */
+  .card { padding:10px 0 12px; border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
+  .card:first-child { padding-top:2px; border-top:0; }
+  .chead { display:flex; align-items:baseline; gap:6px; margin-bottom:7px; min-width:0; }
+  .bar { display:grid; grid-template-columns: 92px minmax(0,1fr) 40px 56px; column-gap:10px; align-items:center; margin:5px 0; }
+  .bar .l { font-size:11px; color: var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .bar .t { height:4px; border-radius:2px; overflow:hidden; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
+  .bar .t i { display:block; height:100%; border-radius:2px; background: var(--vscode-foreground); opacity:.5; }
+  .bar .t i.bad { background: var(--vscode-charts-red, #f14c4c); opacity:1; }
+  @media (prefers-reduced-motion: no-preference) { .bar .t i { transition: width .4s ease; } }
+  .bar .p { text-align:right; font-weight:600; }
+  .bar .r { text-align:right; font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .ctitle { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .cplan { color: var(--vscode-descriptionForeground); font-size:11px; white-space:nowrap; }
   .adot { align-self:center; width:6px; height:6px; border-radius:50%; background:var(--vscode-charts-green,#4caf50); flex:none; }
   .cage { margin-left:auto; font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
-  .eta { margin-top:4px; font-size:11px; color: var(--vscode-charts-red, #f14c4c); }
+  .eta { margin-top:2px; font-size:11px; color: var(--vscode-charts-red, #f14c4c); }
   .note { font-size:10px; line-height:1.4; color: var(--vscode-descriptionForeground); margin-top:2px; }
   .foot { display:flex; gap:8px; align-items:baseline; margin:4px 0 2px; font-size:11px; color: var(--vscode-descriptionForeground); }
   .foot .num { margin-left:auto; color: var(--vscode-foreground); }
@@ -903,10 +906,10 @@ function fmtLeft(ms){
   let s = Math.round((ms - Date.now())/1000);
   if(s<=0) return 'resets now';
   const d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60);
-  if(d>0) return 'resets in '+d+'d '+h+'h';
-  if(h>0) return 'resets in '+h+'h '+m+'m';
-  if(m>0) return 'resets in '+m+'m';
-  return 'resets in <1m';
+  if(d>0) return d+'d '+h+'h';
+  if(h>0) return h+'h '+m+'m';
+  if(m>0) return m+'m';
+  return '<1m';
 }
 function fmtDur(ms){
   if(ms==null || ms<=0) return 'now';
@@ -968,24 +971,13 @@ function tokenFoot(t, multiAcct){
   return '<div class="foot"><span title="in + out + cache-write'+(multiAcct?', all logins on this Mac':'')+'">Tokens'+(multiAcct?', all logins':'')+'</span>'
     + '<span class="num">5h '+fmtTokens(t.fiveHour)+' · 7d '+fmtTokens(t.sevenDay)+'</span></div>';
 }
-// The binding window: highest used%; ties keep payload order (session first).
-function binding(gauges){
-  let best = null;
-  for(const g of gauges) if(g.pct!=null && (best==null || g.pct>best.pct)) best = g;
-  return best || gauges[0];
-}
-// Secondary windows read as one line, model windows shortened to the model name
-// ("Weekly · Fable" -> "Fable") since the line already sits under a Weekly figure.
-function restLabel(l){ return gaugeLabel(l).replace(/^Weekly · /, ''); }
-function gaugeBlock(gauges){
-  const b = binding(gauges);
-  let h = '<div class="big"><span class="n num" style="color:'+color(b.pct)+'">'+fmtPct(b.pct)+'%</span>'
-    + '<span class="l">'+esc(gaugeLabel(b.label))+'</span>'
-    + '<span class="r">'+(b.resetMs?fmtLeft(b.resetMs):'')+'</span></div>';
-  // Secondary values color only once spent (>=90%), so the big figure stays the one accent.
-  const rest = gauges.filter(g=>g!==b).map(g=>esc(restLabel(g.label))+' <b style="color:'+(g.pct!=null&&g.pct>=90?C_BAD:'inherit')+'">'+fmtPct(g.pct)+'%</b>');
-  if(rest.length) h += '<div class="rest">'+rest.join(' · ')+'</div>';
-  return h;
+// One window = label · bar · used% · reset countdown.
+function gaugeRow(g){
+  const p = g.pct, spent = p!=null && p>=90;
+  return '<div class="bar"><span class="l" title="'+esc(g.label)+'">'+esc(gaugeLabel(g.label))+'</span>'
+    + '<span class="t"><i'+(spent?' class="bad"':'')+' style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%"></i></span>'
+    + '<span class="p num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
+    + '<span class="r num">'+(g.resetMs?fmtLeft(g.resetMs):'')+'</span></div>';
 }
 // One card per provider/account, stacked. The header is "who · plan"; the fetch
 // age only shows once the data is older than ten minutes, so a healthy card
@@ -1001,7 +993,7 @@ function providerCard(card){
     + '</div>';
   const gauges = card.official ? (card.gauges||[]) : [];
   if(gauges.length){
-    h += gaugeBlock(gauges);
+    h += gauges.map(gaugeRow).join('');
     if(card.provider==='claude' && card.active && gauges.some(g=>g.key==='session'||g.key==='5h')) h += etaLine(last.eta);
   }
   if(card.note) h += '<div class="note">'+esc(card.note)+'</div>';
@@ -1026,7 +1018,7 @@ function render(){
   if(limited.length){
     h += '<div class="foot">Active limit hits</div>';
     for(const l of limited){
-      const reset = l.resetMs ? (' · '+fmtLeft(l.resetMs)) : (l.resetText? (' · resets '+esc(l.resetText)) : '');
+      const reset = l.resetMs ? (' · resets in '+fmtLeft(l.resetMs)) : (l.resetText? (' · resets '+esc(l.resetText)) : '');
       const prov = cards.length > 1 ? (l.provider==='codex' ? 'Codex · ' : 'Claude · ') : '';
       h += '<div class="hit"><span class="hitt">'+prov+esc(l.title)+'</span> <span class="note">'+esc(l.sub)+reset+'</span></div>';
     }

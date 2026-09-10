@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.6.0
+
+### Changed
+
+- The usage view is the main event: the Sessions view now asks for a third of the
+  sidebar (`initialSize` 1 vs 3) and its rows are back to one line (dot · title with
+  model and folder muted inline · tokens · age), so the live list stays short.
+  VS Code remembers a sidebar you already resized, so drag the divider once if
+  the old split sticks.
+- Usage view: bars are back. Each window is one row (label · 4px monochrome bar ·
+  used% · reset countdown); the bar is foreground at half opacity and turns red only
+  from 90%, used% goes amber from 70%. Accounts are separated by a hairline rule
+  instead of colored rules or rings.
+
 ## 2.5.0
 
 ### Changed

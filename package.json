@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -72,12 +72,14 @@
         {
           "id": "claudeSessionMonitor.view",
           "name": "Sessions",
-          "type": "webview"
+          "type": "webview",
+          "initialSize": 1
         },
         {
           "id": "claudeSessionMonitor.limits",
           "name": "Usage limits",
-          "type": "webview"
+          "type": "webview",
+          "initialSize": 3
         }
       ]
     },

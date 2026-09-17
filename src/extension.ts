@@ -56,10 +56,6 @@ import {
   type CodexProviderSnapshot,
 } from "./providers/codex";
 import {
-  collectCopilotQuota,
-  type CopilotProviderSnapshot,
-} from "./providers/copilot";
-import {
   countProviders,
   filterProvider,
   mergeProviderSessions,
@@ -72,7 +68,6 @@ import {
   type AgentProvider,
   type ProviderHealth,
 } from "./providers/types";
-import { registerAgentHub, resolveAgentExecutable } from "./hub/runtime";
 import {
   GROUPS,
   NEEDS_YOU,
@@ -385,11 +380,10 @@ function render(){
     + pill('all','All',last.providerCounts.all)
     + (enabled.has('claude')?pill('claude','Claude',last.providerCounts.claude):'')
     + (enabled.has('codex')?pill('codex','Codex',last.providerCounts.codex):'')
-    + (enabled.has('copilot')?pill('copilot','Copilot',last.providerCounts.copilot):'')
     + (totals.length?'<span class="totals num">'+totals.join(' · ')+'</span>':'')
     + '</div>';
   const health = (last.health||[]).filter(x=>x.state!=='ready' && x.message);
-  if(health.length) h += '<div class="health">'+health.map(x=>'<div><b>'+esc(x.provider==='codex'?'Codex':x.provider==='copilot'?'Copilot':'Claude')+':</b> '+esc(x.message)+'</div>').join('')+'</div>';
+  if(health.length) h += '<div class="health">'+health.map(x=>'<div><b>'+esc(x.provider==='codex'?'Codex':'Claude')+':</b> '+esc(x.message)+'</div>').join('')+'</div>';
   if(!last.groups.length){
     h += '<div class="empty">'+esc(last.emptyMessage || 'No recent agent sessions.')+'</div>';
     root.innerHTML = h;
@@ -454,9 +448,6 @@ interface Gauge {
   label: string;
   pct: number | null;
   resetMs: number | null;
-  usedRequests?: number;
-  entitlementRequests?: number;
-  unitLabel?: string;
 }
 
 interface LimitedHit {
@@ -643,7 +634,6 @@ function buildLimitsPayload(
   usageNote: string | null = null,
   acctCtx: AccountCtx | null = null,
   codexSnapshot: CodexProviderSnapshot | null = null,
-  copilotSnapshot: CopilotProviderSnapshot | null = null,
   enabledProviders: ReadonlyArray<AgentProvider> = ["claude"],
   planLabels: Record<string, string> = {},
 ): LimitsPayload {
@@ -800,34 +790,6 @@ function buildLimitsPayload(
       lifetimeTokens: usage?.lifetimeTokens ?? null,
     });
   }
-  if (enabledProviders.includes("copilot")) {
-    const usage = copilotSnapshot?.usage;
-    providers.push({
-      id: "copilot",
-      provider: "copilot",
-      label: "Copilot",
-      plan: planLabels["copilot"] ?? null,
-      active: false,
-      ts: usage?.ts ?? null,
-      official: !!usage,
-      gauges:
-        usage?.gauges.map((g) => ({
-          key: g.key,
-          label: g.label,
-          pct: g.pct,
-          resetMs: g.resetMs,
-          usedRequests: g.usedRequests,
-          entitlementRequests: g.entitlementRequests,
-          unitLabel: g.unitLabel,
-        })) ?? [],
-      note:
-        usage
-          ? "Copilot SDK account quota. Native Copilot sessions are not listed in Sessions."
-          : copilotSnapshot?.health.message ?? "Copilot account usage is not available yet.",
-      sevenDayTokens: null,
-      lifetimeTokens: null,
-    });
-  }
 
   return {
     type: "update",
@@ -900,12 +862,10 @@ function limitsHtml(): string {
   .bar .l { font-size:11px; color: var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .bar .t { height:4px; border-radius:2px; overflow:hidden; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
   .bar .t i { display:block; height:100%; border-radius:2px; background: var(--vscode-foreground); opacity:.5; }
-  .bar .t.unlimited { background:transparent; }
   .bar .t i.bad { background: var(--vscode-charts-red, #f14c4c); opacity:1; }
   @media (prefers-reduced-motion: no-preference) { .bar .t i { transition: width .4s ease; } }
   .bar .p { text-align:right; font-weight:600; }
   .bar .r { text-align:right; font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
-  .quota-count { margin:-2px 0 4px 102px; font-size:10px; color:var(--vscode-descriptionForeground); }
   .ctitle { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .cplan { color: var(--vscode-descriptionForeground); font-size:11px; white-space:nowrap; }
   .adot { align-self:center; width:6px; height:6px; border-radius:50%; background:var(--vscode-charts-green,#4caf50); flex:none; }
@@ -1014,21 +974,17 @@ function tokenFoot(t, multiAcct){
 // One window = label · bar · used% · reset countdown.
 function gaugeRow(g){
   const p = g.pct, spent = p!=null && p>=90;
-  const units = typeof g.usedRequests === 'number' && typeof g.entitlementRequests === 'number'
-    ? g.usedRequests+' / '+(g.entitlementRequests === -1 ? '∞' : g.entitlementRequests)+' '+(g.unitLabel || 'quota units')
-    : '';
-  return '<div class="gwrap"><div class="bar"><span class="l" title="'+esc(g.label)+'">'+esc(gaugeLabel(g.label))+'</span>'
-    + '<span class="t'+(p==null?' unlimited':'')+'"><i'+(spent?' class="bad"':'')+' style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%"></i></span>'
-    + '<span class="p num" style="color:'+color(p)+'">'+(p==null?'∞':fmtPct(p)+'%')+'</span>'
-    + '<span class="r num">'+(g.resetMs?fmtLeft(g.resetMs):'')+'</span></div>'
-    + (units?'<div class="quota-count num">'+esc(units)+'</div>':'')+'</div>';
+  return '<div class="bar"><span class="l" title="'+esc(g.label)+'">'+esc(gaugeLabel(g.label))+'</span>'
+    + '<span class="t"><i'+(spent?' class="bad"':'')+' style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%"></i></span>'
+    + '<span class="p num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
+    + '<span class="r num">'+(g.resetMs?fmtLeft(g.resetMs):'')+'</span></div>';
 }
 // One card per provider/account, stacked. The header is "who · plan"; the fetch
 // age only shows once the data is older than ten minutes, so a healthy card
 // carries nothing but its gauges.
 function providerCard(card){
   const age = card.ts ? Math.max(0, Math.round(Date.now()/1000 - card.ts)) : null;
-  const name = card.label.replace(/^(Claude|Codex|Copilot) · /,'');
+  const name = card.label.replace(/^(Claude|Codex) · /,'');
   let h='<div class="card"><div class="chead">'
     + '<span class="ctitle" title="'+esc(card.label)+'">'+esc(name)+'</span>'
     + (card.provider==='claude' && card.active ? '<span class="adot" title="active login"></span>' : '')
@@ -1095,7 +1051,6 @@ setInterval(render, 1000); // keep countdowns live
 // ---------------------------------------------------------------------------
 
 export function activate(ctx: vscode.ExtensionContext): void {
-  ctx.subscriptions.push(registerAgentHub(ctx));
   const cfg = () => vscode.workspace.getConfiguration("claudeSessionMonitor");
   const workspaceCwd = () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const trackAllAccounts = () => cfg().get<boolean>("trackAllAccounts", true);
@@ -1110,22 +1065,18 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const planLabelFor = (key: string): string | null => planLabels()[key.toLowerCase()] ?? null;
   const claudeEnabled = () => cfg().get<boolean>("enableClaude", true);
   const codexEnabled = () => cfg().get<boolean>("enableCodex", true);
-  const copilotEnabled = () => cfg().get<boolean>("enableCopilot", true);
   const enabledProviders = (): AgentProvider[] => [
     ...(claudeEnabled() ? (["claude"] as const) : []),
     ...(codexEnabled() ? (["codex"] as const) : []),
-    ...(copilotEnabled() ? (["copilot"] as const) : []),
   ];
   const savedProviderFilter = ctx.globalState.get<string>("providerFilter", "all");
   let providerFilter: AgentProvider | "all" =
-    savedProviderFilter === "claude" || savedProviderFilter === "codex" || savedProviderFilter === "copilot"
-      ? savedProviderFilter
-      : "all";
+    savedProviderFilter === "claude" || savedProviderFilter === "codex" ? savedProviderFilter : "all";
 
   const resourceCache = new Map<number, ResStat>();
   const sessionsView = new SessionsView((action, sessionId) => {
     if (action === "filterProvider") {
-      if (sessionId === "all" || sessionId === "claude" || sessionId === "codex" || sessionId === "copilot") {
+      if (sessionId === "all" || sessionId === "claude" || sessionId === "codex") {
         providerFilter = sessionId;
         void ctx.globalState.update("providerFilter", providerFilter);
         refresh();
@@ -1186,17 +1137,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastCodexRefresh = 0;
   let codexFailureCount = 0;
   let codexRetryAfter = 0;
-  let copilotRefreshInflight = false;
-  let lastCopilotRefresh = 0;
   let disposed = false;
   let codexSnapshot: CodexProviderSnapshot = {
     sessions: [],
     usage: null,
     health: { provider: "codex", state: "loading", message: "Connecting to Codex app-server…" },
-  };
-  let copilotSnapshot: CopilotProviderSnapshot = {
-    usage: null,
-    health: { provider: "copilot", state: "loading", message: "Reading Copilot account quota…" },
   };
 
   // Boot from the shared snapshots so gauges render immediately (with an honest
@@ -1629,30 +1574,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (!disposed) refresh();
   }
 
-  async function pollCopilot(force: boolean): Promise<void> {
-    if (disposed || !copilotEnabled()) return;
-    const now = Date.now() / 1000;
-    const cadence = Math.max(60, cfg().get<number>("copilotPollSeconds", 120));
-    if (!force && now - lastCopilotRefresh < cadence) return;
-    if (copilotRefreshInflight) return;
-    copilotRefreshInflight = true;
-    lastCopilotRefresh = now;
-    try {
-      const configured = vscode.workspace
-        .getConfiguration()
-        .get<string>("agentHub.copilotExecutable", "copilot");
-      const next = await collectCopilotQuota({
-        executable: resolveAgentExecutable("copilot", configured),
-        trustedWorkspace: vscode.workspace.isTrusted,
-        now,
-      });
-      if (!disposed && copilotEnabled()) copilotSnapshot = next;
-    } finally {
-      copilotRefreshInflight = false;
-    }
-    if (!disposed) refresh();
-  }
-
   /** Rebuild the sessions table payload (grouping, per-row stats, badge) and post it. */
   function pushSessions(views: SessionView[], allViews: SessionView[] = views): void {
     // Token hog: the biggest 5h consumer, only when it is a meaningful share.
@@ -1676,20 +1597,18 @@ export function activate(ctx: vscode.ExtensionContext): void {
         cfg().get<number>("cpuHogThreshold", 60),
         countProviders(allViews),
         providerFilter,
-      enabledProviders().map((provider) =>
-          provider === "claude"
-            ? { provider: "claude", state: "ready" as const, updatedAt: Date.now() / 1000 }
-            : provider === "codex"
-              ? codexSnapshot.health
-              : copilotSnapshot.health,
+        enabledProviders().map((provider) =>
+          provider === "codex"
+            ? codexSnapshot.health
+            : { provider: "claude", state: "ready" as const, updatedAt: Date.now() / 1000 },
         ),
         views.length
           ? ""
           : enabledProviders().length === 0
-            ? "All providers are disabled. Enable Claude, Codex, or Copilot in Settings."
+            ? "Both providers are disabled. Enable Claude or Codex in Settings."
             : providerFilter !== "all" || needsYouOnly
               ? "No sessions match the active filters."
-              : "No recent Claude or Codex sessions. Copilot quota is shown in Usage limits.",
+              : "No recent Claude or Codex sessions. Start one and it will appear here.",
       ),
     );
     let badge = 0;
@@ -1711,7 +1630,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
           usageNote,
           c,
           codexEnabled() ? codexSnapshot : null,
-          copilotEnabled() ? copilotSnapshot : null,
           enabledProviders(),
           planLabels(),
         ),
@@ -1736,7 +1654,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
       void ctx.globalState.update("providerFilter", providerFilter);
     }
     if (codexEnabled()) void pollCodex(false);
-    if (copilotEnabled()) void pollCopilot(false);
 
     const maxAgeHours = c.get<number>("recentScanMaxAgeHours", 6);
     if (claudeEnabled() && now - lastRecentScan > 25) {
@@ -2121,10 +2038,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
         return;
       }
       try {
-        if (v.provider !== "copilot") {
-          const dir = v.provider === "codex" ? CODEX_MONITOR_DIR : MONITOR_DIR;
-          fs.unlinkSync(`${dir}/${v.sessionId}.json`);
-        }
+        const dir = v.provider === "codex" ? CODEX_MONITOR_DIR : MONITOR_DIR;
+        fs.unlinkSync(`${dir}/${v.sessionId}.json`);
       } catch {
         /* may not exist */
       }
@@ -2227,7 +2142,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
           ? pollUsage(true).then(() => pollOtherAccounts(true))
           : Promise.resolve(),
         codexEnabled() ? pollCodex(true) : Promise.resolve(),
-        copilotEnabled() ? pollCopilot(true) : Promise.resolve(),
       ]);
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.forgetOtherAccounts", async () => {
@@ -2364,18 +2278,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
       if (
         e.affectsConfiguration("claudeSessionMonitor.enableClaude") ||
         e.affectsConfiguration("claudeSessionMonitor.enableCodex") ||
-        e.affectsConfiguration("claudeSessionMonitor.enableCopilot") ||
         e.affectsConfiguration("claudeSessionMonitor.codexExecutable") ||
-        e.affectsConfiguration("claudeSessionMonitor.codexPollSeconds") ||
-        e.affectsConfiguration("claudeSessionMonitor.copilotPollSeconds") ||
-        e.affectsConfiguration("agentHub.copilotExecutable")
+        e.affectsConfiguration("claudeSessionMonitor.codexPollSeconds")
       ) {
         if (e.affectsConfiguration("claudeSessionMonitor.enableClaude") && !claudeEnabled()) {
           clearAutoResume();
           stopResume();
         }
         lastCodexRefresh = 0;
-        lastCopilotRefresh = 0;
         if (
           e.affectsConfiguration("claudeSessionMonitor.enableCodex") ||
           e.affectsConfiguration("claudeSessionMonitor.codexExecutable")
@@ -2396,7 +2306,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
           };
         }
         void pollCodex(true);
-        void pollCopilot(true);
         refresh();
       }
     }),
@@ -2453,10 +2362,6 @@ function verifyKillTarget(view: SessionView): Promise<boolean> {
             /(?:^|[/\s])codex(?:\s|$)/.test(command) &&
               !/(?:^|\s)app-server(?:\s|$)/.test(command),
           );
-          return;
-        }
-        if (view.provider === "copilot") {
-          resolve(false);
           return;
         }
         resolve(command.includes("anthropic.claude-code") && command.includes("resources"));
@@ -2516,7 +2421,7 @@ function updateStatusBar(
     ? `\nClaude usage: ${usage.gauges.map((g) => `${g.label} ${Math.round(g.pct)}%`).join(" · ")}`
     : "";
   const providers = countProviders(views);
-  item.tooltip = `Agent sessions\nClaude: ${providers.claude} · Codex: ${providers.codex} · Copilot: ${providers.copilot}\nworking: ${counts.working}\nwaiting: ${waiting}\nyour turn: ${done}\nlimited: ${counts.limited}${resLine}${usageLine}\n(click to open the panel)`;
+  item.tooltip = `Agent sessions\nClaude: ${providers.claude} · Codex: ${providers.codex}\nworking: ${counts.working}\nwaiting: ${waiting}\nyour turn: ${done}\nlimited: ${counts.limited}${resLine}${usageLine}\n(click to open the panel)`;
 
   if (counts.limited > 0) {
     item.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
@@ -2858,8 +2763,7 @@ async function promptNoTabMatch(v: SessionView): Promise<void> {
 /** Normalize a command argument to a SessionView (undefined when absent/foreign). */
 function asView(arg?: SessionView): SessionView | undefined {
   if (!arg || typeof arg.sessionId !== "string" || !arg.sessionId.trim()) return undefined;
-  const provider: AgentProvider =
-    arg.provider === "codex" || arg.provider === "copilot" ? arg.provider : "claude";
+  const provider: AgentProvider = arg.provider === "codex" ? "codex" : "claude";
   return {
     ...arg,
     provider,
@@ -2882,22 +2786,13 @@ function resumeInTerminal(arg: SessionView): void {
       .getConfiguration("claudeSessionMonitor")
       .get<string>("codexExecutable", "codex")
       .trim() || "codex";
-  const copilotExecutable = resolveAgentExecutable(
-    "copilot",
-    vscode.workspace.getConfiguration().get<string>("agentHub.copilotExecutable", "copilot"),
-  );
   // Launch the provider directly instead of composing text for the user's
   // configured terminal shell. This is safe for paths/ids containing quoting
   // characters and works consistently across POSIX shells, PowerShell and cmd.
   const term = vscode.window.createTerminal({
     name: `${providerLabel(v.provider)} · ${truncate(v.title, 32)}`,
     cwd: v.cwd,
-    shellPath:
-      v.provider === "codex"
-        ? codexExecutable
-        : v.provider === "copilot"
-          ? copilotExecutable ?? "copilot"
-          : "claude",
+    shellPath: v.provider === "codex" ? codexExecutable : "claude",
     shellArgs:
       v.provider === "codex"
         ? ["resume", v.sessionId]

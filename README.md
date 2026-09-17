@@ -1,9 +1,9 @@
 <div align="center">
 
-# Agent Hub: Claude, Codex & Copilot
+# Agent Session Monitor: Claude + Codex
 
-**Run Claude Code, Codex and GitHub Copilot from one VS Code workbench. Switch
-agents, choose models and permissions, open native settings, and see account limits.**
+**See Claude Code and Codex sessions in one VS Code panel: what is working, what
+needs you, what ended, and which provider each session belongs to.**
 
 [![Marketplace](https://img.shields.io/visual-studio-marketplace/v/softween.claude-code-session-monitor?label=Marketplace&color=3794ff)](https://marketplace.visualstudio.com/items?itemName=softween.claude-code-session-monitor)
 [![Installs](https://img.shields.io/visual-studio-marketplace/i/softween.claude-code-session-monitor?color=3fb950)](https://marketplace.visualstudio.com/items?itemName=softween.claude-code-session-monitor)
@@ -16,66 +16,19 @@ agents, choose models and permissions, open native settings, and see account lim
 
 ## Why
 
-Agent Hub brings the native coding agents and the existing session monitor into
-one activity-bar panel. The **Workbench** selects the agent you work with; the
-**Sessions** filter controls only the list you see. **Usage limits** keeps account
-quota separate from session tokens.
+When Claude Code and Codex are both part of your workflow, their sessions live in
+different products and expose different metadata. It becomes easy to miss an
+approval, forget an idle session, or assume one provider exposes a number that it
+does not.
 
-## Workbench
-
-1. Open **Agent Hub** in the activity bar, or run **Agent Hub: Open Workbench**.
-2. Select **Claude**, **Codex**, or **Copilot**. Use `Cmd+Alt+A` on macOS or
-   `Ctrl+Alt+A` elsewhere to switch agents from the keyboard.
-3. Choose the workspace, model and permissions, then open an agent session.
-4. The native agent runs in a VS Code terminal editor. Switching back reopens its
-   managed terminal; **New session** starts a fresh conversation.
-5. Open native settings, instructions and tool configuration from the workbench.
-   Use **Sign in** or **Resume** for the provider's own account/session flow.
-
-**Native settings** preserves the provider's configured permissions. **Ask** and
-**Full access** are explicit launch presets. Full access passes the provider's
-native permission-bypass flag; select it only for a workspace where that is your
-intention. Changes apply to new sessions; existing terminals keep their current
-model and permissions. Untrusted workspaces cannot launch agents.
-
-The native CLIs retain their own tools, MCP servers, hooks, plugins, skills,
-authentication and slash commands. Their native configuration files remain the
-source of truth; Agent Hub does not translate every setting into a common schema.
-Configuration files open in the normal editor and are never copied into the
-workbench webview. Provider conversations remain separate when you switch.
-
-The three vendor VS Code extensions are **not required for these native agent
-sessions**. Their proprietary chat interfaces, inline completions and editor-only
-features are not reproduced. Existing extensions are not removed or disabled.
-
-## Copilot account usage
-
-Copilot quota comes from the official SDK's `account.getQuota` RPC using the
-installed CLI and its existing authentication. Reading quota does not create a
-model session or send a prompt. The panel distinguishes unlimited entitlements,
-reported usage, missing login, unavailable data and the snapshot's age. Session
-token counts are not treated as remaining account quota.
-Copilot sessions launched through Agent Hub remain native terminal sessions and
-are not listed in the Sessions monitor.
-
-The SDK may return a `resetDate` equal to the request time. Agent Hub does not
-turn that field into a promised reset countdown. Use the native account usage
-page for billing-period details. The CLI's `/usage` describes a session; it is
-different from the account quota shown here.
-
-Integration references: [Copilot usage and billing](https://docs.github.com/en/copilot/how-tos/copilot-sdk/features/usage-and-billing),
-[Copilot configuration](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/configure-copilot-cli),
-[Codex app-server](https://developers.openai.com/codex/app-server),
-[Claude permissions](https://code.claude.com/docs/en/permissions).
+Agent Session Monitor keeps both providers visible while preserving those
+differences instead of flattening them into misleading data.
 
 ## Features
 
-- **One provider-aware session list** — monitor Claude / Codex lifecycle data, group sessions
+- **One provider-aware session list** — filter All / Claude / Codex, group sessions
   by Limited / Waiting / Your turn / Working / Ended, and keep provider-qualified
   session identities distinct.
-- **Copilot native sessions and account quota** — launch and switch Copilot from
-  the workbench and view its account limits. Copilot chat lifecycle/transcripts are
-  not imported into the Sessions monitor; its native CLI owns that history.
 - **Official Codex integration** — launches the configured Codex CLI as
   `codex app-server --stdio` and uses its supported thread and account-usage
   methods. It does not scrape the Codex state database.
@@ -96,14 +49,8 @@ Integration references: [Copilot usage and billing](https://docs.github.com/en/c
 
 ### From the Marketplace
 
-The Marketplace identifier remains unchanged. Until version 3.0.0 is published
-there, install the packaged release locally:
-
-```bash
-code --install-extension claude-code-session-monitor-3.0.0.vsix --force
-```
-
-The existing Marketplace listing is available using:
+Search **"Agent Session Monitor: Claude + Codex"** in the Extensions view, or
+upgrade/install it with the existing Marketplace identifier:
 
 ```bash
 code --install-extension softween.claude-code-session-monitor
@@ -118,38 +65,8 @@ installations upgrade in place.
 - **Codex:** install and sign in to the Codex CLI, then confirm `codex --version`
   works in the environment VS Code inherits. If it does not, set
   `claudeSessionMonitor.codexExecutable` to the absolute executable path.
-- **Copilot:** install the GitHub Copilot CLI and sign in with `copilot login`.
-  The workbench also checks common user installation paths. Set
-  `agentHub.copilotExecutable` if you use a custom installation.
 
-Requires VS Code 1.103 or newer (Node.js 22 extension host). The Copilot quota adapter is built against
-`@github/copilot-sdk` 1.0.14 and verified with Copilot CLI 1.0.85.
-
-This release is verified on macOS with native executables. Linux native
-executables use the same launch path but have not been live-tested. Windows npm
-`.cmd` shims are not supported by the direct executable launcher in this release.
-
-### Release validation
-
-After `npm run build`, `npm run typecheck`, and `npm test`, run `npm run test:host`
-on the macOS release machine. It opens a separate real VS Code development window,
-activates the built extension, and verifies Codex/Copilot process start, terminal
-reuse and new sessions. It sends no model prompts and closes only its own test
-terminals. It uses a reusable isolated VS Code profile at
-`$TMPDIR/agent-hub-vscode-smoke` (override with `AGENT_HUB_VSCODE_USER_DATA`). If
-the source checkout is untrusted, the test opens Workspace Trust management and
-waits up to 90 seconds for you to approve it; it never bypasses trust. Override
-the editor executable with `AGENT_HUB_CODE_CLI` if needed. The runner stops after
-180 seconds and writes a JSON report to the system temporary directory (or
-`AGENT_HUB_SMOKE_REPORT`).
-
-Finally package with `npm run package`, install the VSIX, and check the Workbench
-and live quota cards in a new VS Code window. CI runs the portable unit/type/build
-checks; the real-host check intentionally uses the release machine's existing
-CLI installations and authenticated accounts. Test scripts are excluded from the
-installed VSIX.
-
-Each provider can be disabled independently in Settings.
+Either provider can be disabled independently in Settings.
 
 ### Install the provider hooks
 
@@ -264,23 +181,14 @@ legacy namespace: `claudeSessionMonitor.toggleProvider` and
 
 ## Configuration
 
-### Agent Hub settings
-
-| Setting | Default | Description |
-|---|---|---|
-| `agentHub.claudeExecutable` | `"claude"` | Machine-level executable used for Claude Code native sessions |
-| `agentHub.copilotExecutable` | `"copilot"` | Machine-level executable used for Copilot native sessions and quota reads |
-
-### Monitor settings
+All settings are under `claudeSessionMonitor.*`:
 
 | Setting | Default | Description |
 |---|---|---|
 | `enableClaude` | `true` | Enable the Claude provider |
 | `enableCodex` | `true` | Enable the Codex provider |
-| `enableCopilot` | `true` | Enable Copilot account quota collection |
 | `codexExecutable` | `"codex"` | Machine-level executable used for the local Codex app-server |
 | `codexPollSeconds` | `5` | Codex app-server refresh cadence (minimum 3 seconds) |
-| `copilotPollSeconds` | `120` | Copilot account-quota refresh cadence (minimum 60 seconds) |
 | `notifyOnWaiting` | `true` | Notify when a session starts waiting for you |
 | `notifyOnLimited` | `true` | Notify when a session hits a limit |
 | `notifyOnDone` | `false` | Notify when a session finishes its turn |
@@ -308,7 +216,6 @@ legacy namespace: `claudeSessionMonitor.toggleProvider` and
 | Per-session CPU / RAM | ✅ | ✅ | ⚠️ |
 | Claude account usage gauges | ✅ | ➖ | ➖ |
 | Native notifications + Claude bulk-input automation | ✅ | ➖ | ➖ |
-| Agent Hub native CLI sessions | ✅ | Untested | Not supported |
 
 Cross-platform support for the macOS-only pieces is welcome via PRs.
 

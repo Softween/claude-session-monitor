@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -12,11 +12,6 @@ import {
   type CodexRefreshOptions,
   type CodexThread,
 } from "../src/providers/codex";
-import {
-  collectCopilotQuota,
-  parseCopilotQuota,
-  type CopilotClientLike,
-} from "../src/providers/copilot";
 import {
   countProviders,
   filterProvider,
@@ -621,7 +616,7 @@ describe("provider registry", () => {
       `claude:${rawId}`,
       `codex:${rawId}`,
     ]);
-    expect(countProviders(merged)).toEqual({ all: 2, claude: 1, codex: 1, copilot: 0 });
+    expect(countProviders(merged)).toEqual({ all: 2, claude: 1, codex: 1 });
     expect(filterProvider(merged, "claude").map((view) => view.key)).toEqual([
       `claude:${rawId}`,
     ]);
@@ -644,217 +639,5 @@ describe("provider registry", () => {
     )[0];
 
     expect(mergeProviderSessions([older], [newer])).toEqual([newer]);
-  });
-
-  it("counts Copilot explicitly rather than treating it as Codex", () => {
-    const [codex] = mapCodexThreads(
-      [thread("copilot-quota", { type: "notLoaded" })],
-      new Map(),
-      options(),
-    );
-    const copilot = { ...codex, provider: "copilot" as const, key: "copilot:copilot-quota" };
-
-    expect(countProviders([copilot])).toEqual({ all: 1, claude: 0, codex: 0, copilot: 1 });
-    expect(filterProvider([copilot], "copilot")).toEqual([copilot]);
-  });
-});
-
-describe("Copilot quota provider", () => {
-  const quotaResponse = {
-    quotaSnapshots: {
-      premium_interactions: {
-        entitlementRequests: 300,
-        usedRequests: 42,
-        remainingPercentage: 86,
-        resetDate: "2026-08-01T00:00:00.000Z",
-      },
-      chat: {
-        entitlementRequests: -1,
-        usedRequests: 12,
-        remainingPercentage: 100,
-      },
-      completions: {
-        entitlementRequests: 2_000,
-        usedRequests: 10,
-        remainingPercentage: 99.5,
-        resetDate: "not-a-date",
-      },
-    },
-  };
-
-  it("parses known quota types, quota-unit counts, and unlimited access without trusting reset dates", () => {
-    const usage = parseCopilotQuota(quotaResponse, NOW);
-
-    expect(usage?.provider).toBe("copilot");
-    expect(usage?.gauges).toEqual([
-      {
-        key: "premium_interactions",
-        label: "Premium interactions",
-        pct: 14,
-        resetMs: null,
-        usedRequests: 42,
-        entitlementRequests: 300,
-        unitLabel: "quota units",
-      },
-      {
-        key: "chat",
-        label: "Chat (unlimited)",
-        pct: null,
-        resetMs: null,
-        usedRequests: 12,
-        entitlementRequests: -1,
-        unitLabel: "quota units",
-      },
-      {
-        key: "completions",
-        label: "Completions",
-        pct: 0.5,
-        resetMs: null,
-        usedRequests: 10,
-        entitlementRequests: 2_000,
-        unitLabel: "quota units",
-      },
-    ]);
-  });
-
-  it("keeps malformed or empty quota replies unknown", () => {
-    expect(parseCopilotQuota({}, NOW)).toBeNull();
-    expect(parseCopilotQuota({ quotaSnapshots: { chat: { usedRequests: "x" } } }, NOW)).toBeNull();
-    expect(parseCopilotQuota({ quotaSnapshots: { chat: { hasQuota: false, entitlementRequests: 0, usedRequests: 0, remainingPercentage: 100 } } }, NOW)).toBeNull();
-  });
-
-  it("keeps valid future quota keys with a safe human label", () => {
-    const usage = parseCopilotQuota({
-      quotaSnapshots: {
-        enterprise_priority_pool: {
-          entitlementRequests: 50,
-          usedRequests: 5,
-          remainingPercentage: 90,
-        },
-      },
-    }, NOW);
-
-    expect(usage?.gauges).toEqual([
-      expect.objectContaining({ key: "enterprise_priority_pool", label: "Enterprise Priority Pool", pct: 10 }),
-    ]);
-  });
-
-  it("uses a short-lived client, reads quota only, and cleans it up", async () => {
-    const start = vi.fn().mockResolvedValue(undefined);
-    const getQuota = vi.fn().mockResolvedValue(quotaResponse);
-    const stop = vi.fn().mockResolvedValue([]);
-    const client: CopilotClientLike = {
-      start,
-      stop,
-      rpc: { account: { getQuota } },
-    };
-    const createClient = vi.fn().mockResolvedValue(client);
-
-    const snapshot = await collectCopilotQuota({
-      executable: "/opt/copilot",
-      createClient,
-      now: NOW,
-    });
-
-    expect(snapshot.health).toMatchObject({ provider: "copilot", state: "ready" });
-    expect(snapshot.usage?.gauges).toHaveLength(3);
-    expect(createClient).toHaveBeenCalledWith("/opt/copilot");
-    expect(start).toHaveBeenCalledOnce();
-    expect(getQuota).toHaveBeenCalledWith({});
-    expect(stop).toHaveBeenCalledOnce();
-  });
-
-  it("marks quota transport failures degraded without exposing raw errors", async () => {
-    const stop = vi.fn().mockResolvedValue([]);
-    const client: CopilotClientLike = {
-      start: vi.fn().mockResolvedValue(undefined),
-      stop,
-      rpc: { account: { getQuota: vi.fn().mockRejectedValue(new Error("token=secret")) } },
-    };
-
-    const snapshot = await collectCopilotQuota({
-      executable: "/opt/copilot",
-      createClient: async () => client,
-      now: NOW,
-    });
-
-    expect(snapshot).toMatchObject({
-      usage: null,
-      health: {
-        provider: "copilot",
-        state: "degraded",
-        message: "Copilot quota unavailable; retry or check CLI compatibility.",
-      },
-    });
-    expect(JSON.stringify(snapshot)).not.toContain("secret");
-    expect(stop).toHaveBeenCalledOnce();
-  });
-
-  it("marks only a verified unsigned-in client as setup-required", async () => {
-    const client: CopilotClientLike = {
-      start: vi.fn().mockResolvedValue(undefined),
-      stop: vi.fn().mockResolvedValue([]),
-      getAuthStatus: vi.fn().mockResolvedValue({ isAuthenticated: false }),
-      rpc: { account: { getQuota: vi.fn().mockRejectedValue(new Error("unauthenticated")) } },
-    };
-
-    const snapshot = await collectCopilotQuota({
-      executable: "/opt/copilot",
-      createClient: async () => client,
-      now: NOW,
-    });
-
-    expect(snapshot.health).toMatchObject({
-      state: "setup-required",
-      message: "Copilot is not signed in. Sign in with the Copilot CLI to enable quota.",
-    });
-  });
-
-  it("cleans up a client whose start settles after a timeout without sending a late quota RPC", async () => {
-    let resolveStart: (() => void) | undefined;
-    const start = vi.fn(
-      () => new Promise<void>((resolve) => {
-        resolveStart = resolve;
-      }),
-    );
-    const getQuota = vi.fn();
-    const stop = vi.fn().mockResolvedValue([]);
-    const client: CopilotClientLike = {
-      start,
-      stop,
-      rpc: { account: { getQuota } },
-    };
-
-    const snapshot = await collectCopilotQuota({
-      executable: "/opt/copilot",
-      createClient: async () => client,
-      now: NOW,
-      timeoutMs: 5,
-    });
-    resolveStart?.();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(snapshot.usage).toBeNull();
-    expect(getQuota).not.toHaveBeenCalled();
-    expect(stop).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not launch Copilot in an untrusted workspace or without a resolved CLI", async () => {
-    const createClient = vi.fn();
-    const untrusted = await collectCopilotQuota({
-      executable: "/opt/copilot",
-      trustedWorkspace: false,
-      createClient,
-      now: NOW,
-    });
-    const missing = await collectCopilotQuota({
-      executable: undefined,
-      createClient,
-      now: NOW,
-    });
-
-    expect(untrusted.health.message).toContain("trusted workspace");
-    expect(missing.health.message).toContain("CLI was not found");
-    expect(createClient).not.toHaveBeenCalled();
   });
 });

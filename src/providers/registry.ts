@@ -12,6 +12,7 @@ export interface ProviderCounts {
   all: number;
   claude: number;
   codex: number;
+  copilot: number;
 }
 
 export function mergeProviderSessions(...lists: ReadonlyArray<ReadonlyArray<SessionView>>): SessionView[] {
@@ -34,11 +35,13 @@ export function mergeProviderSessions(...lists: ReadonlyArray<ReadonlyArray<Sess
 export function countProviders(views: ReadonlyArray<SessionView>): ProviderCounts {
   let claude = 0;
   let codex = 0;
+  let copilot = 0;
   for (const view of views) {
     if (view.provider === "claude") claude++;
-    else codex++;
+    else if (view.provider === "codex") codex++;
+    else if (view.provider === "copilot") copilot++;
   }
-  return { all: claude + codex, claude, codex };
+  return { all: claude + codex + copilot, claude, codex, copilot };
 }
 
 export function filterProvider(

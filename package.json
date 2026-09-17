@@ -1,8 +1,8 @@
 {
   "name": "claude-code-session-monitor",
-  "displayName": "Agent Session Monitor: Claude + Codex",
-  "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.6.0",
+  "displayName": "Agent Hub: Claude, Codex & Copilot",
+  "description": "One workbench for Claude Code, Codex and GitHub Copilot: switch native agents, manage models and permissions, open settings and track account usage limits.",
+  "version": "3.0.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -15,7 +15,7 @@
     "url": "https://github.com/Softween/claude-session-monitor/issues"
   },
   "engines": {
-    "vscode": "^1.84.0"
+    "vscode": "^1.103.0"
   },
   "capabilities": {
     "untrustedWorkspaces": {
@@ -38,6 +38,7 @@
     "claude code",
     "anthropic",
     "codex",
+    "copilot",
     "openai",
     "agent",
     "sessions",
@@ -62,13 +63,19 @@
       "activitybar": [
         {
           "id": "claudeSessionMonitor",
-          "title": "Agent Sessions",
+          "title": "Agent Hub",
           "icon": "media/icon.svg"
         }
       ]
     },
     "views": {
       "claudeSessionMonitor": [
+        {
+          "id": "claudeSessionMonitor.hub",
+          "name": "Workbench",
+          "type": "webview",
+          "initialSize": 3
+        },
         {
           "id": "claudeSessionMonitor.view",
           "name": "Sessions",
@@ -84,6 +91,14 @@
       ]
     },
     "commands": [
+      { "command": "agentHub.open", "title": "Agent Hub: Open Workbench", "icon": "$(home)" },
+      { "command": "agentHub.selectProvider", "title": "Agent Hub: Switch Agent", "icon": "$(arrow-swap)" },
+      { "command": "agentHub.start", "title": "Agent Hub: Open Agent Session", "icon": "$(play)" },
+      { "command": "agentHub.newSession", "title": "Agent Hub: New Agent Session", "icon": "$(add)" },
+      { "command": "agentHub.configure", "title": "Agent Hub: Configure Model and Permissions", "icon": "$(settings-gear)" },
+      { "command": "agentHub.nativeSettings", "title": "Agent Hub: Native Settings, Tools and Instructions", "icon": "$(gear)" },
+      { "command": "agentHub.login", "title": "Agent Hub: Sign In to Selected Agent", "icon": "$(account)" },
+      { "command": "agentHub.resume", "title": "Agent Hub: Resume Agent Session", "icon": "$(history)" },
       {
         "command": "claudeSessionMonitor.refresh",
         "title": "Agent Sessions: Refresh",
@@ -148,15 +163,15 @@
       },
       {
         "command": "claudeSessionMonitor.setModelAll",
-        "title": "Agent Sessions: Set Model for All Claude Sessions\u2026",
+        "title": "Agent Sessions: Set Model for All Claude Sessions…",
         "icon": "$(chip)",
-        "shortTitle": "Set Model (All)\u2026"
+        "shortTitle": "Set Model (All)…"
       },
       {
         "command": "claudeSessionMonitor.setEffortAll",
-        "title": "Agent Sessions: Set Effort for All Claude Sessions\u2026",
+        "title": "Agent Sessions: Set Effort for All Claude Sessions…",
         "icon": "$(dashboard)",
-        "shortTitle": "Set Effort (All)\u2026"
+        "shortTitle": "Set Effort (All)…"
       },
       {
         "command": "claudeSessionMonitor.dumpTabs",
@@ -195,6 +210,16 @@
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "agentHub.selectProvider",
+          "when": "view == claudeSessionMonitor.hub",
+          "group": "navigation@0"
+        },
+        {
+          "command": "agentHub.configure",
+          "when": "view == claudeSessionMonitor.hub",
+          "group": "navigation@1"
+        },
         {
           "command": "claudeSessionMonitor.toggleProvider",
           "when": "view == claudeSessionMonitor.view",
@@ -258,8 +283,31 @@
       ]
     },
     "configuration": {
-      "title": "Agent Session Monitor",
+      "title": "Agent Hub",
       "properties": {
+        "agentHub.claudeExecutable": {
+          "type": "string",
+          "default": "claude",
+          "scope": "machine",
+          "description": "Claude Code executable. Agent Hub also checks common user installation folders. An absolute path selects a specific installation."
+        },
+        "agentHub.copilotExecutable": {
+          "type": "string",
+          "default": "copilot",
+          "scope": "machine",
+          "description": "GitHub Copilot CLI executable used for native sessions and read-only account quota requests."
+        },
+        "claudeSessionMonitor.enableCopilot": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show Copilot account usage through its official SDK. Requires the Copilot CLI and an existing login. No model request is sent."
+        },
+        "claudeSessionMonitor.copilotPollSeconds": {
+          "type": "number",
+          "default": 120,
+          "minimum": 60,
+          "description": "Minimum interval between Copilot account quota snapshots, in seconds."
+        },
         "claudeSessionMonitor.enableClaude": {
           "type": "boolean",
           "default": true,
@@ -311,7 +359,9 @@
         "claudeSessionMonitor.planLabels": {
           "type": "object",
           "default": {},
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": {
+            "type": "string"
+          },
           "markdownDescription": "Plan label shown on each usage card, keyed by Claude account email, or `claude` / `codex` for the provider card. Example: `{ \"me@example.com\": \"$200 Max\", \"codex\": \"$100 Pro Lite\" }`. When a key is missing the label is derived from the login's rate-limit tier (Claude keychain `rateLimitTier`, Codex `planType`) and left blank if unknown."
         },
         "claudeSessionMonitor.usageWarnPercent": {
@@ -400,6 +450,11 @@
     },
     "keybindings": [
       {
+        "command": "agentHub.selectProvider",
+        "key": "ctrl+alt+a",
+        "mac": "cmd+alt+a"
+      },
+      {
         "command": "claudeSessionMonitor.focusNextNeedsYou",
         "key": "ctrl+alt+n",
         "mac": "cmd+alt+n"
@@ -411,6 +466,7 @@
     "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "verify": "esbuild src/verify.ts --bundle --platform=node --format=cjs --outfile=dist/verify.cjs && node dist/verify.cjs",
     "test": "vitest run",
+    "test:host": "node scripts/run-vscode-smoke.cjs",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -425,5 +481,8 @@
     "esbuild": "^0.28.1",
     "typescript": "^5.4.0",
     "vitest": "^4.1.10"
+  },
+  "dependencies": {
+    "@github/copilot-sdk": "1.0.14"
   }
 }

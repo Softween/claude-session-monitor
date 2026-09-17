@@ -1,4 +1,4 @@
-export type AgentProvider = "claude" | "codex";
+export type AgentProvider = "claude" | "codex" | "copilot";
 
 export type SessionBucket = "limited" | "attention" | "working" | "ended" | "unknown";
 
@@ -61,8 +61,14 @@ export interface SessionView {
 export interface ProviderGauge {
   key: string;
   label: string;
-  pct: number;
+  pct: number | null;
   resetMs: number | null;
+  /** Provider-native quota units when the source exposes them. */
+  usedRequests?: number;
+  /** -1 means the provider reports an unlimited entitlement. */
+  entitlementRequests?: number;
+  /** Human label for the provider-native metering unit. */
+  unitLabel?: string;
 }
 
 export interface ProviderUsageSnapshot {
@@ -90,7 +96,9 @@ export function sessionKey(provider: AgentProvider, sessionId: string): string {
 }
 
 export function providerLabel(provider: AgentProvider): string {
-  return provider === "claude" ? "Claude" : "Codex";
+  if (provider === "claude") return "Claude";
+  if (provider === "codex") return "Codex";
+  return "Copilot";
 }
 
 export function defaultCapabilities(

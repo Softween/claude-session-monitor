@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 3.0.0
+
+### Added
+
+- Agent Hub workbench for native Claude Code, Codex and GitHub Copilot sessions,
+  with provider switching, model and permission presets, workspace selection,
+  sign-in, session resume and native configuration shortcuts.
+- Copilot account quota through the official SDK, with isolated error states,
+  honest unlimited/unavailable labels and snapshot timestamps.
+- Workspace trust checks and direct executable/argument launches for the new
+  workbench. Existing sessions retain their launch settings when defaults change.
+
+### Changed
+
+- Display name and activity-bar container become Agent Hub. The Marketplace
+  identifier remains `softween.claude-code-session-monitor` for in-place upgrades.
+- Minimum VS Code version is 1.103 for the Copilot SDK's Node runtime requirement.
+- Workbench runtime selection is separate from the existing session-list filter.
+
 ## 2.6.0
 
 ### Changed

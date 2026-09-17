@@ -85,9 +85,20 @@ vi.mock("vscode", () => {
     TreeItem,
     ThemeIcon,
     ThemeColor,
+    Disposable: {
+      from: (...disposables: Array<{ dispose?: () => void }>) => ({
+        dispose: () => {
+          for (const disposable of disposables) disposable.dispose?.();
+        },
+      }),
+    },
     TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
     StatusBarAlignment: { Left: 1, Right: 2 },
-    Uri: { file: (p: string) => ({ fsPath: p, toString: () => p }) },
+    ViewColumn: { Active: 1 },
+    Uri: {
+      file: (p: string) => ({ fsPath: p, toString: () => p }),
+      parse: (value: string) => ({ toString: () => value }),
+    },
     window: {
       createTreeView: (id: string) => {
         const tv: any = { id, badge: undefined, message: undefined, dispose() {} };
@@ -114,6 +125,7 @@ vi.mock("vscode", () => {
         rec.terminals.push(terminal);
         return terminal;
       },
+      onDidCloseTerminal: () => ({ dispose() {} }),
       showInformationMessage: () => Promise.resolve(undefined),
       showWarningMessage: (...args: any[]) => {
         rec.warningMessages.push(args);
@@ -125,6 +137,7 @@ vi.mock("vscode", () => {
       tabGroups: { all: [], activeTabGroup: { activeTab: undefined } },
     },
     workspace: {
+      isTrusted: true,
       getConfiguration: () => ({
         get: (key: string, def: any) => (rec.config.has(key) ? rec.config.get(key) : def),
       }),
@@ -150,6 +163,10 @@ vi.mock("vscode", () => {
         return Promise.resolve(undefined);
       },
     },
+    env: {
+      clipboard: { writeText: () => Promise.resolve() },
+      openExternal: () => Promise.resolve(true),
+    },
   };
 });
 
@@ -162,6 +179,7 @@ beforeEach(() => {
   fs.mkdirSync(`${HOME}/.claude/projects`, { recursive: true });
   rec.config.clear();
   rec.config.set("enableCodex", false);
+  rec.config.set("enableCopilot", false);
 });
 afterAll(() => {
   try {

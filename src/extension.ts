@@ -19,6 +19,22 @@ import * as os from "os";
 import * as path from "path";
 import { execFile } from "child_process";
 import {
+  KEYCHAIN_SERVICE,
+  REFRESH_MARGIN_MS,
+  needsRefresh,
+  parseJsonObject,
+  performSwitch,
+  pickBestAccount,
+  refreshOAuth,
+  remainingSummary,
+  shouldAutoRotate,
+  vaultIdentKey,
+  vaultOauthKey,
+  type FetchLike,
+  type OAuthBlob,
+  type SwitchDeps,
+} from "./rotation";
+import {
   collectSessions,
   countBuckets,
   findRecentTranscripts,
@@ -477,6 +493,8 @@ interface UsageProviderCard {
   note: string | null;
   sevenDayTokens: number | null;
   lifetimeTokens: number | null;
+  accountId?: string; // Claude account card: clicking its name switches Claude Code to it
+  best?: boolean; // Claude account card: the account with the most headroom
 }
 
 interface LimitsPayload {
@@ -512,6 +530,7 @@ interface ClaudeCredentials {
   token: string;
   expiresAt?: number; // epoch ms the access token expires (from the keychain payload)
   tier?: string; // rateLimitTier (or subscriptionType) — used only for the plan label
+  oauth?: OAuthBlob; // the whole claudeAiOauth object (vaulted for account rotation)
 }
 
 // The keychain read spawns a `security` subprocess; with a 10s usage poll that
@@ -552,7 +571,7 @@ function readClaudeCredentials(): Promise<ClaudeCredentials | undefined> {
               : typeof oauth.subscriptionType === "string" && oauth.subscriptionType
                 ? oauth.subscriptionType
                 : undefined;
-          resolve({ token, expiresAt: typeof oauth.expiresAt === "number" ? oauth.expiresAt : undefined, tier });
+          resolve({ token, expiresAt: typeof oauth.expiresAt === "number" ? oauth.expiresAt : undefined, tier, oauth });
         } catch {
           resolve(undefined);
         }
@@ -567,6 +586,7 @@ function readClaudeCredentials(): Promise<ClaudeCredentials | undefined> {
 interface ActiveIdentity {
   id: string;
   email: string;
+  block?: Record<string, unknown>; // the whole oauthAccount object (vaulted for account rotation)
 }
 
 let identityCache: { token: string; identity: ActiveIdentity | undefined } | undefined;
@@ -578,7 +598,7 @@ async function readActiveIdentity(token: string): Promise<ActiveIdentity | undef
     const raw = await fs.promises.readFile(`${os.homedir()}/.claude.json`, "utf8");
     const oa = JSON.parse(raw)?.oauthAccount;
     if (oa && typeof oa.accountUuid === "string" && oa.accountUuid && typeof oa.emailAddress === "string") {
-      identity = { id: oa.accountUuid, email: oa.emailAddress };
+      identity = { id: oa.accountUuid, email: oa.emailAddress, block: oa };
     }
   } catch {
     /* missing or unparsable — identity stays unknown */
@@ -726,6 +746,7 @@ function buildLimitsPayload(
       // Every known login gets its own card so the panel shows all accounts at
       // once. The selected (active) account carries the live gauges; the others
       // show their last background fetch.
+      const bestId = pickBestAccount(acctCtx.accounts)?.id;
       for (const a of acctCtx.accounts) {
         const isSel = a.id === acctCtx.selectedId;
         const aGauges = isSel ? gauges : a.gauges;
@@ -747,6 +768,8 @@ function buildLimitsPayload(
           note,
           sevenDayTokens: null,
           lifetimeTokens: null,
+          accountId: a.id,
+          best: a.id === bestId,
         });
       }
     } else {
@@ -817,6 +840,8 @@ class LimitsView implements vscode.WebviewViewProvider {
 
   constructor(
     private readonly onRefresh: () => void,
+    private readonly onSwitch: (accountId: string) => void,
+    private readonly onRotate: () => void,
   ) {}
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -825,6 +850,8 @@ class LimitsView implements vscode.WebviewViewProvider {
     view.webview.html = limitsHtml();
     view.webview.onDidReceiveMessage((m) => {
       if (m && m.type === "refresh") this.onRefresh();
+      else if (m && m.type === "switchAccount" && typeof m.id === "string") this.onSwitch(m.id);
+      else if (m && m.type === "rotateBest") this.onRotate();
     });
     if (this.pending) view.webview.postMessage(this.pending);
   }
@@ -868,6 +895,13 @@ function limitsHtml(): string {
   .bar .r { text-align:right; font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .ctitle { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .cplan { color: var(--vscode-descriptionForeground); font-size:11px; white-space:nowrap; }
+  .ctitle.sw { cursor:pointer; }
+  .ctitle.sw:hover { text-decoration:underline; }
+  .best { color: var(--vscode-charts-yellow, #e6b800); font-size:11px; }
+  .rot { display:flex; justify-content:flex-end; margin:0 0 2px; }
+  .rot + .card { padding-top:2px; border-top:0; }
+  .rotbtn { border:0; background:transparent; color: var(--vscode-textLink-foreground); font:inherit; font-size:11px; cursor:pointer; padding:0; }
+  .rotbtn:hover { text-decoration:underline; }
   .adot { align-self:center; width:6px; height:6px; border-radius:50%; background:var(--vscode-charts-green,#4caf50); flex:none; }
   .cage { margin-left:auto; font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .eta { margin-top:2px; font-size:11px; color: var(--vscode-charts-red, #f14c4c); }
@@ -985,8 +1019,12 @@ function gaugeRow(g){
 function providerCard(card){
   const age = card.ts ? Math.max(0, Math.round(Date.now()/1000 - card.ts)) : null;
   const name = card.label.replace(/^(Claude|Codex) · /,'');
+  const canSwitch = card.provider==='claude' && !!card.accountId && !card.active;
   let h='<div class="card"><div class="chead">'
-    + '<span class="ctitle" title="'+esc(card.label)+'">'+esc(name)+'</span>'
+    + (canSwitch
+        ? '<span class="ctitle sw" role="button" tabindex="0" data-switch="'+esc(card.accountId)+'" title="Switch Claude Code to this account">'+esc(name)+'</span>'
+        : '<span class="ctitle" title="'+esc(card.label)+'">'+esc(name)+'</span>')
+    + (card.best ? '<span class="best" title="most headroom">★</span>' : '')
     + (card.provider==='claude' && card.active ? '<span class="adot" title="active login"></span>' : '')
     + (card.plan ? '<span class="cplan">'+esc(card.plan)+'</span>' : '')
     + (age!=null && age>600 ? '<span class="cage num" title="last official usage fetch">'+fmtAge(age)+' ago</span>' : '')
@@ -1008,6 +1046,7 @@ function render(){
     id:'claude', provider:'claude', label:'Claude', active:true, ts:last.ts, official:last.official, gauges:last.gauges||[],
     note:last.usageNote||last.accountNote||null, sevenDayTokens:null, lifetimeTokens:null
   }];
+  if(last.accounts && last.accounts.length > 1) h += '<div class="rot"><button type="button" class="rotbtn" data-rotate="1" title="Switch Claude Code to the account with the most headroom">Rotate ▸</button></div>';
   for(const c of cards) h += providerCard(c);
   if(cards.some(c=>c.provider==='claude')){
     const multiAcct = !!(last.accounts && last.accounts.length > 1);
@@ -1028,6 +1067,8 @@ function render(){
 document.getElementById('root').addEventListener('click', (ev) => {
   let el = ev.target;
   while(el && el !== ev.currentTarget){
+    if(el.dataset && el.dataset.switch){ vscodeApi.postMessage({ type:'switchAccount', id: el.dataset.switch }); return; }
+    if(el.dataset && el.dataset.rotate){ vscodeApi.postMessage({ type:'rotateBest' }); return; }
     if(el.classList && el.classList.contains('sech') && el.dataset.sec){
       collapsed[el.dataset.sec] = !collapsed[el.dataset.sec];
       saveState();
@@ -1103,8 +1144,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let othersInflight = false;
   let lastOthersCheck = 0;
 
-  const limitsView = new LimitsView(() =>
-    vscode.commands.executeCommand("claudeSessionMonitor.refreshUsage"),
+  const limitsView = new LimitsView(
+    () => vscode.commands.executeCommand("claudeSessionMonitor.refreshUsage"),
+    (id) => void switchToAccount(id),
+    () => void vscode.commands.executeCommand("claudeSessionMonitor.switchToBestAccount"),
   );
   ctx.subscriptions.push(
     vscode.window.registerWebviewViewProvider("claudeSessionMonitor.limits", limitsView),
@@ -1355,6 +1398,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
         writeOfficialSnapshot({ gauges: r.usage.gauges, ts: r.usage.ts, attemptTs: nowSec }, officialUsageFileFor(ident.id));
         if (trackAllAccounts()) {
           void ctx.secrets.store(`csm.token.${ident.id}`, creds.token).then(undefined, () => {});
+          if (creds.oauth && ident.block) {
+            // Full snapshot so this login can be refreshed in the background and switched back to.
+            void ctx.secrets.store(vaultOauthKey(ident.id), JSON.stringify(creds.oauth)).then(undefined, () => {});
+            void ctx.secrets.store(vaultIdentKey(ident.id), JSON.stringify(ident.block)).then(undefined, () => {});
+          }
         }
         const g5 = r.usage.gauges.find((g) => g.key === "session");
         const g7 = r.usage.gauges.find((g) => g.key === "weekly");
@@ -1368,6 +1416,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           ts: nowSec,
         });
         checkUsageWarn(r.usage);
+        maybeAutoRotate();
       } else if (r.status === 429) {
         const b = nextUsageBackoffSec(cur.backoffSec, r.retryAfterSec);
         writeOfficialSnapshot({ ...cur, attemptTs: nowSec, backoffUntil: nowSec + b, backoffSec: b });
@@ -1404,7 +1453,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     let changed = false;
     try {
       const cadence = Math.max(120, cfg().get<number>("usagePollSeconds", 30) * 2);
-      for (const a of others) {
+      for (const a0 of others) {
+        let a = a0;
         const file = officialUsageFileFor(a.id);
         const snap = readOfficialSnapshot(file);
         const nowSec = Date.now() / 1000;
@@ -1412,6 +1462,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
         if (snap?.gauges.length && snap.ts && (!known?.usage || snap.ts > known.usage.ts)) {
           usageByAccount.set(a.id, { usage: { gauges: snap.gauges, ts: snap.ts }, stale: !!snap.tokenStale });
           changed = true; // another window fetched it
+        }
+        const vault = await readVaultOauth(a.id);
+        if (vault && needsRefresh(vault, Date.now(), REFRESH_MARGIN_MS) && (await refreshStoredAccount(a.id, vault, force))) {
+          a = accountsFile.accounts.find((x) => x.id === a.id) ?? a;
+          changed = true;
         }
         if (a.tokenExpiresAt != null && Date.now() > a.tokenExpiresAt) {
           if (snap && !snap.tokenStale) writeOfficialSnapshot({ ...snap, tokenStale: true }, file);
@@ -1441,7 +1496,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
           continue;
         }
         writeOfficialSnapshot({ ...(snap ?? { gauges: [], ts: 0 }), attemptTs: nowSec }, file);
-        const r = await fetchOfficialUsage(token);
+        let r = await fetchOfficialUsage(token);
+        if (!r.ok && (r.status === 401 || r.status === 403)) {
+          const v2 = await readVaultOauth(a.id);
+          const t2 = v2 ? await refreshStoredAccount(a.id, v2, true) : undefined;
+          if (t2) r = await fetchOfficialUsage(t2);
+        }
         const now2 = Date.now() / 1000;
         const cur2 = readOfficialSnapshot(file) ?? { gauges: [], ts: 0 };
         if (r.ok) {
@@ -1471,6 +1531,196 @@ export function activate(ctx: vscode.ExtensionContext): void {
       othersInflight = false;
     }
     if (changed) pushUsagePayload();
+  }
+
+  // --- Account rotation (pure logic in src/rotation.ts) ---------------------
+  let lastSwitchTs = 0;
+  let switchInflight = false;
+  const refreshFailTs = new Map<string, number>(); // accountId -> ms of the last failed refresh
+  const httpFetch: FetchLike = (url, init) => fetch(url, init);
+
+  async function readVaultOauth(id: string): Promise<OAuthBlob | undefined> {
+    try {
+      return parseJsonObject(await ctx.secrets.get(vaultOauthKey(id))) as OAuthBlob | undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Refresh an INACTIVE account's stored token pair (never the active login:
+   * Claude Code owns that one). Returns the new access token, or undefined on
+   * failure (the existing stale/backoff handling then applies).
+   */
+  async function refreshStoredAccount(id: string, oauth: OAuthBlob, force: boolean): Promise<string | undefined> {
+    if (id === accountsFile.activeId) return undefined;
+    const failed = refreshFailTs.get(id);
+    if (!force && failed && Date.now() - failed < 10 * 60_000) return undefined;
+    const next = await refreshOAuth(oauth, httpFetch, Date.now());
+    if (!next?.accessToken) {
+      refreshFailTs.set(id, Date.now());
+      log(`oauth refresh failed (acct ${id.slice(0, 8)})`);
+      return undefined;
+    }
+    refreshFailTs.delete(id);
+    try {
+      await ctx.secrets.store(vaultOauthKey(id), JSON.stringify(next));
+      await ctx.secrets.store(`csm.token.${id}`, next.accessToken);
+    } catch (e) {
+      log("oauth vault store failed: " + String(e));
+    }
+    accountsFile = {
+      ...accountsFile,
+      accounts: accountsFile.accounts.map((x) => (x.id === id ? { ...x, tokenExpiresAt: next.expiresAt } : x)),
+    };
+    writeAccountsFile(accountsFile);
+    const file = officialUsageFileFor(id);
+    const snap = readOfficialSnapshot(file);
+    if (snap?.tokenStale) {
+      const { tokenStale: _t, backoffUntil: _b, backoffSec: _s, ...rest } = snap;
+      writeOfficialSnapshot(rest, file);
+    }
+    const cur = usageByAccount.get(id);
+    if (cur?.stale) usageByAccount.set(id, { usage: cur.usage, stale: false });
+    log(`oauth refreshed (acct ${id.slice(0, 8)})`);
+    return next.accessToken;
+  }
+
+  function securityExec(args: string[]): Promise<string | undefined> {
+    return new Promise((resolve, reject) => {
+      execFile("security", args, { encoding: "utf8", timeout: 8000 }, (err, stdout) => {
+        if (err) reject(err);
+        else resolve(String(stdout).trim());
+      });
+    });
+  }
+
+  const switchDeps: SwitchDeps = {
+    readKeychain: async () => {
+      const user = process.env.USER || os.userInfo().username || "";
+      try {
+        return await securityExec(["find-generic-password", "-a", user, "-w", "-s", KEYCHAIN_SERVICE]);
+      } catch {
+        return undefined;
+      }
+    },
+    writeKeychain: async (json) => {
+      const user = process.env.USER || os.userInfo().username || "";
+      await securityExec(["add-generic-password", "-U", "-a", user, "-s", KEYCHAIN_SERVICE, "-w", json]);
+    },
+    getSecret: async (k) => ctx.secrets.get(k),
+    setSecret: async (k, v) => ctx.secrets.store(k, v),
+    readClaudeJson: async () => {
+      try {
+        return await fs.promises.readFile(`${os.homedir()}/.claude.json`, "utf8");
+      } catch {
+        return undefined;
+      }
+    },
+    writeClaudeJson: async (text) => {
+      const file = `${os.homedir()}/.claude.json`;
+      const tmp = `${file}.csm-${process.pid}.tmp`;
+      let mode = 0o600;
+      try {
+        mode = (await fs.promises.stat(file)).mode & 0o777;
+      } catch {
+        /* keep default */
+      }
+      await fs.promises.writeFile(tmp, text, { mode });
+      await fs.promises.rename(tmp, file);
+    },
+    fetchFn: httpFetch,
+    now: () => Date.now(),
+  };
+
+  async function switchToAccount(targetId: string, auto = false): Promise<void> {
+    if (process.platform !== "darwin") {
+      vscode.window.showErrorMessage("Agent Sessions: switching Claude accounts is only supported on macOS.");
+      return;
+    }
+    if (switchInflight) return;
+    accountsFile = readAccountsFile();
+    const target = accountsFile.accounts.find((a) => a.id === targetId);
+    if (!target) {
+      vscode.window.showErrorMessage("Agent Sessions: unknown Claude account.");
+      return;
+    }
+    if (target.id === accountsFile.activeId) {
+      vscode.window.showInformationMessage(`Agent Sessions: already on ${target.email}.`);
+      return;
+    }
+    switchInflight = true;
+    try {
+      const r = await performSwitch(switchDeps, targetId, target.email);
+      if (!r.ok) {
+        vscode.window.showErrorMessage(`Agent Sessions: ${r.error}`);
+        return;
+      }
+      if (r.refreshed?.accessToken) {
+        await ctx.secrets.store(`csm.token.${targetId}`, r.refreshed.accessToken);
+      }
+      lastSwitchTs = Date.now();
+      accountsFile = { ...readAccountsFile(), activeId: targetId };
+      writeAccountsFile(accountsFile);
+      cachedCreds = undefined;
+      identityCache = undefined;
+      vscode.window.showInformationMessage(
+        `${auto ? "Auto-rotate: s" : "S"}witched Claude Code to ${r.email}. New sessions use it; running sessions switch at their next token refresh.`,
+      );
+      await pollUsage(true);
+    } catch (e) {
+      log("switch failed: " + String(e));
+      vscode.window.showErrorMessage(`Agent Sessions: could not switch accounts (${String(e)})`);
+    } finally {
+      switchInflight = false;
+    }
+  }
+
+  function maybeAutoRotate(): void {
+    const c = cfg();
+    const rc = {
+      autoRotate: c.get<boolean>("autoRotate", false),
+      rotateAtPercent: c.get<number>("rotateAtPercent", 90),
+    };
+    if (!rc.autoRotate || switchInflight) return;
+    const views = currentAccountCtx().accounts;
+    const active = views.find((a) => a.active);
+    const best = pickBestAccount(views);
+    if (!active || !best || !shouldAutoRotate(active, best, rc, lastSwitchTs, Date.now())) return;
+    if (readAccountsFile().activeId !== active.id) return; // another window already switched
+    void switchToAccount(best.id, true);
+  }
+
+  async function pickAndSwitchAccount(): Promise<void> {
+    const views = currentAccountCtx().accounts;
+    if (!views.length) {
+      vscode.window.showInformationMessage("Agent Sessions: only one Claude account is known. Log in with another one (claude /login) first.");
+      return;
+    }
+    const bestId = pickBestAccount(views)?.id;
+    const picked = await vscode.window.showQuickPick(
+      views.map((v) => ({
+        label: `${v.stale ? "$(circle-slash) " : ""}${v.email}${v.active ? " (active)" : ""}${v.id === bestId ? " ★" : ""}`,
+        description: v.stale ? "(needs /login)" : remainingSummary(v.gauges),
+        id: v.id,
+      })),
+      { placeHolder: "Switch Claude Code to which account?" },
+    );
+    if (picked) await switchToAccount(picked.id);
+  }
+
+  async function rotateToBest(): Promise<void> {
+    const views = currentAccountCtx().accounts;
+    const best = pickBestAccount(views);
+    if (!best) {
+      vscode.window.showInformationMessage("Agent Sessions: no other Claude account with usage data to rotate to.");
+      return;
+    }
+    if (best.active) {
+      vscode.window.showInformationMessage("Already on the account with the most headroom");
+      return;
+    }
+    await switchToAccount(best.id);
   }
 
   /**
@@ -2144,6 +2394,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
         codexEnabled() ? pollCodex(true) : Promise.resolve(),
       ]);
     }),
+    vscode.commands.registerCommand("claudeSessionMonitor.switchAccount", () => pickAndSwitchAccount()),
+    vscode.commands.registerCommand("claudeSessionMonitor.switchToBestAccount", () => rotateToBest()),
     vscode.commands.registerCommand("claudeSessionMonitor.forgetOtherAccounts", async () => {
       accountsFile = readAccountsFile(); // another window may have a fresher registry
       const keepId = accountsFile.activeId;
@@ -2157,6 +2409,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
       for (const a of drop) {
         try {
           await ctx.secrets.delete(`csm.token.${a.id}`);
+          await ctx.secrets.delete(vaultOauthKey(a.id));
+          await ctx.secrets.delete(vaultIdentKey(a.id));
         } catch {
           /* ignore */
         }

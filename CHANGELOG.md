@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.7.0
+
+### Added
+
+- Account rotation (macOS): every Claude login seen as the active one is vaulted in
+  VS Code Secret Storage (full OAuth block + identity). Inactive accounts are kept
+  alive by refreshing their tokens in the background (the active login is never
+  refreshed, Claude Code owns it).
+- Commands **Agent Sessions: Switch Claude account** and **Switch to Claude account
+  with most headroom**; clicking an account name in the Usage limits panel switches
+  to it, the account with the most headroom is marked with a star, and a "Rotate"
+  button switches to it directly.
+- Settings `autoRotate` (default off) and `rotateAtPercent` (default 90): switch
+  automatically when the active account is nearly spent and another has 20+ points
+  more headroom, at most once per 10 minutes.
+- Only Claude Code's own login is switched (keychain `claudeAiOauth` and
+  `~/.claude.json` `oauthAccount`); "Forget other accounts" also deletes the vaulted tokens.
+
 ## 2.6.0
 
 ### Changed

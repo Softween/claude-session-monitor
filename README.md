@@ -204,6 +204,24 @@ All settings are under `claudeSessionMonitor.*`:
 | `hideEndedAfterMinutes` | `30` | Hide ended sessions after this long |
 | `workspaceOnly` | `false` | Only show this workspace's sessions |
 | `trackAllAccounts` | `true` | Remember each Claude login + refresh non-active accounts in the background |
+| `autoRotate` | `false` | Auto-switch to the account with the most headroom when the active one is nearly spent |
+| `rotateAtPercent` | `90` | Usage percent at which auto-rotate may switch (50-100) |
+
+## Account rotation (multiple logins)
+
+1. Log in once with each account (`claude /login`) while the extension is running, so
+   its token is captured in VS Code Secret Storage.
+2. Switch from the account names in the Usage limits panel, the command
+   **Agent Sessions: Switch Claude account**, or **Switch to Claude account with most
+   headroom** (the star marks that account). Enable `autoRotate` to switch
+   automatically at `rotateAtPercent` usage.
+3. Inactive accounts stay usable because the extension refreshes their tokens in the
+   background. If an account's token has fully expired it shows "needs /login".
+
+Only Claude Code's own login is switched (the keychain item `Claude Code-credentials`
+and the identity in `~/.claude.json`); nothing else on your machine is touched. New
+Claude Code sessions use the new account, running sessions switch at their next token
+refresh. macOS only.
 
 ## Platform support
 

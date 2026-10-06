@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -191,6 +191,16 @@
         "title": "Agent Sessions: Refresh Usage",
         "icon": "$(refresh)",
         "shortTitle": "Refresh Usage"
+      },
+      {
+        "command": "claudeSessionMonitor.switchAccount",
+        "title": "Agent Sessions: Switch Claude account",
+        "shortTitle": "Switch Claude Account"
+      },
+      {
+        "command": "claudeSessionMonitor.switchToBestAccount",
+        "title": "Agent Sessions: Switch to Claude account with most headroom",
+        "shortTitle": "Rotate Claude Account"
       }
     ],
     "menus": {
@@ -254,6 +264,11 @@
           "command": "claudeSessionMonitor.refreshUsage",
           "when": "view == claudeSessionMonitor.limits",
           "group": "navigation@0"
+        },
+        {
+          "command": "claudeSessionMonitor.switchToBestAccount",
+          "when": "view == claudeSessionMonitor.limits",
+          "group": "overflow"
         }
       ]
     },
@@ -307,6 +322,18 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Remember every Claude account you log into (identity in `~/.claude/session-monitor/accounts.json`, access token in VS Code Secret Storage, i.e. your OS keychain) and keep fetching usage for non-active accounts in the background, so the Usage limits panel can show each account and switch between them. Turn off to track only the current login; run **Agent Sessions: Forget Other Claude Accounts** to also delete already-stored tokens."
+        },
+        "claudeSessionMonitor.autoRotate": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Automatically switch Claude Code to the account with the most headroom when the active account reaches `#claudeSessionMonitor.rotateAtPercent#` on its busiest window and another account has at least 20 points more headroom. At most once per 10 minutes. macOS only; needs `trackAllAccounts` and a captured login for each account."
+        },
+        "claudeSessionMonitor.rotateAtPercent": {
+          "type": "number",
+          "default": 90,
+          "minimum": 50,
+          "maximum": 100,
+          "description": "Usage percent of the active account's busiest window at which auto-rotate may switch accounts."
         },
         "claudeSessionMonitor.planLabels": {
           "type": "object",

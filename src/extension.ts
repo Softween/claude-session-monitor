@@ -1588,9 +1588,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   function securityExec(args: string[]): Promise<string | undefined> {
     return new Promise((resolve, reject) => {
-      execFile("security", args, { encoding: "utf8", timeout: 8000 }, (err, stdout) => {
-        if (err) reject(err);
-        else resolve(String(stdout).trim());
+      // Never propagate `err` itself: execFile errors embed the full argv (which
+      // may carry credentials) in err.message/err.cmd. Report code + stderr only.
+      execFile("security", args, { encoding: "utf8", timeout: 8000 }, (err, stdout, stderr) => {
+        if (err) {
+          const code = (err as NodeJS.ErrnoException).code ?? "error";
+          reject(new Error(`security ${args[0]} failed (${String(code)}): ${String(stderr || "").trim().slice(0, 200)}`));
+        } else resolve(String(stdout).trim());
       });
     });
   }
@@ -1606,7 +1610,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     },
     writeKeychain: async (json) => {
       const user = process.env.USER || os.userInfo().username || "";
-      await securityExec(["add-generic-password", "-U", "-a", user, "-s", KEYCHAIN_SERVICE, "-w", json]);
+      // Hex-encoded (-X) exactly like the Claude CLI writes it; argv exposure is identical to the CLI's own login.
+      await securityExec(["add-generic-password", "-U", "-a", user, "-s", KEYCHAIN_SERVICE, "-X", Buffer.from(json, "utf8").toString("hex")]);
     },
     getSecret: async (k) => ctx.secrets.get(k),
     setSecret: async (k, v) => ctx.secrets.store(k, v),

@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.9.0
+
+### Changed
+
+- Usage Limits: non-active Claude accounts collapse to a two-line row (name, worst window %, one thin bar per window); click the row or its chevron to expand, state is kept per workspace. The active account stays a full card.
+
 ## 2.8.0
 
 ### Fixed

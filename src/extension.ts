@@ -17,6 +17,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { gaugeShort, layoutAccounts, toggleExpanded, worstGauge } from "./compact";
 import { execFile } from "child_process";
 import {
   KEYCHAIN_SERVICE,
@@ -507,6 +508,35 @@ interface UsageProviderCard {
   lifetimeTokens: number | null;
   accountId?: string; // Claude account card: clicking its name switches Claude Code to it
   best?: boolean; // Claude account card: the account with the most headroom
+  mode?: "full" | "compact"; // Claude account card layout (see compact.ts)
+  expandable?: boolean; // non-active account: header shows a collapse/expand chevron
+  worstPct?: number | null; // compact row: highest used% across gauges
+  shorts?: string[]; // compact row: one-letter label per gauge, parallel to gauges
+  loginNeeded?: boolean; // note says the token is expired/revoked
+}
+
+/** Decorate account cards with their compact/full layout; non-account cards stay full. */
+function applyLayout(providers: UsageProviderCard[], expandedIds: string[]): UsageProviderCard[] {
+  const modes = new Map(
+    layoutAccounts(
+      providers.filter((p) => p.accountId).map((p) => ({ id: p.accountId as string, active: p.active })),
+      expandedIds,
+    ).map((m) => [m.id, m.mode]),
+  );
+  return providers.map((p) => {
+    const mode = p.accountId ? modes.get(p.accountId) : undefined;
+    if (!mode) return p;
+    const gs = p.official ? p.gauges : [];
+    const w = worstGauge(gs.filter((g) => g.pct != null).map((g) => ({ key: g.key, pct: g.pct as number })));
+    return {
+      ...p,
+      mode,
+      expandable: !p.active,
+      worstPct: w ? w.pct : null,
+      shorts: gs.map((g) => gaugeShort(g.key)),
+      loginNeeded: /^token (expired|revoked)/.test(p.note ?? ""),
+    };
+  });
 }
 
 interface LimitsPayload {
@@ -872,6 +902,7 @@ class LimitsView implements vscode.WebviewViewProvider {
     private readonly onRefresh: () => void,
     private readonly onSwitch: (accountId: string) => void,
     private readonly onRotate: () => void,
+    private readonly onToggle: (accountId: string) => void,
   ) {}
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -882,6 +913,7 @@ class LimitsView implements vscode.WebviewViewProvider {
       if (m && m.type === "refresh") this.onRefresh();
       else if (m && m.type === "switchAccount" && typeof m.id === "string") this.onSwitch(m.id);
       else if (m && m.type === "rotateBest") this.onRotate();
+      else if (m && m.type === "toggleAccount" && typeof m.id === "string") this.onToggle(m.id);
     });
     if (this.pending) view.webview.postMessage(this.pending);
   }
@@ -928,6 +960,20 @@ function limitsHtml(): string {
   .ctitle.sw { cursor:pointer; }
   .ctitle.sw:hover { text-decoration:underline; }
   .best { color: var(--vscode-charts-yellow, #e6b800); font-size:11px; }
+  .crow { padding:7px 0 8px; border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
+  .crow .chead { margin-bottom:5px; cursor:pointer; }
+  .crow .chead:focus-visible, .chead .chevb:focus-visible { outline:1px solid var(--vscode-focusBorder); }
+  .cwarn { color: var(--vscode-charts-yellow, #e6b800); font-size:11px; cursor:help; }
+  .clogin { color: var(--vscode-charts-red, #f14c4c); font-size:10px; font-weight:600; }
+  .cworst { margin-left:auto; font-weight:600; }
+  .cchev { font-size:9px; width:9px; flex:none; color: var(--vscode-descriptionForeground); }
+  .cgs { display:flex; align-items:center; gap:8px; }
+  .cg { display:flex; align-items:center; gap:4px; flex:1 1 0; min-width:0; }
+  .cg .cl { font-size:10px; color: var(--vscode-descriptionForeground); width:1ch; }
+  .cg .t { flex:1 1 auto; height:4px; border-radius:2px; overflow:hidden; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
+  .cg .t i { display:block; height:100%; border-radius:2px; background: var(--vscode-foreground); opacity:.5; }
+  .cg .t i.bad { background: var(--vscode-charts-red, #f14c4c); opacity:1; }
+  .cg .cp { width:3ch; text-align:right; font-size:10px; }
   .rot { display:flex; justify-content:flex-end; margin:0 0 2px; }
   .rot + .card { padding-top:2px; border-top:0; }
   .rotbtn { border:0; background:transparent; color: var(--vscode-textLink-foreground); font:inherit; font-size:11px; cursor:pointer; padding:0; }
@@ -1043,21 +1089,53 @@ function gaugeRow(g){
     + '<span class="p num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
     + '<span class="r num">'+(g.resetMs?fmtLeft(g.resetMs):'')+'</span></div>';
 }
+function chevron(card, open){
+  return card.expandable ? '<span class="cchev" aria-hidden="true">'+(open?'▾':'▸')+'</span>' : '';
+}
+function nameSpan(card, name){
+  const canSwitch = card.provider==='claude' && !!card.accountId && !card.active;
+  return canSwitch
+    ? '<span class="ctitle sw" role="button" tabindex="0" data-switch="'+esc(card.accountId)+'" title="Switch Claude Code to this account">'+esc(name)+'</span>'
+    : '<span class="ctitle" title="'+esc(card.label)+'">'+esc(name)+'</span>';
+}
+function toggleAttrs(card, open){
+  return card.expandable ? ' role="button" tabindex="0" aria-expanded="'+open+'" data-toggle="'+esc(card.accountId)+'"' : '';
+}
+// Compact row: line 1 = name, flags, worst %, chevron (a toggle); line 2 = every window as letter + thin bar + %.
+function compactRow(card){
+  const name = card.label.replace(/^(Claude|Codex) · /,'');
+  const gs = card.official ? (card.gauges||[]) : [];
+  const w = card.worstPct;
+  let h = '<div class="crow" data-testid="csm-account-compact"><div class="chead"'+toggleAttrs(card,false)+'>'
+    + nameSpan(card, name)
+    + (card.best ? '<span class="best" title="most headroom">★</span>' : '')
+    + (card.note ? '<span class="cwarn" title="'+esc(card.note)+'">⚠</span>' : '')
+    + (card.note && card.loginNeeded ? '<span class="clogin">login</span>' : '')
+    + (card.plan ? '<span class="cplan">'+esc(card.plan)+'</span>' : '')
+    + '<span class="cworst num" style="color:'+color(w)+'">'+(w!=null?fmtPct(w)+'%':'')+'</span>'
+    + chevron(card,false)+'</div><div class="cgs">';
+  gs.forEach((g,i) => {
+    const p = g.pct;
+    h += '<span class="cg" title="'+esc(g.label)+'"><span class="cl">'+esc((card.shorts||[])[i]||'')+'</span>'
+      + '<span class="t"><i'+(p!=null&&p>=90?' class="bad"':'')+' style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%"></i></span>'
+      + '<span class="cp num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span></span>';
+  });
+  return h+'</div></div>';
+}
 // One card per provider/account, stacked. The header is "who · plan"; the fetch
 // age only shows once the data is older than ten minutes, so a healthy card
 // carries nothing but its gauges.
 function providerCard(card){
   const age = card.ts ? Math.max(0, Math.round(Date.now()/1000 - card.ts)) : null;
   const name = card.label.replace(/^(Claude|Codex) · /,'');
-  const canSwitch = card.provider==='claude' && !!card.accountId && !card.active;
-  let h='<div class="card"><div class="chead">'
-    + (canSwitch
-        ? '<span class="ctitle sw" role="button" tabindex="0" data-switch="'+esc(card.accountId)+'" title="Switch Claude Code to this account">'+esc(name)+'</span>'
-        : '<span class="ctitle" title="'+esc(card.label)+'">'+esc(name)+'</span>')
+  if(card.mode==='compact') return compactRow(card);
+  let h='<div class="card"><div class="chead"'+toggleAttrs(card,true)+'>'
+    + nameSpan(card, name)
     + (card.best ? '<span class="best" title="most headroom">★</span>' : '')
     + (card.provider==='claude' && card.active ? '<span class="adot" title="active login"></span>' : '')
     + (card.plan ? '<span class="cplan">'+esc(card.plan)+'</span>' : '')
     + (age!=null && age>600 ? '<span class="cage num" title="last official usage fetch">'+fmtAge(age)+' ago</span>' : '')
+    + (card.expandable ? '<span class="cchev" style="margin-left:'+(age!=null&&age>600?'0':'auto')+'" aria-hidden="true">▾</span>' : '')
     + '</div>';
   const gauges = card.official ? (card.gauges||[]) : [];
   if(gauges.length){
@@ -1094,10 +1172,18 @@ function render(){
   }
   root.innerHTML = h;
 }
+document.getElementById('root').addEventListener('keydown', (ev) => {
+  if(ev.key !== 'Enter' && ev.key !== ' ') return;
+  const d = ev.target && ev.target.dataset;
+  if(!d) return;
+  if(d.switch){ vscodeApi.postMessage({ type:'switchAccount', id: d.switch }); ev.preventDefault(); }
+  else if(d.toggle){ vscodeApi.postMessage({ type:'toggleAccount', id: d.toggle }); ev.preventDefault(); }
+});
 document.getElementById('root').addEventListener('click', (ev) => {
   let el = ev.target;
   while(el && el !== ev.currentTarget){
     if(el.dataset && el.dataset.switch){ vscodeApi.postMessage({ type:'switchAccount', id: el.dataset.switch }); return; }
+    if(el.dataset && el.dataset.toggle){ vscodeApi.postMessage({ type:'toggleAccount', id: el.dataset.toggle }); return; }
     if(el.dataset && el.dataset.rotate){ vscodeApi.postMessage({ type:'rotateBest' }); return; }
     if(el.classList && el.classList.contains('sech') && el.dataset.sec){
       collapsed[el.dataset.sec] = !collapsed[el.dataset.sec];
@@ -1174,10 +1260,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let othersInflight = false;
   let lastOthersCheck = 0;
 
+  let expandedIds: string[] = ctx.workspaceState.get<string[]>("csm.expandedAccounts", []);
   const limitsView = new LimitsView(
     () => vscode.commands.executeCommand("claudeSessionMonitor.refreshUsage"),
     (id) => void switchToAccount(id),
     () => void vscode.commands.executeCommand("claudeSessionMonitor.switchToBestAccount"),
+    (id) => {
+      expandedIds = toggleExpanded(expandedIds, id);
+      void ctx.workspaceState.update("csm.expandedAccounts", expandedIds);
+      pushUsagePayload();
+    },
   );
   ctx.subscriptions.push(
     vscode.window.registerWebviewViewProvider("claudeSessionMonitor.limits", limitsView),
@@ -2096,8 +2188,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   function pushUsagePayload(): void {
     try {
       const c = currentAccountCtx();
-      limitsView.update(
-        buildLimitsPayload(
+      const payload = buildLimitsPayload(
           lastAllViews,
           tokenUsage,
           c.usage,
@@ -2106,8 +2197,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
           codexEnabled() ? codexSnapshot : null,
           enabledProviders(),
           planLabels(),
-        ),
       );
+      limitsView.update({ ...payload, providers: applyLayout(payload.providers, expandedIds) });
       updateStatusBar(
         statusBar,
         lastAllViews,

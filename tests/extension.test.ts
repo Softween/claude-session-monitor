@@ -182,6 +182,13 @@ function mkCtx(state = new Map<string, unknown>()): any {
         return Promise.resolve();
       },
     },
+    workspaceState: {
+      get: (k: string, def?: unknown) => (state.has(k) ? state.get(k) : def),
+      update: (k: string, v: unknown) => {
+        state.set(k, v);
+        return Promise.resolve();
+      },
+    },
     secrets: {
       get: () => Promise.resolve(undefined),
       store: () => Promise.resolve(),

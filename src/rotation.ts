@@ -4,6 +4,8 @@
 // it has seen, keeps the inactive ones alive by refreshing their tokens, and can
 // swap the active login by rewriting those two places.
 
+import { classifyRefreshFailure } from "./capture";
+
 export const KEYCHAIN_SERVICE = "Claude Code-credentials";
 export const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 export const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -133,15 +135,31 @@ export interface HttpResponseLike {
   ok: boolean;
   status: number;
   json(): Promise<unknown>;
+  text(): Promise<string>;
 }
 export type FetchLike = (
   url: string,
   init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal },
 ) => Promise<HttpResponseLike>;
 
+/** `permanent` = the grant itself was rejected (needs a new login); `snippet` never carries token values. */
+export type RefreshResult =
+  | { ok: true; blob: OAuthBlob & { accessToken: string } }
+  | { ok: false; permanent: boolean; status: number | null; snippet: string };
+
+/** First 120 chars of an error body, with anything token-shaped (sk-ant-…, any 24+ char opaque run) masked. */
+function bodySnippet(body: string): string {
+  return body
+    .replace(/sk-ant-[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/[A-Za-z0-9_-]{24,}/g, "[redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
 /** Refresh an oauth blob the way the Claude CLI does: JSON POST with client_id and the granted scopes. */
-export async function refreshOAuth(oauth: OAuthBlob, fetchFn: FetchLike, nowMs: number): Promise<OAuthBlob | undefined> {
-  if (!oauth.refreshToken) return undefined;
+export async function refreshOAuth(oauth: OAuthBlob, fetchFn: FetchLike, nowMs: number): Promise<RefreshResult> {
+  if (!oauth.refreshToken) return { ok: false, permanent: true, status: null, snippet: "no refresh token stored" };
   const body: Record<string, string> = {
     grant_type: "refresh_token",
     refresh_token: oauth.refreshToken,
@@ -155,10 +173,16 @@ export async function refreshOAuth(oauth: OAuthBlob, fetchFn: FetchLike, nowMs: 
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(15000),
     });
-    if (!res.ok) return undefined;
-    return parseRefreshResponse(await res.json(), oauth, nowMs);
-  } catch {
-    return undefined;
+    if (!res.ok) {
+      const raw = await res.text().catch(() => "");
+      const permanent = classifyRefreshFailure(res.status, raw) === "permanent";
+      return { ok: false, permanent, status: res.status, snippet: bodySnippet(raw) };
+    }
+    const blob = parseRefreshResponse(await res.json(), oauth, nowMs);
+    if (!blob?.accessToken) return { ok: false, permanent: false, status: res.status, snippet: "token response without access_token" };
+    return { ok: true, blob: { ...blob, accessToken: blob.accessToken } };
+  } catch (e) {
+    return { ok: false, permanent: false, status: null, snippet: bodySnippet(String(e)) };
   }
 }
 
@@ -220,8 +244,9 @@ export async function performSwitch(deps: SwitchDeps, targetId: string, targetEm
   let oauth = tOauth;
   let refreshed: OAuthBlob | undefined;
   if (needsRefresh(tOauth, deps.now(), SWITCH_REFRESH_MARGIN_MS)) {
-    refreshed = await refreshOAuth(tOauth, deps.fetchFn, deps.now());
-    if (!refreshed) return { ok: false, error: "this account's token expired and could not be refreshed — run /login with it" };
+    const rr = await refreshOAuth(tOauth, deps.fetchFn, deps.now());
+    if (!rr.ok) return { ok: false, error: "this account's token expired and could not be refreshed — run /login with it" };
+    refreshed = rr.blob;
     oauth = refreshed;
     await deps.setSecret(vaultOauthKey(targetId), JSON.stringify(oauth));
   }

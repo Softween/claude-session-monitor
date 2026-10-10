@@ -138,6 +138,7 @@ export interface AccountView {
   selected: boolean; // currently displayed in the panel
   ts: number | null; // epoch sec of its last successful usage fetch
   stale: boolean; // stored token expired/rejected — data is last-known only
+  needsLogin?: boolean; // stored refresh token revoked — only a new Claude Code login brings it back
   gauges: { key: string; label: string; pct: number | null; resetMs: number | null }[]; // last-known official gauges ([] = none yet)
   plan: string | null; // "$200 Max" etc: planLabels setting, else derived from the login's rate-limit tier
 }

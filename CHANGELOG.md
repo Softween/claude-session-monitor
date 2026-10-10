@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.8.0
+
+### Fixed
+
+- Every `claude /login` is vaulted within seconds, independent of the usage API and its 429 backoff: a stat of `~/.claude.json` per tick, a fresh keychain read on change or every 60 s, stored once the same account + token pair holds for 3 s (30 s before a token is moved from another account's vault entry).
+- Background token refresh separates a revoked grant from a transient failure: 429/5xx/network/`invalid_client` retry after 10 minutes; `invalid_grant` (unless another window already rotated the token) marks the account "token revoked — log in with Claude Code once" until its vault holds a newer token.
+- Vault writes are awaited and a failed store is retried on the next tick; refresh failures log the HTTP status and a short token-free body snippet.
+
 ## 2.7.0
 
 ### Added

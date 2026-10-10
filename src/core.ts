@@ -970,6 +970,8 @@ export interface AccountInfo {
   lastSeenTs: number; // epoch sec this account was last seen as the active login
   tokenExpiresAt?: number; // epoch ms the stored access token expires (from the keychain payload)
   tier?: string; // keychain rateLimitTier / subscriptionType seen while this was the active login
+  needsLogin?: boolean; // stored refresh token rejected (invalid_grant): no background refresh until captured again
+  needsLoginFp?: string; // short sha256 fingerprint of that rejected refresh token (never the token itself)
 }
 
 export interface AccountsFile {
@@ -988,7 +990,7 @@ export function readAccountsFile(file = ACCOUNTS_FILE): AccountsFile {
   return { v: 1, accounts, activeId: typeof raw.activeId === "string" ? raw.activeId : undefined };
 }
 
-/** Pure upsert: a NEW AccountsFile with `acct` recorded as the active login, newest first. */
+/** Pure upsert: a NEW AccountsFile with `acct` recorded as the active login, newest first (clears needsLogin). */
 export function upsertActiveAccount(
   f: AccountsFile,
   acct: { id: string; email: string; tokenExpiresAt?: number; tier?: string },

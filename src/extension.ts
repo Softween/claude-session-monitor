@@ -35,6 +35,17 @@ import {
   type SwitchDeps,
 } from "./rotation";
 import {
+  CAPTURE_MOVE_SETTLE_MS,
+  CAPTURE_SETTLE_MS,
+  classifyIdentityChange,
+  decideCapture,
+  refreshBlocked,
+  settleCapture,
+  tokenFingerprint,
+  withoutNeedsLogin,
+  type PendingCapture,
+} from "./capture";
+import {
   collectSessions,
   countBuckets,
   findRecentTranscripts,
@@ -59,6 +70,7 @@ import {
   MONITOR_DIR,
   PROJECTS_DIR,
   DEFAULT_ENTRYPOINTS,
+  type AccountInfo,
   type AccountsFile,
   type SessionView,
   type RecentTranscript,
@@ -534,7 +546,8 @@ interface ClaudeCredentials {
 }
 
 // The keychain read spawns a `security` subprocess; with a 10s usage poll that
-// would be constant churn, so the credentials are cached and invalidated on 401/403.
+// would be constant churn, so the credentials are cached and invalidated on 401/403
+// (captureActiveLogin also replaces them with each of its fresh reads).
 const TOKEN_TTL_SEC = 300;
 let cachedCreds: { creds: ClaudeCredentials; ts: number } | undefined;
 
@@ -591,20 +604,36 @@ interface ActiveIdentity {
 
 let identityCache: { token: string; identity: ActiveIdentity | undefined } | undefined;
 
-async function readActiveIdentity(token: string): Promise<ActiveIdentity | undefined> {
-  if (identityCache?.token === token) return identityCache.identity;
-  let identity: ActiveIdentity | undefined;
+const CLAUDE_JSON = `${os.homedir()}/.claude.json`;
+
+/** Parse oauthAccount out of ~/.claude.json (uncached: callers decide how often). */
+async function readIdentityFile(): Promise<ActiveIdentity | undefined> {
   try {
-    const raw = await fs.promises.readFile(`${os.homedir()}/.claude.json`, "utf8");
+    const raw = await fs.promises.readFile(CLAUDE_JSON, "utf8");
     const oa = JSON.parse(raw)?.oauthAccount;
     if (oa && typeof oa.accountUuid === "string" && oa.accountUuid && typeof oa.emailAddress === "string") {
-      identity = { id: oa.accountUuid, email: oa.emailAddress, block: oa };
+      return { id: oa.accountUuid, email: oa.emailAddress, block: oa };
     }
   } catch {
     /* missing or unparsable — identity stays unknown */
   }
+  return undefined;
+}
+
+async function readActiveIdentity(token: string): Promise<ActiveIdentity | undefined> {
+  if (identityCache?.token === token) return identityCache.identity;
+  const identity = await readIdentityFile();
   identityCache = { token, identity };
   return identity;
+}
+
+/** mtime of ~/.claude.json in ms (undefined when missing): the cheap per-tick login-change probe. */
+async function claudeJsonMtimeMs(): Promise<number | undefined> {
+  try {
+    return (await fs.promises.stat(CLAUDE_JSON)).mtimeMs;
+  } catch {
+    return undefined;
+  }
 }
 
 type UsageFetch =
@@ -753,6 +782,7 @@ function buildLimitsPayload(
         const aOfficial = aGauges.some((g) => g.pct != null);
         let note: string | null;
         if (isSel) note = selectedNote;
+        else if (a.needsLogin) note = "token revoked — log in with Claude Code once";
         else if (a.stale) note = "token expired — last-known data; log in with Claude Code once to refresh";
         else if (!aOfficial) note = "no usage data yet — appears after the first background fetch";
         else note = null;
@@ -1396,14 +1426,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         writeAccountsFile(accountsFile);
         usageByAccount.set(ident.id, { usage: r.usage, stale: false });
         writeOfficialSnapshot({ gauges: r.usage.gauges, ts: r.usage.ts, attemptTs: nowSec }, officialUsageFileFor(ident.id));
-        if (trackAllAccounts()) {
-          void ctx.secrets.store(`csm.token.${ident.id}`, creds.token).then(undefined, () => {});
-          if (creds.oauth && ident.block) {
-            // Full snapshot so this login can be refreshed in the background and switched back to.
-            void ctx.secrets.store(vaultOauthKey(ident.id), JSON.stringify(creds.oauth)).then(undefined, () => {});
-            void ctx.secrets.store(vaultIdentKey(ident.id), JSON.stringify(ident.block)).then(undefined, () => {});
-          }
-        }
+        if (await captureWanted(ident, creds)) captureRetry = true; // vaulted by captureActiveLogin (fresh reads + settle window)
         const g5 = r.usage.gauges.find((g) => g.key === "session");
         const g7 = r.usage.gauges.find((g) => g.key === "weekly");
         appendLimitsHistory({
@@ -1464,6 +1487,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           changed = true; // another window fetched it
         }
         const vault = await readVaultOauth(a.id);
+        if (vault && healNeedsLogin(a, vault)) changed = true;
         if (vault && needsRefresh(vault, Date.now(), REFRESH_MARGIN_MS) && (await refreshStoredAccount(a.id, vault, force))) {
           a = accountsFile.accounts.find((x) => x.id === a.id) ?? a;
           changed = true;
@@ -1547,6 +1571,198 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
   }
 
+  // --- Login capture (pure decisions in src/capture.ts) ----------------------
+  let captureInflight = false;
+  let captureForceQueued = false; // a forced capture arrived mid-pass: the next pass runs forced
+  let captureRetry = false; // fresh keychain read wanted on the next tick (failed store, mid-read switch, usage-poll nudge)
+  let captureFails = 0; // consecutive failed stores: only the first one schedules that retry
+  let captureMidReadRetried = false; // the account changed during the last keychain read and was re-read once
+  let captureMtimeMs: number | undefined; // ~/.claude.json mtime seen on the last tick
+  let captureIdent: ActiveIdentity | undefined; // its parsed oauthAccount (change probe only)
+  let captureKcTs = 0; // ms of the capture loop's last fresh keychain read
+  let captureDirty = false; // oauthAccount edited (same account) since that read: read within 5 s
+  let capturePending: PendingCapture | null = null; // changed login waiting out the settle window
+
+  /** Other accounts whose vaulted blob holds this refresh token (stale data or an earlier mismatched pair). */
+  async function vaultOwners(id: string, refreshToken: string | undefined): Promise<string[]> {
+    if (!refreshToken) return [];
+    const owners: string[] = [];
+    for (const a of readAccountsFile().accounts) {
+      if (a.id !== id && (await readVaultOauth(a.id))?.refreshToken === refreshToken) owners.push(a.id);
+    }
+    return owners;
+  }
+
+  /** True when the keychain blob differs from what is vaulted for this identity. */
+  async function captureWanted(ident: ActiveIdentity, creds: ClaudeCredentials): Promise<boolean> {
+    if (!trackAllAccounts()) return false;
+    const vaulted = (await readVaultOauth(ident.id)) ?? null;
+    return decideCapture({ identity: ident, keychain: creds.oauth ?? null, vaulted }) === "store";
+  }
+
+  /**
+   * Write a settled login under `ident.id`. The pair held for the settle window
+   * (30 s when `owners` is non-empty), so ~/.claude.json is trusted: the same
+   * refresh token vaulted under another id is moved here (that id's entries are
+   * deleted). False when a store failed.
+   */
+  async function writeVault(ident: ActiveIdentity, creds: ClaudeCredentials, owners: string[]): Promise<boolean> {
+    const rt = creds.oauth?.refreshToken;
+    try {
+      await ctx.secrets.store(`csm.token.${ident.id}`, creds.token);
+      await ctx.secrets.store(vaultOauthKey(ident.id), JSON.stringify(creds.oauth));
+      if (ident.block) await ctx.secrets.store(vaultIdentKey(ident.id), JSON.stringify(ident.block));
+      for (const other of owners) {
+        if ((await readVaultOauth(other))?.refreshToken !== rt) continue;
+        await ctx.secrets.delete(vaultOauthKey(other));
+        await ctx.secrets.delete(vaultIdentKey(other));
+        await ctx.secrets.delete(`csm.token.${other}`);
+        log(`capture: moved vault entry from ${other.slice(0, 8)} to ${ident.id.slice(0, 8)} after a 30 s settle`);
+      }
+    } catch (e) {
+      log(`capture: vault store failed (acct ${ident.id.slice(0, 8)}): ${String(e)}`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * The one code path that vaults the active login. Takes a pair read FRESH on
+   * this tick (keychain + ~/.claude.json), stores only once the settle window
+   * confirmed the pair (3 s; 30 s when the token would move from another id),
+   * then records the account in the registry (which clears needsLogin).
+   */
+  async function vaultActiveLogin(ident: ActiveIdentity, creds: ClaudeCredentials): Promise<"stored" | "skipped" | "waiting" | "failed"> {
+    if (!(await captureWanted(ident, creds))) {
+      capturePending = null;
+      return "skipped";
+    }
+    const rt = creds.oauth?.refreshToken;
+    const owners = await vaultOwners(ident.id, rt);
+    const minMs = owners.length ? CAPTURE_MOVE_SETTLE_MS : CAPTURE_SETTLE_MS;
+    const settle = settleCapture(capturePending, { accountUuid: ident.id, refreshToken: rt }, Date.now(), minMs);
+    capturePending = settle.pending;
+    if (settle.action === "wait") return "waiting";
+    if (!(await writeVault(ident, creds, owners))) return "failed";
+    refreshFailTs.delete(ident.id);
+    accountsFile = upsertActiveAccount(
+      readAccountsFile(),
+      { id: ident.id, email: ident.email, tokenExpiresAt: creds.expiresAt, tier: creds.tier },
+      Date.now() / 1000,
+    );
+    writeAccountsFile(accountsFile);
+    log(`capture: vaulted login (acct ${ident.id.slice(0, 8)})`);
+    return "stored";
+  }
+
+  /**
+   * Follow ~/.claude.json through its mtime (parse only on change). True when
+   * the logged-in account changed; an edited oauthAccount of the same account
+   * marks captureDirty; unrelated rewrites (every few seconds) change nothing.
+   */
+  async function noteClaudeJson(mtimeMs: number | undefined): Promise<boolean> {
+    if (mtimeMs === captureMtimeMs) return false;
+    captureMtimeMs = mtimeMs;
+    const ident = mtimeMs === undefined ? undefined : await readIdentityFile();
+    const change = classifyIdentityChange(captureIdent, ident);
+    captureIdent = ident;
+    if (change === "block") captureDirty = true;
+    return change === "account";
+  }
+
+  /** Read keychain then ~/.claude.json fresh (never mtime-cached) and hand the pair to vaultActiveLogin. */
+  async function captureFreshPair(now: number): Promise<void> {
+    const before = captureIdent;
+    const creds = before ? await readClaudeCredentials() : undefined;
+    const ident = creds ? await readIdentityFile() : undefined;
+    if (!creds || !ident) {
+      capturePending = null;
+      return;
+    }
+    cachedCreds = { creds, ts: now / 1000 };
+    if (ident.id !== before?.id && !captureMidReadRetried) {
+      captureMidReadRetried = true; // account switched during the keychain read: re-read once on the next tick
+      captureRetry = true;
+      return;
+    }
+    captureMidReadRetried = false;
+    const res = await vaultActiveLogin(ident, creds);
+    if (res === "stored" || res === "skipped") captureFails = 0;
+    else if (res === "failed" && ++captureFails === 1) captureRetry = true; // retry once on the next tick
+  }
+
+  /**
+   * Called every tick: stat ~/.claude.json; when the account or its oauthAccount
+   * changed, a settle confirmation is due, or 60 s passed, read the login fresh
+   * (captureFreshPair), so a /login is captured even while the usage API is
+   * rate-limited.
+   */
+  async function captureActiveLogin(force: boolean): Promise<void> {
+    if (switchInflight || !trackAllAccounts() || process.platform !== "darwin") return;
+    if (captureInflight) {
+      if (force) captureForceQueued = true; // don't drop a manual refresh: the next pass runs forced
+      return;
+    }
+    captureInflight = true;
+    try {
+      const forced = force || captureForceQueued;
+      captureForceQueued = false;
+      const now = Date.now();
+      const uuidChanged = await noteClaudeJson(await claudeJsonMtimeMs());
+      if (uuidChanged) cachedCreds = undefined; // another login: drop the 300 s keychain cache
+      const retry = captureRetry;
+      captureRetry = false;
+      const confirm = !!capturePending && now - capturePending.observedAt >= capturePending.holdMs;
+      const stale = (captureDirty && now - captureKcTs >= 5_000) || now - captureKcTs >= 60_000;
+      if (!(forced || uuidChanged || retry || confirm || stale)) return;
+      captureKcTs = now;
+      captureDirty = false;
+      await captureFreshPair(now);
+    } catch (e) {
+      log("capture error: " + String(e));
+    } finally {
+      captureInflight = false;
+    }
+  }
+
+  /** Clear needsLogin once the vault no longer holds the rejected token (another window refreshed it); true when cleared. */
+  function healNeedsLogin(a: AccountInfo, vault: OAuthBlob): boolean {
+    if (!a.needsLogin || refreshBlocked(a, vault.refreshToken)) return false;
+    const f = readAccountsFile(); // fresh read: another window may have written the registry
+    accountsFile = { ...f, accounts: f.accounts.map((x) => (x.id === a.id ? withoutNeedsLogin(x) : x)) };
+    writeAccountsFile(accountsFile);
+    log(`needsLogin cleared (acct ${a.id.slice(0, 8)}): vault holds a newer refresh token`);
+    return true;
+  }
+
+  /**
+   * Transient failure (429, 5xx, network): retry after the 10-minute backoff.
+   * Permanent (invalid_grant) only when the vault STILL holds the token that was
+   * sent: otherwise another window rotated the single-use refresh token first.
+   * A permanent failure flags needsLogin (+ token fingerprint) so background
+   * refresh stops until the vault holds a different token or a new login.
+   */
+  async function recordRefreshFailure(
+    id: string,
+    sentRefreshToken: string | undefined,
+    r: { permanent: boolean; status: number | null; snippet: string },
+  ): Promise<void> {
+    const permanent = r.permanent && (await readVaultOauth(id))?.refreshToken === sentRefreshToken;
+    const kind = permanent ? "permanent" : r.permanent ? "transient: vault rotated elsewhere" : "transient";
+    log(`oauth refresh failed (acct ${id.slice(0, 8)}, ${kind}): HTTP ${r.status ?? "-"} ${r.snippet}`);
+    if (!permanent) {
+      refreshFailTs.set(id, Date.now());
+      return;
+    }
+    refreshFailTs.delete(id);
+    const f = readAccountsFile(); // another window may have a fresher registry
+    const flag = { needsLogin: true, needsLoginFp: tokenFingerprint(sentRefreshToken) };
+    accountsFile = { ...f, accounts: f.accounts.map((x) => (x.id === id ? { ...x, ...flag } : x)) };
+    writeAccountsFile(accountsFile);
+    const cur = usageByAccount.get(id);
+    usageByAccount.set(id, { usage: cur?.usage ?? null, stale: true });
+  }
+
   /**
    * Refresh an INACTIVE account's stored token pair (never the active login:
    * Claude Code owns that one). Returns the new access token, or undefined on
@@ -1554,14 +1770,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
    */
   async function refreshStoredAccount(id: string, oauth: OAuthBlob, force: boolean): Promise<string | undefined> {
     if (id === accountsFile.activeId) return undefined;
+    const entry = accountsFile.accounts.find((x) => x.id === id);
+    if (entry && refreshBlocked(entry, oauth.refreshToken)) return undefined; // rejected token still vaulted: wait for a new login
     const failed = refreshFailTs.get(id);
     if (!force && failed && Date.now() - failed < 10 * 60_000) return undefined;
-    const next = await refreshOAuth(oauth, httpFetch, Date.now());
-    if (!next?.accessToken) {
-      refreshFailTs.set(id, Date.now());
-      log(`oauth refresh failed (acct ${id.slice(0, 8)})`);
+    const r = await refreshOAuth(oauth, httpFetch, Date.now());
+    if (!r.ok) {
+      await recordRefreshFailure(id, oauth.refreshToken, r);
       return undefined;
     }
+    const next = r.blob;
     refreshFailTs.delete(id);
     try {
       await ctx.secrets.store(vaultOauthKey(id), JSON.stringify(next));
@@ -1571,7 +1789,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
     accountsFile = {
       ...accountsFile,
-      accounts: accountsFile.accounts.map((x) => (x.id === id ? { ...x, tokenExpiresAt: next.expiresAt } : x)),
+      accounts: accountsFile.accounts.map((x) => (x.id === id ? { ...withoutNeedsLogin(x), tokenExpiresAt: next.expiresAt } : x)),
     };
     writeAccountsFile(accountsFile);
     const file = officialUsageFileFor(id);
@@ -1753,7 +1971,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
         stale:
           a.id === activeId
             ? false
-            : (e?.stale ?? false) || (a.tokenExpiresAt != null && Date.now() > a.tokenExpiresAt),
+            : (e?.stale ?? false) || a.needsLogin === true || (a.tokenExpiresAt != null && Date.now() > a.tokenExpiresAt),
+        needsLogin: a.id !== activeId && a.needsLogin === true,
       };
     });
     const usage = selId === activeId ? officialUsage : (selId && usageByAccount.get(selId)?.usage) || null;
@@ -1940,6 +2159,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
         /* ignore */
       }
     }
+
+    // Vault the active login on every tick, independent of the usage API (and its
+    // 429 backoff): a stat per tick, a keychain read only on change / every 60 s.
+    if (claudeEnabled()) void captureActiveLogin(false);
 
     // Official usage poll — coordinated across ALL VS Code windows through the
     // shared snapshot file (see pollUsage).
@@ -2394,7 +2617,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       vscode.window.setStatusBarMessage("Agent Sessions: refreshing usage…", 2500);
       await Promise.all([
         claudeEnabled()
-          ? pollUsage(true).then(() => pollOtherAccounts(true))
+          ? captureActiveLogin(true).then(() => pollUsage(true)).then(() => pollOtherAccounts(true))
           : Promise.resolve(),
         codexEnabled() ? pollCodex(true) : Promise.resolve(),
       ]);

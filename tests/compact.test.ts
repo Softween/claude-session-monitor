@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { gaugeShort, layoutAccounts, toggleExpanded, worstGauge } from "../src/compact";
 
@@ -43,4 +44,12 @@ describe("gaugeShort", () => {
     expect(gaugeShort("weekly_fable_opus")).toBe("F");
   });
   it("falls back to the upper-cased first letter", () => expect(gaugeShort("opus")).toBe("O"));
+});
+
+describe("compact row reset countdown", () => {
+  it("renders the same fmtLeft(resetMs) text as the full bar, only when a reset exists", () => {
+    const src = readFileSync("src/extension.ts", "utf8");
+    expect(src).toContain("(g.resetMs ? '<span class=\"cr num\">'+fmtLeft(g.resetMs)+'</span>' : '')");
+    expect(src).toContain("(g.resetMs?fmtLeft(g.resetMs):'')");
+  });
 });

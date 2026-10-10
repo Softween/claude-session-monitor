@@ -967,13 +967,14 @@ function limitsHtml(): string {
   .clogin { color: var(--vscode-charts-red, #f14c4c); font-size:10px; font-weight:600; }
   .cworst { margin-left:auto; font-weight:600; }
   .cchev { font-size:9px; width:9px; flex:none; color: var(--vscode-descriptionForeground); }
-  .cgs { display:flex; align-items:center; gap:8px; }
-  .cg { display:flex; align-items:center; gap:4px; flex:1 1 0; min-width:0; }
+  .cgs { display:flex; flex-wrap:wrap; align-items:center; gap:4px 8px; }
+  .cg { display:flex; align-items:center; gap:4px; flex:1 1 150px; min-width:150px; }
   .cg .cl { font-size:10px; color: var(--vscode-descriptionForeground); width:1ch; }
   .cg .t { flex:1 1 auto; height:4px; border-radius:2px; overflow:hidden; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
   .cg .t i { display:block; height:100%; border-radius:2px; background: var(--vscode-foreground); opacity:.5; }
   .cg .t i.bad { background: var(--vscode-charts-red, #f14c4c); opacity:1; }
   .cg .cp { width:3ch; text-align:right; font-size:10px; }
+  .cg .cr { margin-left:4px; font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .rot { display:flex; justify-content:flex-end; margin:0 0 2px; }
   .rot + .card { padding-top:2px; border-top:0; }
   .rotbtn { border:0; background:transparent; color: var(--vscode-textLink-foreground); font:inherit; font-size:11px; cursor:pointer; padding:0; }
@@ -1118,7 +1119,8 @@ function compactRow(card){
     const p = g.pct;
     h += '<span class="cg" title="'+esc(g.label)+'"><span class="cl">'+esc((card.shorts||[])[i]||'')+'</span>'
       + '<span class="t"><i'+(p!=null&&p>=90?' class="bad"':'')+' style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%"></i></span>'
-      + '<span class="cp num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span></span>';
+      + '<span class="cp num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
+      + (g.resetMs ? '<span class="cr num">'+fmtLeft(g.resetMs)+'</span>' : '') + '</span>';
   });
   return h+'</div></div>';
 }

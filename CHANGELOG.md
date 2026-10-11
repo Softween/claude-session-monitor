@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.9.2
+
+- Usage Limits: Team and Enterprise logins are labelled "Team" / "Enterprise" instead of "$100 Max". Their seats carry a Max-style `rateLimitTier`, so the plan now comes from `subscriptionType` for those plans.
+
 ## 2.9.1
 
 - Usage Limits: compact account rows show each window's reset countdown; gauges wrap to their own line on a narrow sidebar.

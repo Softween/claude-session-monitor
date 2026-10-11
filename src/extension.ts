@@ -119,6 +119,7 @@ import {
   nextUsageBackoffSec,
   accountPillLabels,
   claudePlanLabel,
+  claudePlanTier,
   codexPlanLabel,
   filterHistoryForAccount,
   topSessionRows,
@@ -571,7 +572,7 @@ interface OfficialUsage {
 interface ClaudeCredentials {
   token: string;
   expiresAt?: number; // epoch ms the access token expires (from the keychain payload)
-  tier?: string; // rateLimitTier (or subscriptionType) — used only for the plan label
+  tier?: string; // claudePlanTier(): subscriptionType for Team/Enterprise, else rateLimitTier — used only for the plan label
   oauth?: OAuthBlob; // the whole claudeAiOauth object (vaulted for account rotation)
 }
 
@@ -608,12 +609,7 @@ function readClaudeCredentials(): Promise<ClaudeCredentials | undefined> {
             resolve(undefined);
             return;
           }
-          const tier =
-            typeof oauth.rateLimitTier === "string" && oauth.rateLimitTier
-              ? oauth.rateLimitTier
-              : typeof oauth.subscriptionType === "string" && oauth.subscriptionType
-                ? oauth.subscriptionType
-                : undefined;
+          const tier = claudePlanTier(oauth.rateLimitTier, oauth.subscriptionType);
           resolve({ token, expiresAt: typeof oauth.expiresAt === "number" ? oauth.expiresAt : undefined, tier, oauth });
         } catch {
           resolve(undefined);

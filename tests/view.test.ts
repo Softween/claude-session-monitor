@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, subtreeTotals, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec, accountPillLabels, filterHistoryForAccount, topSessionRows, sortByTokens, claudePlanLabel, codexPlanLabel } from "../src/view";
+import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, subtreeTotals, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec, accountPillLabels, filterHistoryForAccount, topSessionRows, sortByTokens, claudePlanLabel, claudePlanTier, codexPlanLabel } from "../src/view";
 import type { SessionView } from "../src/core";
 
 const v = (bucket: SessionView["bucket"], sub: string): SessionView =>
@@ -376,6 +376,15 @@ describe("plan labels", () => {
     expect(claudePlanLabel(undefined, "pro")).toBe("$20 Pro");
     expect(claudePlanLabel(undefined, "team")).toBe("Team");
     expect(claudePlanLabel(null, null)).toBeNull();
+  });
+  it("names Team and Enterprise seats by subscription, not their Max-style rate-limit tier", () => {
+    expect(claudePlanTier("default_claude_max_5x", "team")).toBe("team");
+    expect(claudePlanTier("default_claude_max_5x", "enterprise")).toBe("enterprise");
+    expect(claudePlanTier("default_claude_max_20x", "max")).toBe("default_claude_max_20x");
+    expect(claudePlanTier(undefined, "pro")).toBe("pro");
+    expect(claudePlanTier(null, null)).toBeUndefined();
+    expect(claudePlanLabel(claudePlanTier("default_claude_max_5x", "team"))).toBe("Team");
+    expect(claudePlanLabel("enterprise")).toBe("Enterprise");
   });
   it("maps Codex plan types", () => {
     expect(codexPlanLabel("prolite")).toBe("$100 Pro Lite");

@@ -150,6 +150,8 @@ export interface AccountView {
  */
 export function claudePlanLabel(tier: string | null | undefined, subscription?: string | null): string | null {
   const t = (tier ?? "").toLowerCase();
+  if (t === "team") return "Team";
+  if (t === "enterprise") return "Enterprise";
   if (t.includes("max_20x")) return "$200 Max";
   if (t.includes("max_5x")) return "$100 Max";
   if (t.includes("max")) return "Max";
@@ -159,6 +161,19 @@ export function claudePlanLabel(tier: string | null | undefined, subscription?: 
   if (s === "pro") return "$20 Pro";
   if (s) return s.charAt(0).toUpperCase() + s.slice(1);
   return null;
+}
+
+/**
+ * The plan-identifying tier from the keychain payload. Team and Enterprise seats
+ * carry a Max-style `rateLimitTier` (e.g. "default_claude_max_5x"), so for them
+ * `subscriptionType` names the plan; otherwise `rateLimitTier`, falling back to
+ * `subscriptionType`.
+ */
+export function claudePlanTier(rateLimitTier: unknown, subscriptionType: unknown): string | undefined {
+  const sub = typeof subscriptionType === "string" ? subscriptionType : "";
+  if (/^(team|enterprise)$/i.test(sub)) return sub;
+  if (typeof rateLimitTier === "string" && rateLimitTier) return rateLimitTier;
+  return sub || undefined;
 }
 
 /** Human plan label from Codex's `planType` ("plus", "pro", "prolite", ...). */

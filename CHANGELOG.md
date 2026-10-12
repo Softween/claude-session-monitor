@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 - Usage Limits: Team and Enterprise logins are labelled "Team" / "Enterprise" instead of "$100 Max". Their seats carry a Max-style `rateLimitTier`, so the plan now comes from `subscriptionType` for those plans.
 
+## 2.10.0
+
+### Changed
+
+- Usage Limits: one account grid (Account, Session, Weekly, Fable) replaces per-account cards: bar, used % and reset countdown per cell, active row highlighted, notes for the active account below the grid, others in a warning tooltip.
+- Removed the 2.9 expand/collapse rows and their stored state.
+
 ## 2.9.1
 
 - Usage Limits: compact account rows show each window's reset countdown; gauges wrap to their own line on a narrow sidebar.

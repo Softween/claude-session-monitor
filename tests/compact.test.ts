@@ -1,55 +1,21 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { gaugeShort, layoutAccounts, toggleExpanded, worstGauge } from "../src/compact";
+import { gaugeColumn } from "../src/compact";
 
-const accts = [{ id: "a", active: true }, { id: "b" }, { id: "c" }];
-
-describe("layoutAccounts", () => {
-  it("active is full even when not expanded", () => {
-    expect(layoutAccounts(accts, [])[0]).toEqual({ id: "a", mode: "full" });
+describe("gaugeColumn", () => {
+  it("maps session keys", () => {
+    expect(gaugeColumn("session")).toBe("session");
+    expect(gaugeColumn("5h")).toBe("session");
   });
-  it("non-active accounts are compact by default", () => {
-    expect(layoutAccounts(accts, []).map((x) => x.mode)).toEqual(["full", "compact", "compact"]);
+  it("maps weekly keys", () => {
+    expect(gaugeColumn("weekly")).toBe("weekly");
+    expect(gaugeColumn("7d")).toBe("weekly");
   });
-  it("expanded non-active becomes full", () => {
-    expect(layoutAccounts(accts, ["c"]).map((x) => x.mode)).toEqual(["full", "compact", "full"]);
+  it("maps any fable key to the fable column", () => {
+    expect(gaugeColumn("weekly-fable")).toBe("fable");
+    expect(gaugeColumn("weekly_Fable_x")).toBe("fable");
   });
-  it("ignores unknown expanded ids", () => {
-    expect(layoutAccounts(accts, ["zzz"]).map((x) => x.mode)).toEqual(["full", "compact", "compact"]);
-  });
-});
-
-describe("toggleExpanded", () => {
-  it("adds then removes without mutating", () => {
-    const base: string[] = [];
-    const added = toggleExpanded(base, "b");
-    expect(added).toEqual(["b"]);
-    expect(base).toEqual([]);
-    expect(toggleExpanded(added, "b")).toEqual([]);
-  });
-});
-
-describe("worstGauge", () => {
-  it("empty list gives null", () => expect(worstGauge([])).toBeNull());
-  it("picks the highest pct", () => {
-    expect(worstGauge([{ key: "session", pct: 10 }, { key: "weekly", pct: 72 }, { key: "x", pct: 5 }])).toEqual({ key: "weekly", pct: 72 });
-  });
-});
-
-describe("gaugeShort", () => {
-  it("maps known keys", () => {
-    expect(gaugeShort("session")).toBe("S");
-    expect(gaugeShort("weekly")).toBe("W");
-    expect(gaugeShort("weekly-fable")).toBe("F");
-    expect(gaugeShort("weekly_fable_opus")).toBe("F");
-  });
-  it("falls back to the upper-cased first letter", () => expect(gaugeShort("opus")).toBe("O"));
-});
-
-describe("compact row reset countdown", () => {
-  it("renders the same fmtLeft(resetMs) text as the full bar, only when a reset exists", () => {
-    const src = readFileSync("src/extension.ts", "utf8");
-    expect(src).toContain("(g.resetMs ? '<span class=\"cr num\">'+fmtLeft(g.resetMs)+'</span>' : '')");
-    expect(src).toContain("(g.resetMs?fmtLeft(g.resetMs):'')");
+  it("leaves other model-scoped weeklies out of the grid", () => {
+    expect(gaugeColumn("weekly-opus")).toBeNull();
+    expect(gaugeColumn("")).toBeNull();
   });
 });

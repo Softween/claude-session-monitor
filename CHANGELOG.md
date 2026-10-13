@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.12.0
+- Back to the original card layout: one row per gauge with the long bar, percent and reset time; cards are tighter so eight accounts still fit.
+
 ## 2.11.1
 - Grid bars back to the thin 2.10 style (4 px, plain fill, red only at 90%+); the rest of the 2.11.0 layout stays.
 

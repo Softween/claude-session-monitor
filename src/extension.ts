@@ -926,7 +926,7 @@ function limitsHtml(): string {
   .card { padding:10px 0 12px; border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
   .card:first-child { padding-top:2px; border-top:0; }
   .chead { display:flex; align-items:baseline; gap:6px; margin-bottom:7px; min-width:0; }
-  .bar { display:grid; grid-template-columns: 92px minmax(0,1fr) 40px 56px; column-gap:10px; align-items:center; margin:5px 0; }
+  .bar { display:grid; grid-template-columns: 92px minmax(0,1fr) 40px 56px; column-gap:10px; align-items:center; margin:3px 0; }
   .bar .l { font-size:11px; color: var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .bar .t { height:4px; border-radius:2px; overflow:hidden; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
   .bar .t i { display:block; height:100%; border-radius:2px; background: var(--vscode-foreground); opacity:.5; }
@@ -939,34 +939,8 @@ function limitsHtml(): string {
   .ctitle.sw { cursor:pointer; }
   .ctitle.sw:hover { text-decoration:underline; }
   .best { color: var(--vscode-charts-yellow, #e6b800); font-size:11px; }
-  .agrid { display:grid; grid-template-columns: minmax(150px,1.8fr) repeat(3, minmax(88px,1fr)); column-gap:0; align-items:center; }
-  .agrid > *, .arow > * { min-width:0; }
-  .ahead { font-size:10px; text-transform:uppercase; letter-spacing:.06em; color: var(--vscode-descriptionForeground); padding:2px 6px 5px; border-bottom:1px solid color-mix(in srgb, var(--vscode-foreground) 10%, transparent); }
-  .arow { display:contents; }
-  .arow > * { padding:8px 6px; border-top:1px solid color-mix(in srgb, var(--vscode-foreground) 10%, transparent); align-self:stretch; display:flex; flex-direction:column; justify-content:center; }
-  .ahead + .arow > *, .ahead ~ .arow:first-of-type > * { border-top:0; }
-  .arow.act > * { background: color-mix(in srgb, var(--vscode-list-activeSelectionBackground) 18%, transparent); }
-  .arow.act > :first-child { box-shadow: inset 3px 0 0 var(--vscode-charts-green, #4caf50); border-radius:4px 0 0 4px; }
-  .arow.act > :last-child { border-radius:0 4px 4px 0; }
-  .aline { display:flex; min-width:0; }
-  .aline .ctitle { font-size:13px; font-weight:600; min-width:0; }
-  .asub { display:flex; align-items:center; gap:5px; margin-top:1px; font-size:11px; color: var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; }
-  .asub .cplan { overflow:hidden; text-overflow:ellipsis; }
-  .asub .best, .asub .cwarn, .asub .clogin, .asub .adot { flex:none; }
   .cwarn { color: var(--vscode-charts-yellow, #e6b800); font-size:11px; cursor:help; }
   .clogin { color: var(--vscode-charts-red, #f14c4c); font-size:10px; font-weight:600; }
-  .gcell .t { height:4px; border-radius:2px; overflow:hidden; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
-  .gcell .t i { display:block; height:100%; border-radius:2px; background: var(--vscode-foreground); opacity:.5; }
-  .gcell .t i.bad { background: var(--vscode-charts-red, #f14c4c); opacity:1; }
-  .gcell .gl { display:flex; justify-content:space-between; align-items:baseline; margin-top:4px; gap:4px; }
-  .gcell .gp { font-size:13px; font-weight:600; font-variant-numeric: tabular-nums; }
-  .gcell .gr { font-size:11px; white-space:nowrap; font-variant-numeric: tabular-nums; color: var(--vscode-descriptionForeground); }
-  .gnone { align-items:center; color: var(--vscode-descriptionForeground); }
-  .note.dim { opacity:.75; }
-  .hs { }
-  @media (max-width: 360px) {
-    .agrid { grid-template-columns: minmax(120px,1.5fr) repeat(3, minmax(88px,1fr)); }
-    .hs { display:none; }
   }
   .rot { display:flex; justify-content:flex-end; margin:0 0 2px; }
   .rot + .card { padding-top:2px; border-top:0; }
@@ -1076,58 +1050,38 @@ function tokenFoot(t, multiAcct){
     + '<span class="num">5h '+fmtTokens(t.fiveHour)+' · 7d '+fmtTokens(t.sevenDay)+'</span></div>';
 }
 function nameSpan(card, name){
-  if(card.provider==='claude' && card.accountId && !card.active)
-    return '<span class="ctitle sw" role="button" tabindex="0" data-switch="'+esc(card.accountId)+'" title="Switch Claude Code to this account">'+esc(name)+'</span>';
-  return '<span class="ctitle">'+esc(name)+'</span>';
+  const canSwitch = card.provider==='claude' && !!card.accountId && !card.active;
+  return canSwitch
+    ? '<span class="ctitle sw" role="button" tabindex="0" data-switch="'+esc(card.accountId)+'" title="Switch Claude Code to this account">'+esc(name)+'</span>'
+    : '<span class="ctitle" title="'+esc(card.label)+'">'+esc(name)+'</span>';
 }
-// Fallback for cards the extension did not decorate (single-account payload).
-function colsFromGauges(gs){
-  const cols = {};
-  for(const g of (gs||[])){
-    const k = String(g.key||'').toLowerCase();
-    const c = /fable/.test(k) ? 'fable' : (k==='session'||k==='5h'||k==='primary') ? 'session' : (k==='weekly'||k==='7d'||k==='secondary') ? 'weekly' : null;
-    if(c && !cols[c]) cols[c] = g;
-  }
-  return cols;
+function gaugeRow(g){
+  const p = g.pct, spent = p!=null && p>=90;
+  return '<div class="bar"><span class="l" title="'+esc(g.label)+'">'+esc(gaugeLabel(g.label))+'</span>'
+    + '<span class="t"><i'+(spent?' class="bad"':'')+' style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%"></i></span>'
+    + '<span class="p num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
+    + '<span class="r num">'+(g.resetMs?fmtLeft(g.resetMs).replace('resets now','now'):'')+'</span></div>';
 }
-// Fill colour: same thresholds as color(), calm accent below 70%.
-function gaugeCell(g, label){
-  if(!g) return '<div class="gcell gnone" title="'+label+'">—</div>';
-  const p = g.pct;
-  return '<div class="gcell" title="'+esc(g.label||label)+'"><div class="t"><i'+(p!=null&&p>=90?' class="bad"':'')+' style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%"></i></div>'
-    + '<div class="gl"><span class="gp num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
-    + (g.resetMs ? '<span class="gr num">'+fmtLeft(g.resetMs).replace('resets now','now')+'</span>' : '') + '</div></div>';
-}
-function gridRow(card){
+// One card per account: header line, then the original one-row-per-gauge bars.
+function providerCard(card){
+  const age = card.ts ? Math.max(0, Math.round(Date.now()/1000 - card.ts)) : null;
   const name = card.label.replace(/^(Claude|Codex) · /,'');
-  const cols = card.official ? (card.cols || colsFromGauges(card.gauges)) : {};
-  return '<div class="arow'+(card.provider==='claude' && card.active ? ' act' : '')+'" data-testid="csm-account-row">'
-    + '<div class="acell"><div class="aline">' + nameSpan(card, name) + '</div><div class="asub">'
-    + (card.plan ? '<span class="cplan">'+esc(card.plan)+'</span>' : '')
-    + (card.provider==='claude' && card.active ? '<span class="adot" title="active login"></span>' : '')
+  let h='<div class="card" data-testid="csm-account-row"><div class="chead">'
+    + nameSpan(card, name)
     + (card.best ? '<span class="best" title="most headroom">★</span>' : '')
-    + (card.note ? '<span class="cwarn" title="'+esc(card.note)+'">⚠</span>' : '')
+    + (card.provider==='claude' && card.active ? '<span class="adot" title="active login"></span>' : '')
     + (card.note && card.loginNeeded ? '<span class="clogin">login</span>' : '')
-    + '</div></div>'
-    + gaugeCell(cols.session, 'Session') + gaugeCell(cols.weekly, 'Weekly') + gaugeCell(cols.fable, 'Fable')
+    + (card.plan ? '<span class="cplan">'+esc(card.plan)+'</span>' : '')
+    + (age!=null && age>600 ? '<span class="cage num" title="last official usage fetch">'+fmtAge(age)+' ago</span>' : '')
     + '</div>';
-}
-function accountGrid(cards){
-  let h = '<div class="agrid"><div class="ahead">Account</div><div class="ahead">Session<span class="hs"> · 5h</span></div><div class="ahead">Weekly<span class="hs"> · 7d</span></div><div class="ahead">Fable<span class="hs"> · 7d</span></div>';
-  for(const c of cards) h += gridRow(c);
-  return h + '</div>';
-}
-// Only the active login's notes are spelled out; other accounts keep theirs in the ⚠ tooltip.
-function gridNotes(cards){
-  let h = '';
-  for(const c of cards){
-    if(!(c.provider==='claude' && c.active)) continue;
-    const name = c.label.replace(/^(Claude|Codex) · /,'');
-    if(c.official && (c.gauges||[]).some(g=>g.key==='session'||g.key==='5h')) h += etaLine(last.eta);
-    if(c.note) h += '<div class="note'+(/rate-limited/.test(c.note)?' dim':'')+'"><b>'+esc(name)+'</b> · '+esc(c.note)+'</div>';
-    else if(!c.official) h += '<div class="note"><b>'+esc(name)+'</b> · official usage is unavailable; session state remains available.</div>';
+  const gauges = card.official ? (card.gauges||[]) : [];
+  if(gauges.length){
+    h += gauges.map(gaugeRow).join('');
+    if(card.provider==='claude' && card.active && gauges.some(g=>g.key==='session'||g.key==='5h')) h += etaLine(last.eta);
   }
-  return h;
+  if(card.note) h += '<div class="note">'+esc(card.note)+'</div>';
+  else if(!card.official) h += '<div class="note">Official '+esc(card.label)+' usage is unavailable. Session state remains available.</div>';
+  return h+'</div>';
 }
 function render(){
   const root = document.getElementById('root');
@@ -1138,7 +1092,7 @@ function render(){
     note:last.usageNote||last.accountNote||null, sevenDayTokens:null, lifetimeTokens:null
   }];
   if(last.accounts && last.accounts.length > 1) h += '<div class="rot"><button type="button" class="rotbtn" data-rotate="1" title="Switch Claude Code to the account with the most headroom">Rotate ▸</button></div>';
-  h += accountGrid(cards) + gridNotes(cards);
+  for(const c of cards) h += providerCard(c);
   if(cards.some(c=>c.provider==='claude')){
     const multiAcct = !!(last.accounts && last.accounts.length > 1);
     h += tokenFoot(last.tokens, multiAcct);

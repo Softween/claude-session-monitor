@@ -41,7 +41,7 @@ function mount(): Harness {
 const gauge = (key: string, label: string, pct: number) => ({ key, label, pct, resetMs: Date.now() + 3_600_000 });
 
 describe("Usage Limits webview", () => {
-  it("renders one grid row per account with badges, notes and empty cells", () => {
+  it("renders one card per account with a bar row per gauge, badges and notes", () => {
     const h = mount();
     const session = gauge("session", "Session (5h)", 30);
     const fable = gauge("weekly-fable", "Weekly · Fable", 42);
@@ -59,15 +59,14 @@ describe("Usage Limits webview", () => {
       ],
     });
     const html = h.root.innerHTML;
-    expect(html.match(/class="arow/g)).toHaveLength(3);
-    expect(html).toContain('class="arow act');
+    expect(html.match(/class="card"/g)).toHaveLength(3);
+    expect((html.match(/class="bar"/g) ?? []).length).toBeGreaterThanOrEqual(5);
     expect(html).toContain("one@example.com");
     expect(html).toContain("two@example.com");
     expect(html).toContain('class="clogin">login');
-    expect(html).toContain("gnone");
+    expect(html).toContain('class="adot"');
     expect(html).toContain("42%");
     expect(html).toContain("13%");
-    expect(html).toMatch(/Account/i);
     expect(html).toContain("rate-limited");
     expect(html).toContain("Rotate");
   });

@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.11.0
+
+- Usage Limits grid redesign: name on its own line with plan and badges beneath, 6px bars with pressure colours, full-width active-row highlight with a green accent, narrow-panel header and column rules.
+- Regression test runs the real webview script in a vm so a missing function can no longer ship unnoticed.
+
 ## 2.9.2
 
 - Usage Limits: Team and Enterprise logins are labelled "Team" / "Enterprise" instead of "$100 Max". Their seats carry a Max-style `rateLimitTier`, so the plan now comes from `subscriptionType` for those plans.

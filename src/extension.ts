@@ -939,28 +939,34 @@ function limitsHtml(): string {
   .ctitle.sw { cursor:pointer; }
   .ctitle.sw:hover { text-decoration:underline; }
   .best { color: var(--vscode-charts-yellow, #e6b800); font-size:11px; }
-  .agrid { display:grid; grid-template-columns: minmax(96px,1.3fr) repeat(3, minmax(64px,1fr)); column-gap:8px; align-items:center; }
-  .agrid > * { min-width:0; }
-.ahead { font-size:10px; letter-spacing:.04em; text-transform:uppercase; color:var(--vscode-descriptionForeground); padding:2px 0 4px; }
-  .ghead { font-size:10px; text-transform:uppercase; letter-spacing:.04em; color: var(--vscode-descriptionForeground); padding:2px 0 4px; }
+  .agrid { display:grid; grid-template-columns: minmax(150px,1.8fr) repeat(3, minmax(88px,1fr)); column-gap:0; align-items:center; }
+  .agrid > *, .arow > * { min-width:0; }
+  .ahead { font-size:10px; text-transform:uppercase; letter-spacing:.06em; color: var(--vscode-descriptionForeground); padding:2px 6px 5px; border-bottom:1px solid color-mix(in srgb, var(--vscode-foreground) 10%, transparent); }
   .arow { display:contents; }
-  .arow > * { padding:5px 0; border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
-  .arow.act > * { background: var(--vscode-list-hoverBackground); }
-  .acell { display:flex; flex-direction:column; min-width:0; }
-  .aline { display:flex; align-items:baseline; gap:4px; min-width:0; }
-  .aline .ctitle { flex:0 1 auto; min-width:0; }
-  .aline .best, .aline .cwarn, .aline .clogin { flex:none; }
+  .arow > * { padding:8px 6px; border-top:1px solid color-mix(in srgb, var(--vscode-foreground) 10%, transparent); align-self:stretch; display:flex; flex-direction:column; justify-content:center; }
+  .ahead + .arow > *, .ahead ~ .arow:first-of-type > * { border-top:0; }
+  .arow.act > * { background: color-mix(in srgb, var(--vscode-list-activeSelectionBackground) 18%, transparent); }
+  .arow.act > :first-child { box-shadow: inset 3px 0 0 var(--vscode-charts-green, #4caf50); border-radius:4px 0 0 4px; }
+  .arow.act > :last-child { border-radius:0 4px 4px 0; }
+  .aline { display:flex; min-width:0; }
+  .aline .ctitle { font-size:13px; font-weight:600; min-width:0; }
+  .asub { display:flex; align-items:center; gap:5px; margin-top:1px; font-size:11px; color: var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; }
+  .asub .cplan { overflow:hidden; text-overflow:ellipsis; }
+  .asub .best, .asub .cwarn, .asub .clogin, .asub .adot { flex:none; }
   .cwarn { color: var(--vscode-charts-yellow, #e6b800); font-size:11px; cursor:help; }
   .clogin { color: var(--vscode-charts-red, #f14c4c); font-size:10px; font-weight:600; }
-  .asub { font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .gcell .t { height:4px; border-radius:2px; overflow:hidden; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
-  .gcell .t i { display:block; height:100%; border-radius:2px; background: var(--vscode-foreground); opacity:.5; }
-  .gcell .t i.bad { background: var(--vscode-charts-red, #f14c4c); opacity:1; }
-  .gcell .gl { display:flex; justify-content:space-between; align-items:baseline; margin-top:3px; gap:4px; }
-  .gcell .gp { font-weight:600; }
-  .gcell .gr { font-size:10px; white-space:nowrap; color: var(--vscode-descriptionForeground); }
-  .gnone { text-align:center; color: var(--vscode-descriptionForeground); }
-  .gnote { margin-top:4px; }
+  .gcell .t { height:6px; border-radius:3px; overflow:hidden; background: color-mix(in srgb, var(--vscode-foreground) 12%, transparent); }
+  .gcell .t i { display:block; height:100%; border-radius:3px; }
+  .gcell .gl { display:flex; justify-content:space-between; align-items:baseline; margin-top:4px; gap:4px; }
+  .gcell .gp { font-size:13px; font-weight:600; font-variant-numeric: tabular-nums; }
+  .gcell .gr { font-size:11px; white-space:nowrap; font-variant-numeric: tabular-nums; color: var(--vscode-descriptionForeground); }
+  .gnone { align-items:center; color: var(--vscode-descriptionForeground); }
+  .note.dim { opacity:.75; }
+  .hs { }
+  @media (max-width: 360px) {
+    .agrid { grid-template-columns: minmax(120px,1.5fr) repeat(3, minmax(88px,1fr)); }
+    .hs { display:none; }
+  }
   .rot { display:flex; justify-content:flex-end; margin:0 0 2px; }
   .rot + .card { padding-top:2px; border-top:0; }
   .rotbtn { border:0; background:transparent; color: var(--vscode-textLink-foreground); font:inherit; font-size:11px; cursor:pointer; padding:0; }
@@ -1083,28 +1089,31 @@ function colsFromGauges(gs){
   }
   return cols;
 }
+// Fill colour: same thresholds as color(), calm accent below 70%.
+function fillColor(p){ return p!=null && p>=90 ? C_BAD : p!=null && p>=70 ? C_WARN : 'var(--vscode-progressBar-background)'; }
 function gaugeCell(g, label){
   if(!g) return '<div class="gcell gnone" title="'+label+'">—</div>';
   const p = g.pct;
-  return '<div class="gcell" title="'+esc(g.label||label)+'"><div class="t"><i'+(p!=null&&p>=90?' class="bad"':'')+' style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%"></i></div>'
+  return '<div class="gcell" title="'+esc(g.label||label)+'"><div class="t"><i style="background:'+fillColor(p)+';width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%"></i></div>'
     + '<div class="gl"><span class="gp num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
-    + (g.resetMs ? '<span class="gr num">'+fmtLeft(g.resetMs)+'</span>' : '') + '</div></div>';
+    + (g.resetMs ? '<span class="gr num">'+fmtLeft(g.resetMs).replace('resets now','now')+'</span>' : '') + '</div></div>';
 }
 function gridRow(card){
   const name = card.label.replace(/^(Claude|Codex) · /,'');
   const cols = card.official ? (card.cols || colsFromGauges(card.gauges)) : {};
   return '<div class="arow'+(card.provider==='claude' && card.active ? ' act' : '')+'" data-testid="csm-account-row">'
-    + '<div class="acell"><div class="aline">' + nameSpan(card, name)
-    + (card.best ? '<span class="best" title="most headroom">★</span>' : '')
+    + '<div class="acell"><div class="aline">' + nameSpan(card, name) + '</div><div class="asub">'
+    + (card.plan ? '<span class="cplan">'+esc(card.plan)+'</span>' : '')
     + (card.provider==='claude' && card.active ? '<span class="adot" title="active login"></span>' : '')
+    + (card.best ? '<span class="best" title="most headroom">★</span>' : '')
     + (card.note ? '<span class="cwarn" title="'+esc(card.note)+'">⚠</span>' : '')
     + (card.note && card.loginNeeded ? '<span class="clogin">login</span>' : '')
-    + '</div>' + (card.plan ? '<div class="asub">'+esc(card.plan)+'</div>' : '') + '</div>'
+    + '</div></div>'
     + gaugeCell(cols.session, 'Session') + gaugeCell(cols.weekly, 'Weekly') + gaugeCell(cols.fable, 'Fable')
     + '</div>';
 }
 function accountGrid(cards){
-  let h = '<div class="agrid"><div class="ahead">Account</div><div class="ahead">Session</div><div class="ahead">Weekly</div><div class="ahead">Fable</div>';
+  let h = '<div class="agrid"><div class="ahead">Account</div><div class="ahead">Session<span class="hs"> · 5h</span></div><div class="ahead">Weekly<span class="hs"> · 7d</span></div><div class="ahead">Fable<span class="hs"> · 7d</span></div>';
   for(const c of cards) h += gridRow(c);
   return h + '</div>';
 }
@@ -1115,7 +1124,7 @@ function gridNotes(cards){
     if(!(c.provider==='claude' && c.active)) continue;
     const name = c.label.replace(/^(Claude|Codex) · /,'');
     if(c.official && (c.gauges||[]).some(g=>g.key==='session'||g.key==='5h')) h += etaLine(last.eta);
-    if(c.note) h += '<div class="note"><b>'+esc(name)+'</b> · '+esc(c.note)+'</div>';
+    if(c.note) h += '<div class="note'+(/rate-limited/.test(c.note)?' dim':'')+'"><b>'+esc(name)+'</b> · '+esc(c.note)+'</div>';
     else if(!c.official) h += '<div class="note"><b>'+esc(name)+'</b> · official usage is unavailable; session state remains available.</div>';
   }
   return h;

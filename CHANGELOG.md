@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.11.1
+- Grid bars back to the thin 2.10 style (4 px, plain fill, red only at 90%+); the rest of the 2.11.0 layout stays.
+
 ## 2.11.0
 
 - Usage Limits grid redesign: name on its own line with plan and badges beneath, 6px bars with pressure colours, full-width active-row highlight with a green accent, narrow-panel header and column rules.

@@ -955,8 +955,9 @@ function limitsHtml(): string {
   .asub .best, .asub .cwarn, .asub .clogin, .asub .adot { flex:none; }
   .cwarn { color: var(--vscode-charts-yellow, #e6b800); font-size:11px; cursor:help; }
   .clogin { color: var(--vscode-charts-red, #f14c4c); font-size:10px; font-weight:600; }
-  .gcell .t { height:6px; border-radius:3px; overflow:hidden; background: color-mix(in srgb, var(--vscode-foreground) 12%, transparent); }
-  .gcell .t i { display:block; height:100%; border-radius:3px; }
+  .gcell .t { height:4px; border-radius:2px; overflow:hidden; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
+  .gcell .t i { display:block; height:100%; border-radius:2px; background: var(--vscode-foreground); opacity:.5; }
+  .gcell .t i.bad { background: var(--vscode-charts-red, #f14c4c); opacity:1; }
   .gcell .gl { display:flex; justify-content:space-between; align-items:baseline; margin-top:4px; gap:4px; }
   .gcell .gp { font-size:13px; font-weight:600; font-variant-numeric: tabular-nums; }
   .gcell .gr { font-size:11px; white-space:nowrap; font-variant-numeric: tabular-nums; color: var(--vscode-descriptionForeground); }
@@ -1090,11 +1091,10 @@ function colsFromGauges(gs){
   return cols;
 }
 // Fill colour: same thresholds as color(), calm accent below 70%.
-function fillColor(p){ return p!=null && p>=90 ? C_BAD : p!=null && p>=70 ? C_WARN : 'var(--vscode-progressBar-background)'; }
 function gaugeCell(g, label){
   if(!g) return '<div class="gcell gnone" title="'+label+'">—</div>';
   const p = g.pct;
-  return '<div class="gcell" title="'+esc(g.label||label)+'"><div class="t"><i style="background:'+fillColor(p)+';width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%"></i></div>'
+  return '<div class="gcell" title="'+esc(g.label||label)+'"><div class="t"><i'+(p!=null&&p>=90?' class="bad"':'')+' style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%"></i></div>'
     + '<div class="gl"><span class="gp num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
     + (g.resetMs ? '<span class="gr num">'+fmtLeft(g.resetMs).replace('resets now','now')+'</span>' : '') + '</div></div>';
 }

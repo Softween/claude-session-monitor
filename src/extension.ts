@@ -941,6 +941,7 @@ function limitsHtml(): string {
   .best { color: var(--vscode-charts-yellow, #e6b800); font-size:11px; }
   .agrid { display:grid; grid-template-columns: minmax(96px,1.3fr) repeat(3, minmax(64px,1fr)); column-gap:8px; align-items:center; }
   .agrid > * { min-width:0; }
+.ahead { font-size:10px; letter-spacing:.04em; text-transform:uppercase; color:var(--vscode-descriptionForeground); padding:2px 0 4px; }
   .ghead { font-size:10px; text-transform:uppercase; letter-spacing:.04em; color: var(--vscode-descriptionForeground); padding:2px 0 4px; }
   .arow { display:contents; }
   .arow > * { padding:5px 0; border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
@@ -1066,6 +1067,58 @@ function tokenFoot(t, multiAcct){
   if(!t) return '';
   return '<div class="foot"><span title="in + out + cache-write'+(multiAcct?', all logins on this Mac':'')+'">Tokens'+(multiAcct?', all logins':'')+'</span>'
     + '<span class="num">5h '+fmtTokens(t.fiveHour)+' · 7d '+fmtTokens(t.sevenDay)+'</span></div>';
+}
+function nameSpan(card, name){
+  if(card.provider==='claude' && card.accountId && !card.active)
+    return '<span class="ctitle sw" role="button" tabindex="0" data-switch="'+esc(card.accountId)+'" title="Switch Claude Code to this account">'+esc(name)+'</span>';
+  return '<span class="ctitle">'+esc(name)+'</span>';
+}
+// Fallback for cards the extension did not decorate (single-account payload).
+function colsFromGauges(gs){
+  const cols = {};
+  for(const g of (gs||[])){
+    const k = String(g.key||'').toLowerCase();
+    const c = /fable/.test(k) ? 'fable' : (k==='session'||k==='5h'||k==='primary') ? 'session' : (k==='weekly'||k==='7d'||k==='secondary') ? 'weekly' : null;
+    if(c && !cols[c]) cols[c] = g;
+  }
+  return cols;
+}
+function gaugeCell(g, label){
+  if(!g) return '<div class="gcell gnone" title="'+label+'">—</div>';
+  const p = g.pct;
+  return '<div class="gcell" title="'+esc(g.label||label)+'"><div class="t"><i'+(p!=null&&p>=90?' class="bad"':'')+' style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%"></i></div>'
+    + '<div class="gl"><span class="gp num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
+    + (g.resetMs ? '<span class="gr num">'+fmtLeft(g.resetMs)+'</span>' : '') + '</div></div>';
+}
+function gridRow(card){
+  const name = card.label.replace(/^(Claude|Codex) · /,'');
+  const cols = card.official ? (card.cols || colsFromGauges(card.gauges)) : {};
+  return '<div class="arow'+(card.provider==='claude' && card.active ? ' act' : '')+'" data-testid="csm-account-row">'
+    + '<div class="acell"><div class="aline">' + nameSpan(card, name)
+    + (card.best ? '<span class="best" title="most headroom">★</span>' : '')
+    + (card.provider==='claude' && card.active ? '<span class="adot" title="active login"></span>' : '')
+    + (card.note ? '<span class="cwarn" title="'+esc(card.note)+'">⚠</span>' : '')
+    + (card.note && card.loginNeeded ? '<span class="clogin">login</span>' : '')
+    + '</div>' + (card.plan ? '<div class="asub">'+esc(card.plan)+'</div>' : '') + '</div>'
+    + gaugeCell(cols.session, 'Session') + gaugeCell(cols.weekly, 'Weekly') + gaugeCell(cols.fable, 'Fable')
+    + '</div>';
+}
+function accountGrid(cards){
+  let h = '<div class="agrid"><div class="ahead">Account</div><div class="ahead">Session</div><div class="ahead">Weekly</div><div class="ahead">Fable</div>';
+  for(const c of cards) h += gridRow(c);
+  return h + '</div>';
+}
+// Only the active login's notes are spelled out; other accounts keep theirs in the ⚠ tooltip.
+function gridNotes(cards){
+  let h = '';
+  for(const c of cards){
+    if(!(c.provider==='claude' && c.active)) continue;
+    const name = c.label.replace(/^(Claude|Codex) · /,'');
+    if(c.official && (c.gauges||[]).some(g=>g.key==='session'||g.key==='5h')) h += etaLine(last.eta);
+    if(c.note) h += '<div class="note"><b>'+esc(name)+'</b> · '+esc(c.note)+'</div>';
+    else if(!c.official) h += '<div class="note"><b>'+esc(name)+'</b> · official usage is unavailable; session state remains available.</div>';
+  }
+  return h;
 }
 function render(){
   const root = document.getElementById('root');

@@ -8,6 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 - Usage Limits: Team and Enterprise logins are labelled "Team" / "Enterprise" instead of "$100 Max". Their seats carry a Max-style `rateLimitTier`, so the plan now comes from `subscriptionType` for those plans.
 
+## 2.10.1
+- Fix: the Usage Limits grid never rendered (its render helpers were missing from the webview script), leaving the panel on "Waiting for usage-limit data".
+
 ## 2.10.0
 
 ### Changed

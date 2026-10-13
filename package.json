@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.10.0",
+  "version": "2.10.1",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -148,15 +148,15 @@
       },
       {
         "command": "claudeSessionMonitor.setModelAll",
-        "title": "Agent Sessions: Set Model for All Claude Sessions\u2026",
+        "title": "Agent Sessions: Set Model for All Claude Sessions…",
         "icon": "$(chip)",
-        "shortTitle": "Set Model (All)\u2026"
+        "shortTitle": "Set Model (All)…"
       },
       {
         "command": "claudeSessionMonitor.setEffortAll",
-        "title": "Agent Sessions: Set Effort for All Claude Sessions\u2026",
+        "title": "Agent Sessions: Set Effort for All Claude Sessions…",
         "icon": "$(dashboard)",
-        "shortTitle": "Set Effort (All)\u2026"
+        "shortTitle": "Set Effort (All)…"
       },
       {
         "command": "claudeSessionMonitor.dumpTabs",
@@ -338,7 +338,9 @@
         "claudeSessionMonitor.planLabels": {
           "type": "object",
           "default": {},
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": {
+            "type": "string"
+          },
           "markdownDescription": "Plan label shown on each usage card, keyed by Claude account email, or `claude` / `codex` for the provider card. Example: `{ \"me@example.com\": \"$200 Max\", \"codex\": \"$100 Pro Lite\" }`. When a key is missing the label is derived from the login's rate-limit tier (Claude keychain `rateLimitTier`, Codex `planType`) and left blank if unknown."
         },
         "claudeSessionMonitor.usageWarnPercent": {

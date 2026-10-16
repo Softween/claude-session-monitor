@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import vm from "node:vm";
+import { allBadges, renderSwitchBlock, type SwitchPanel } from "../src/switchPanel";
 
 function webviewScript(): string {
   const src = readFileSync(join(__dirname, "..", "src", "extension.ts"), "utf8");
@@ -76,5 +77,31 @@ describe("Usage Limits webview", () => {
     h.send({ type: "update", ts: Date.now() / 1000, official: true, gauges: [gauge("session", "Session (5h)", 12)], usageNote: null });
     expect(h.root.innerHTML).toContain("12%");
     expect(h.root.innerHTML).toContain("csm-account-row");
+  });
+
+  it("injects the claude-switch block above the cards and badges the matching account", () => {
+    const h = mount();
+    const now = Date.now();
+    const panel: SwitchPanel = {
+      v: 1, ts: now / 1000, active: { email: "one@example.com" }, priority: ["two@example.com", "one@example.com"],
+      paused: false, breaker: { count: 1, max: 4 }, nextHint: "hold",
+      accounts: [{ email: "two@example.com", rank: 1, needsLogin: true, needsLoginReason: "refresh revoked" }],
+      events: [{ ts: now / 1000, kind: "switch", text: "a -> b (auto)" }],
+    };
+    const session = gauge("session", "Session (5h)", 30);
+    h.send({
+      type: "update", ts: now / 1000, official: true, accounts: [], eta: null, tokens: null, models: [],
+      switchHtml: renderSwitchBlock(panel, now), switchBadges: allBadges(panel),
+      providers: [
+        { id: "c:a", provider: "claude", label: "Claude · one@example.com", active: true, official: true, ts: now / 1000, note: null, gauges: [session] },
+        { id: "c:b", provider: "claude", label: "Claude · two@example.com", active: false, official: true, ts: now / 1000, note: null, gauges: [session] },
+      ],
+    });
+    const html = h.root.innerHTML;
+    expect(html.indexOf("claude-switch")).toBeLessThan(html.indexOf("one@example.com</span>"));
+    expect(html).toContain("a -&gt; b (auto)");
+    expect(html).toContain("#2</span>");
+    expect(html).toContain("#1</span>");
+    expect(html).toContain("login needed (refresh revoked)");
   });
 });

@@ -17,6 +17,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, readPanel, renderSwitchBlock } from "./switchPanel";
 import { gaugeColumn } from "./compact";
 import { execFile } from "child_process";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
@@ -541,6 +542,8 @@ interface LimitsPayload {
   accountNote: string | null; // honesty note when a non-active account is displayed
   usageNote: string | null; // honest status when the usage API is degraded
   providers: UsageProviderCard[];
+  switchHtml?: string; // claude-switch block, rendered host-side by switchPanel.ts
+  switchBadges?: Record<string, { rank?: number; loginNeeded?: string }>; // by account email
 }
 
 // ---------------------------------------------------------------------------
@@ -942,6 +945,11 @@ function limitsHtml(): string {
   .ctitle.sw:hover { text-decoration:underline; }
   .best { color: var(--vscode-charts-yellow, #e6b800); font-size:11px; }
   .cwarn { color: var(--vscode-charts-yellow, #e6b800); font-size:11px; cursor:help; }
+  .swblock { padding:0 0 8px; margin-bottom:2px; border-bottom:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
+  .swline { font-size:11px; line-height:1.45; overflow-wrap:anywhere; }
+  .swline.sw-hint, .swline.sw-info { color: var(--vscode-descriptionForeground); }
+  .swline.sw-error, .swline.sw-needsLogin { color: var(--vscode-descriptionForeground); }
+  .swrank { color: var(--vscode-descriptionForeground); font-size:11px; }
   .clogin { color: var(--vscode-charts-red, #f14c4c); font-size:10px; font-weight:600; }
   }
   .rot { display:flex; justify-content:flex-end; margin:0 0 2px; }
@@ -1068,11 +1076,14 @@ function gaugeRow(g){
 function providerCard(card){
   const age = card.ts ? Math.max(0, Math.round(Date.now()/1000 - card.ts)) : null;
   const name = card.label.replace(/^(Claude|Codex) · /,'');
+  const sb = (card.provider==='claude' && last.switchBadges && last.switchBadges[name]) || {};
   let h='<div class="card" data-testid="csm-account-row"><div class="chead">'
     + nameSpan(card, name)
+    + (sb.rank ? '<span class="swrank num" title="claude-switch priority">#'+sb.rank+'</span>' : '')
     + (card.best ? '<span class="best" title="most headroom">★</span>' : '')
     + (card.provider==='claude' && card.active ? '<span class="adot" title="active login"></span>' : '')
     + (card.note && card.loginNeeded ? '<span class="clogin">login</span>' : '')
+    + (sb.loginNeeded ? '<span class="clogin" title="claude-switch">login needed ('+esc(sb.loginNeeded)+')</span>' : '')
     + (card.plan ? '<span class="cplan">'+esc(card.plan)+'</span>' : '')
     + (age!=null && age>600 ? '<span class="cage num" title="last official usage fetch">'+fmtAge(age)+' ago</span>' : '')
     + '</div>';
@@ -1088,7 +1099,7 @@ function providerCard(card){
 function render(){
   const root = document.getElementById('root');
   if(!last){ return; }
-  let h='';
+  let h = last.switchHtml || '';
   const cards = (last.providers && last.providers.length) ? last.providers : [{
     id:'claude', provider:'claude', label:'Claude', active:true, ts:last.ts, official:last.official, gauges:last.gauges||[],
     note:last.usageNote||last.accountNote||null, sevenDayTokens:null, lifetimeTokens:null
@@ -2187,7 +2198,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
           enabledProviders(),
           planLabels(),
       );
-      limitsView.update({ ...payload, providers: decorateCards(payload.providers) });
+      const panel = readPanel();
+      limitsView.update({
+        ...payload,
+        providers: decorateCards(payload.providers),
+        switchHtml: renderSwitchBlock(panel, Date.now()),
+        switchBadges: allBadges(panel),
+      });
       updateStatusBar(
         statusBar,
         lastAllViews,
@@ -2819,6 +2836,17 @@ export function activate(ctx: vscode.ExtensionContext): void {
     } catch {
       /* polling still covers it */
     }
+  }
+  try {
+    const debouncedPanel = debounce(pushUsagePayload, 1000);
+    ctx.subscriptions.push({ dispose: () => debouncedPanel.cancel() });
+    const w3 = fs.watch(SWITCH_STATE_DIR, (_ev, name) => {
+      if (!name || name === path.basename(SWITCH_PANEL_FILE)) debouncedPanel();
+    });
+    w3.on("error", () => {});
+    ctx.subscriptions.push({ dispose: () => w3.close() });
+  } catch {
+    /* state dir absent; the poll-driven refresh still re-reads the panel */
   }
   try {
     const w2 = fs.watch(PROJECTS_DIR, { recursive: true }, debouncedRefresh);

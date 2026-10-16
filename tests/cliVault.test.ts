@@ -1,12 +1,8 @@
-import { describe, expect, it } from "vitest";
-import {
-  buildAddCommand,
-  buildSeedBlob,
-  decidePassiveSource,
-  decodeSecurityOutput,
-  parseCliVaultOutput,
-  shouldSeed,
-} from "../src/cliVault";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+import { buildSeedBlob, decidePassiveSource, readCliVault, shouldSeed, vaultFilePath, writeCliVault } from "../src/cliVault";
 
 const UUID = "123e4567-e89b-12d3-a456-426614174000";
 const tok = (rt: string, exp: number) => ({ accessToken: "at-" + rt, refreshToken: rt, expiresAt: exp });
@@ -24,32 +20,56 @@ describe("decidePassiveSource", () => {
   it("both missing -> use-own", () => expect(decidePassiveSource(undefined, null)).toBe("use-own"));
 });
 
-describe("security output decoding", () => {
-  const json = JSON.stringify({ claudeAiOauth: { accessToken: "a", refreshToken: "r", expiresAt: 1 }, email: "x@y.z" });
-  it("passes JSON text through", () => expect(decodeSecurityOutput(json + "\n")).toBe(json));
-  it("decodes hex output", () => {
-    const hex = Buffer.from(json, "utf8").toString("hex");
-    expect(decodeSecurityOutput(hex + "\n")).toBe(json);
-    expect(parseCliVaultOutput(hex)?.claudeAiOauth?.refreshToken).toBe("r");
-  });
-  it("returns null on garbage", () => {
-    expect(parseCliVaultOutput("not json")).toBeNull();
-    expect(parseCliVaultOutput("[1]")).toBeNull();
+describe("vault path", () => {
+  it("builds <dir>/<uuid>.json", () => expect(vaultFilePath(UUID, "/v")).toBe(path.join("/v", `${UUID}.json`)));
+  it("rejects non-uuid accounts", () => {
+    expect(vaultFilePath("../../etc/passwd", "/v")).toBeNull();
+    expect(vaultFilePath("ABC", "/v")).toBeNull();
+    expect(vaultFilePath(UUID.toUpperCase(), "/v")).toBeNull();
   });
 });
 
-describe("buildAddCommand", () => {
-  const blob = { claudeAiOauth: tok("SECRET-REFRESH", 1) };
-  const line = buildAddCommand(UUID, blob);
-  it("quotes service and account, one line, hex payload only", () => {
-    expect(line).toMatch(new RegExp(`^add-generic-password -U -a "${UUID}" -s "claude-switch" -X [0-9a-f]+\\n$`));
-    expect(line.trim().split("\n")).toHaveLength(1);
-    expect(line).not.toContain("SECRET-REFRESH");
-    expect(Buffer.from(line.trim().split(" -X ")[1], "hex").toString("utf8")).toBe(JSON.stringify(blob));
+describe("file vault I/O", () => {
+  let base: string;
+  let dir: string;
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "csm-vault-"));
+    dir = path.join(base, "vault");
   });
-  it("rejects non-uuid accounts", () => {
-    expect(() => buildAddCommand('x" -w', blob)).toThrow();
-    expect(() => buildAddCommand("ABC", blob)).toThrow();
+  afterEach(() => fs.rmSync(base, { recursive: true, force: true }));
+
+  it("missing file or dir -> null", async () => {
+    expect(await readCliVault(UUID, () => {}, dir)).toBeNull();
+  });
+  it("unparsable or non-object file -> null, never throws", async () => {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${UUID}.json`), "not json");
+    expect(await readCliVault(UUID, () => {}, dir)).toBeNull();
+    fs.writeFileSync(path.join(dir, `${UUID}.json`), "[1]");
+    expect(await readCliVault(UUID, () => {}, dir)).toBeNull();
+  });
+  it("invalid uuid -> null / false without touching disk", async () => {
+    expect(await readCliVault("../x", () => {}, dir)).toBeNull();
+    expect(await writeCliVault("../x", {}, () => {}, dir)).toBe(false);
+    expect(fs.existsSync(dir)).toBe(false);
+  });
+  it("write creates 0700 dir and 0600 file, round-trips, leaves no temp files", async () => {
+    const blob = { claudeAiOauth: tok("r", 1), email: "a@b.c", savedAt: 5 };
+    expect(await writeCliVault(UUID, blob, () => {}, dir)).toBe(true);
+    expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(path.join(dir, `${UUID}.json`)).mode & 0o777).toBe(0o600);
+    expect(fs.readdirSync(dir)).toEqual([`${UUID}.json`]);
+    expect(await readCliVault(UUID, () => {}, dir)).toEqual(blob);
+  });
+  it("overwrite replaces content and keeps 0600", async () => {
+    await writeCliVault(UUID, { claudeAiOauth: tok("r1", 1) }, () => {}, dir);
+    await writeCliVault(UUID, { claudeAiOauth: tok("r2", 2) }, () => {}, dir);
+    expect((await readCliVault(UUID, () => {}, dir))?.claudeAiOauth?.refreshToken).toBe("r2");
+    expect(fs.statSync(path.join(dir, `${UUID}.json`)).mode & 0o777).toBe(0o600);
+  });
+  it("write failure returns false", async () => {
+    fs.writeFileSync(dir, "a file where the dir should be");
+    expect(await writeCliVault(UUID, {}, () => {}, dir)).toBe(false);
   });
 });
 

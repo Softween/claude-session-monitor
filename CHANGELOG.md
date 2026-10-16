@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.14.0
+- The shared claude-switch vault is now a file vault: `~/.claude/state/claude-switch/vault/<accountUuid>.json` (directory 0700, files 0600, written via temp file + rename). The keychain vault caused macOS password prompts and had a 4 KB write limit; the extension no longer calls `security` for it.
+
 ## 2.13.0
 - Passive-account tokens now come from the claude-switch keychain vault (service `claude-switch`); the extension no longer refreshes them itself when that vault has the account, and seeds it once per refresh token otherwise. Both tokens expired shows "waiting for claude-switch keeper".
 

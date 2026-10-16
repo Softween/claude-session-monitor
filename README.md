@@ -257,5 +257,5 @@ use or share its output when transcript titles are sensitive.
 [MIT](LICENSE) © Softween
 
 ## Shared vault with claude-switch
-Passive (non-active) account tokens are read from the macOS keychain vault of `claude-switch` (service `claude-switch`, account = accountUuid), and the extension does not refresh them while that entry exists, because refresh tokens rotate and two refreshers break each other.
-If the vault lacks an account, the extension seeds it once per refresh token from its own SecretStorage; without the CLI vault at all it falls back to its own refresh. The active login is still captured from the login keychain as before.
+Passive (non-active) account tokens are read from the file vault of `claude-switch`: `~/.claude/state/claude-switch/vault/<accountUuid>.json` (directory mode 0700, files 0600, one JSON blob per account). The extension does not refresh them while that file exists, because refresh tokens rotate and two refreshers break each other.
+If the vault lacks an account, the extension seeds it once per refresh token from its own SecretStorage (temp file in the same directory, then atomic rename, mode 0600); without the CLI vault at all it falls back to its own refresh. The active login is still captured from the login keychain as before.

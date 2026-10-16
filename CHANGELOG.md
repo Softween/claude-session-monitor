@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.15.0
+- Usage Limits view: a thin `claude-switch` block above the first account card, fed by `~/.claude/state/claude-switch/panel.json`. One status line (active account, priority rank, auto/PAUSED, breaker count, last switch with age), a `next:` hint line and up to 8 recent events as `HH:MM  text`. Shows `claude-switch: no data (...)` when the file is missing or older than 10 minutes. Account cards gain a `#n` priority badge and a `login needed (reason)` note. Re-read on every refresh and on a debounced (1 s) change of the state directory. No secrets are read or shown.
+
 ## 2.14.0
 - The shared claude-switch vault is now a file vault: `~/.claude/state/claude-switch/vault/<accountUuid>.json` (directory 0700, files 0600, written via temp file + rename). The keychain vault caused macOS password prompts and had a 4 KB write limit; the extension no longer calls `security` for it.
 

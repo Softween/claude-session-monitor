@@ -259,3 +259,6 @@ use or share its output when transcript titles are sensitive.
 ## Shared vault with claude-switch
 Passive (non-active) account tokens are read from the file vault of `claude-switch`: `~/.claude/state/claude-switch/vault/<accountUuid>.json` (directory mode 0700, files 0600, one JSON blob per account). The extension does not refresh them while that file exists, because refresh tokens rotate and two refreshers break each other.
 If the vault lacks an account, the extension seeds it once per refresh token from its own SecretStorage (temp file in the same directory, then atomic rename, mode 0600); without the CLI vault at all it falls back to its own refresh. The active login is still captured from the login keychain as before.
+
+### claude-switch block
+The top of the Usage Limits view shows what the `claude-switch` CLI is doing, read from `~/.claude/state/claude-switch/panel.json`: the active account and its priority rank, `auto` or `PAUSED`, the breaker count, the last switch (from, to, reason, age), a one-line `next:` hint and the last 8 events with local time. Account cards get a `#n` rank badge and a `login needed (reason)` note. If the file is missing or older than 10 minutes the block reads `claude-switch: no data`. The file holds no tokens.

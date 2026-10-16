@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.13.0
+- Passive-account tokens now come from the claude-switch keychain vault (service `claude-switch`); the extension no longer refreshes them itself when that vault has the account, and seeds it once per refresh token otherwise. Both tokens expired shows "waiting for claude-switch keeper".
+
 ## 2.12.0
 - Back to the original card layout: one row per gauge with the long bar, percent and reset time; cards are tighter so eight accounts still fit.
 

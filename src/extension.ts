@@ -19,6 +19,7 @@ import * as os from "os";
 import * as path from "path";
 import { gaugeColumn } from "./compact";
 import { execFile } from "child_process";
+import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import {
   KEYCHAIN_SERVICE,
   REFRESH_MARGIN_MS,
@@ -793,6 +794,7 @@ function buildLimitsPayload(
         const aOfficial = aGauges.some((g) => g.pct != null);
         let note: string | null;
         if (isSel) note = selectedNote;
+        else if (keeperWaiting.has(a.id)) note = "waiting for claude-switch keeper";
         else if (a.needsLogin) note = "token revoked — log in with Claude Code once";
         else if (a.stale) note = "token expired — last-known data; log in with Claude Code once to refresh";
         else if (!aOfficial) note = "no usage data yet — appears after the first background fetch";
@@ -1507,13 +1509,70 @@ export function activate(ctx: vscode.ExtensionContext): void {
           usageByAccount.set(a.id, { usage: { gauges: snap.gauges, ts: snap.ts }, stale: !!snap.tokenStale });
           changed = true; // another window fetched it
         }
-        const vault = await readVaultOauth(a.id);
+        let vault = await readVaultOauth(a.id);
+        const cliBlob = await readCliVault(a.id, log);
+        const cliOauth = cliBlob?.claudeAiOauth;
+        const source = decidePassiveSource(vault, cliOauth);
+        let seeded = false;
+        let cliToken: string | undefined;
+        if (cliOauth && source === "use-cli") {
+          // The CLI keeper owns this token: poll with it and mirror it into our own vault.
+          cliToken = cliOauth.accessToken;
+          if (vault?.refreshToken !== cliOauth.refreshToken || vault?.accessToken !== cliOauth.accessToken || vault?.expiresAt !== cliOauth.expiresAt) {
+            try {
+              await ctx.secrets.store(vaultOauthKey(a.id), JSON.stringify(cliOauth));
+              if (cliOauth.accessToken) await ctx.secrets.store(`csm.token.${a.id}`, cliOauth.accessToken);
+            } catch (e) {
+              log("oauth vault store failed: " + String(e));
+            }
+            vault = cliOauth;
+            const f = readAccountsFile();
+            accountsFile = {
+              ...f,
+              accounts: f.accounts.map((x) => (x.id === a.id ? { ...withoutNeedsLogin(x), tokenExpiresAt: cliOauth.expiresAt } : x)),
+            };
+            writeAccountsFile(accountsFile);
+            a = accountsFile.accounts.find((x) => x.id === a.id) ?? a;
+            changed = true;
+          }
+        } else if (vault && source === "use-own-and-seed" && shouldSeed(seededRefreshTokens.get(a.id), vault.refreshToken)) {
+          let ident: Record<string, unknown> | undefined;
+          try {
+            ident = parseJsonObject(await ctx.secrets.get(vaultIdentKey(a.id)));
+          } catch {
+            ident = undefined;
+          }
+          seeded = await writeCliVault(a.id, buildSeedBlob(vault, ident, Date.now()), log);
+          if (seeded) {
+            seededRefreshTokens.set(a.id, vault.refreshToken);
+            log(`cli vault seeded (acct ${a.id.slice(0, 8)})`);
+          }
+        }
+        // The keeper owns refresh as soon as the CLI vault holds this account; our own refresh stays only for machines without it.
+        const keeperOwns = !!cliOauth || seeded || seededRefreshTokens.has(a.id);
         if (vault && healNeedsLogin(a, vault)) changed = true;
-        if (vault && needsRefresh(vault, Date.now(), REFRESH_MARGIN_MS) && (await refreshStoredAccount(a.id, vault, force))) {
+        if (keeperOwns) {
+          if (a.needsLogin && source === "use-cli") {
+            const f = readAccountsFile();
+            accountsFile = { ...f, accounts: f.accounts.map((x) => (x.id === a.id ? withoutNeedsLogin(x) : x)) };
+            writeAccountsFile(accountsFile);
+            a = accountsFile.accounts.find((x) => x.id === a.id) ?? a;
+          }
+          const best = source === "use-cli" ? cliOauth : vault;
+          if (typeof best?.expiresAt === "number" && Date.now() > best.expiresAt) {
+            if (!keeperWaiting.has(a.id)) log(`acct ${a.id.slice(0, 8)}: tokens expired, waiting for claude-switch keeper`);
+            keeperWaiting.add(a.id);
+            const cur = usageByAccount.get(a.id);
+            if (cur && !cur.stale) usageByAccount.set(a.id, { usage: cur.usage, stale: true });
+            changed = true;
+            continue;
+          }
+          if (keeperWaiting.delete(a.id)) changed = true;
+        } else if (vault && needsRefresh(vault, Date.now(), REFRESH_MARGIN_MS) && (await refreshStoredAccount(a.id, vault, force))) {
           a = accountsFile.accounts.find((x) => x.id === a.id) ?? a;
           changed = true;
         }
-        if (a.tokenExpiresAt != null && Date.now() > a.tokenExpiresAt) {
+        if (!keeperOwns && a.tokenExpiresAt != null && Date.now() > a.tokenExpiresAt) {
           if (snap && !snap.tokenStale) writeOfficialSnapshot({ ...snap, tokenStale: true }, file);
           const cur = usageByAccount.get(a.id);
           if (cur && !cur.stale) {
@@ -1526,9 +1585,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
         const attempted = !force && !!snap?.attemptTs && nowSec - snap.attemptTs < Math.min(60, cadence);
         const inBackoff = !force && !!snap?.backoffUntil && nowSec < snap.backoffUntil;
         if (freshEnough || attempted || inBackoff) continue;
-        let token: string | undefined;
+        let token: string | undefined = cliToken;
         try {
-          token = await ctx.secrets.get(`csm.token.${a.id}`);
+          if (!token) token = await ctx.secrets.get(`csm.token.${a.id}`);
         } catch {
           token = undefined;
         }
@@ -1542,7 +1601,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         }
         writeOfficialSnapshot({ ...(snap ?? { gauges: [], ts: 0 }), attemptTs: nowSec }, file);
         let r = await fetchOfficialUsage(token);
-        if (!r.ok && (r.status === 401 || r.status === 403)) {
+        if (!r.ok && (r.status === 401 || r.status === 403) && !keeperOwns) {
           const v2 = await readVaultOauth(a.id);
           const t2 = v2 ? await refreshStoredAccount(a.id, v2, true) : undefined;
           if (t2) r = await fetchOfficialUsage(t2);
@@ -1581,6 +1640,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // --- Account rotation (pure logic in src/rotation.ts) ---------------------
   let lastSwitchTs = 0;
   let switchInflight = false;
+  const seededRefreshTokens = new Map<string, string | undefined>(); // accountId -> refresh token last seeded into the CLI vault
   const refreshFailTs = new Map<string, number>(); // accountId -> ms of the last failed refresh
   const httpFetch: FetchLike = (url, init) => fetch(url, init);
 

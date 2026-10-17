@@ -105,8 +105,9 @@ export interface CardHeader {
   name: string;
   chip: "active" | "ready" | "exhausted" | "login";
   resetMs?: number; // exhausted: when the exhausting gauge(s) reset
-  worst?: { label: string; pct: number };
+  gauges?: HeaderGauge[];
 }
+export interface HeaderGauge { label: string; short: string; pct: number; hot: boolean }
 interface HGauge { label: string; pct: number | null; resetMs: number | null }
 
 /** Display names: email local part, plus the domain's first label when two local parts collide. */
@@ -125,6 +126,22 @@ export function worstGauge(gauges: HGauge[]): { label: string; pct: number } | u
   let w: HGauge | undefined;
   for (const g of gauges) if (typeof g.pct === "number" && (!w || g.pct > (w.pct as number))) w = g;
   return w ? { label: w.label.replace(/\s*\((5h|7d)\)/, ""), pct: w.pct as number } : undefined;
+}
+
+/** All gauges with a percentage for the header line: session, weekly (all models), then scoped weeklies in arrival order. */
+export function headerGauges(gauges: HGauge[]): HeaderGauge[] {
+  const rank = (l: string): number => (/^Session/i.test(l) ? 0 : /^Weekly(?!\s*·)/i.test(l) ? 1 : 2);
+  const named = (g: HGauge): HeaderGauge => {
+    const scoped = g.label.match(/^Weekly\s*·\s*(.+)$/i);
+    const label = scoped ? scoped[1].trim() : g.label.replace(/\s*\((5h|7d)\)/, "");
+    const pct = g.pct as number;
+    return { label, short: label.charAt(0).toUpperCase(), pct, hot: pct >= 90 };
+  };
+  return gauges
+    .filter((g) => typeof g.pct === "number")
+    .map((g, i) => ({ g, i, r: rank(g.label) }))
+    .sort((x, y) => x.r - y.r || x.i - y.i)
+    .map((x) => named(x.g));
 }
 
 /** Header chip: login needed > exhausted (a gauge at 100%) > active > ready. */

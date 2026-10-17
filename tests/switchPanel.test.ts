@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { accountBadges, displayNames, headerChip, mergePanelAccounts, orderCards, panelAge, panelFresh, readPanel, renderSwitchBlock, worstGauge, type SwitchPanel } from "../src/switchPanel";
+import { accountBadges, displayNames, headerChip, headerGauges, mergePanelAccounts, orderCards, panelAge, panelFresh, readPanel, renderSwitchBlock, worstGauge, type SwitchPanel } from "../src/switchPanel";
 
 const NOW = 1_792_200_000_000;
 const sec = NOW / 1000;
@@ -111,6 +111,20 @@ describe("card helpers", () => {
     expect(worstGauge([g("Session (5h)", 30), g("Weekly (7d)", 71), g("x", null)])).toEqual({ label: "Weekly", pct: 71 });
     expect(worstGauge([g("a", null)])).toBeUndefined();
     expect(worstGauge([])).toBeUndefined();
+  });
+  it("header gauges: session, weekly, then scoped in arrival order; omits missing; hot from 90", () => {
+    const out = headerGauges([g("Weekly · Fable", 100), g("Weekly (7d)", 71), g("Weekly · Opus", 89.9), g("Session (5h)", 27), g("x", null)]);
+    expect(out).toEqual([
+      { label: "Session", short: "S", pct: 27, hot: false },
+      { label: "Weekly", short: "W", pct: 71, hot: false },
+      { label: "Fable", short: "F", pct: 100, hot: true },
+      { label: "Opus", short: "O", pct: 89.9, hot: false },
+    ]);
+    expect(headerGauges([g("Session (5h)", 90), g("Weekly · Fable", 5)]).map((x) => [x.label, x.hot])).toEqual([["Session", true], ["Fable", false]]);
+    expect(headerGauges([])).toEqual([]);
+  });
+  it("header gauges handle Codex session and weekly", () => {
+    expect(headerGauges([g("Weekly (7d)", 12), g("Session (5h)", 3)]).map((x) => x.label)).toEqual(["Session", "Weekly"]);
   });
   it("chip precedence: login > exhausted > active > ready", () => {
     const base = { active: false, loginNeeded: false, gauges: [g("s", 10)] };

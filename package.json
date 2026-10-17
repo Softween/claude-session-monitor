@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.16.0",
+  "version": "2.17.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -347,6 +347,11 @@
           "type": "number",
           "default": 85,
           "description": "Warn (toast + native notification) when any Claude usage gauge (5h, 7d, per-model) reaches this percent. 0 disables."
+        },
+        "claudeSessionMonitor.showTokenStats": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the token totals and per-model share at the bottom of Usage Limits"
         },
         "claudeSessionMonitor.pollIntervalMs": {
           "type": "number",

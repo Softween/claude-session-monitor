@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.16.0
+- Usage Limits view simplified. The claude-switch block is now two lines (`claude-switch · <email> · #<rank> · auto|PAUSED`, then `next: ...`) plus a collapsed `Activity (n)` row that opens the last 8 meaningful events (switch, restore, login, error, rollback, pause/resume, offline, rate limit); state is remembered per workspace.
+- Account cards are ordered by claude-switch priority (Codex last) and collapse to one header line: `#rank name`, a status chip (`active`, `ready`, `exhausted · time to reset`, `login needed`) and the worst gauge. The active account starts expanded, the rest collapsed; the choice is remembered per account.
+- No accidental switching: clicking a name no longer switches and `Rotate` is gone while claude-switch data is fresh. An expanded non-active card has a `Use this account` link that runs `claude-switch use <email>`. Without fresh data the old behaviour is unchanged.
+- Every account claude-switch knows is added to the extension registry (identity only, no token) so its gauges appear through the existing vault polling.
+
 ## 2.15.0
 - Usage Limits view: a thin `claude-switch` block above the first account card, fed by `~/.claude/state/claude-switch/panel.json`. One status line (active account, priority rank, auto/PAUSED, breaker count, last switch with age), a `next:` hint line and up to 8 recent events as `HH:MM  text`. Shows `claude-switch: no data (...)` when the file is missing or older than 10 minutes. Account cards gain a `#n` priority badge and a `login needed (reason)` note. Re-read on every refresh and on a debounced (1 s) change of the state directory. No secrets are read or shown.
 

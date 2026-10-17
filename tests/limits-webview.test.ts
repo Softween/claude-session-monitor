@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import vm from "node:vm";
-import { allBadges, renderSwitchBlock, type SwitchPanel } from "../src/switchPanel";
+import { allBadges, displayNames, headerChip, orderCards, renderSwitchBlock, worstGauge, type CardHeader, type SwitchPanel } from "../src/switchPanel";
 
 function webviewScript(): string {
   const src = readFileSync(join(__dirname, "..", "src", "extension.ts"), "utf8");
@@ -17,15 +17,18 @@ function webviewScript(): string {
   return src.slice(start, end).replace(/\$\{[^}]*\}/g, "0").replace(/\\`/g, "`");
 }
 
-interface Harness { root: { innerHTML: string }; send: (data: unknown) => void }
+interface Harness { root: { innerHTML: string }; send: (data: unknown) => void; posted: unknown[]; click: (attr: string, value: string) => void; key: (attr: string, value: string, k: string) => void }
+type Handler = (ev: any) => void;
 
 function mount(): Harness {
-  const root = { innerHTML: "", addEventListener: () => undefined };
+  const handlers: Record<string, Handler> = {};
+  const posted: unknown[] = [];
+  const root = { innerHTML: "", addEventListener: (t: string, fn: Handler) => { handlers[t] = fn; } };
   let onMessage: ((e: { data: unknown }) => void) | null = null;
   const sandbox = {
     document: { getElementById: () => root, documentElement: {} },
     window: { addEventListener: (_t: string, fn: (e: { data: unknown }) => void) => { onMessage = fn; } },
-    acquireVsCodeApi: () => ({ postMessage: () => undefined, getState: () => ({}), setState: () => undefined }),
+    acquireVsCodeApi: () => ({ postMessage: (m: unknown) => { posted.push(m); }, getState: () => ({}), setState: () => undefined }),
     getComputedStyle: () => ({ getPropertyValue: () => "" }),
     setInterval: () => 0,
     Date,
@@ -36,7 +39,12 @@ function mount(): Harness {
   vm.runInNewContext(webviewScript(), sandbox);
   if (!onMessage) throw new Error("webview registered no message listener");
   const send = onMessage as (e: { data: unknown }) => void;
-  return { root, send: (data) => send({ data }) };
+  const target = (attr: string, value: string) => ({ dataset: { [attr]: value }, classList: { contains: () => false }, parentElement: null });
+  return {
+    root, posted, send: (data) => send({ data }),
+    click: (attr, value) => handlers.click({ target: target(attr, value), currentTarget: root }),
+    key: (attr, value, k) => handlers.keydown({ key: k, target: target(attr, value), preventDefault: () => undefined }),
+  };
 }
 
 const gauge = (key: string, label: string, pct: number) => ({ key, label, pct, resetMs: Date.now() + 3_600_000 });
@@ -79,12 +87,12 @@ describe("Usage Limits webview", () => {
     expect(h.root.innerHTML).toContain("csm-account-row");
   });
 
-  it("injects the claude-switch block above the cards and badges the matching account", () => {
+  it("injects the claude-switch block above the cards (legacy cards without a fresh panel flag)", () => {
     const h = mount();
     const now = Date.now();
     const panel: SwitchPanel = {
       v: 1, ts: now / 1000, active: { email: "one@example.com" }, priority: ["two@example.com", "one@example.com"],
-      paused: false, breaker: { count: 1, max: 4 }, nextHint: "hold",
+      paused: false, nextHint: "hold",
       accounts: [{ email: "two@example.com", rank: 1, needsLogin: true, needsLoginReason: "refresh revoked" }],
       events: [{ ts: now / 1000, kind: "switch", text: "a -> b (auto)" }],
     };
@@ -101,7 +109,70 @@ describe("Usage Limits webview", () => {
     expect(html.indexOf("claude-switch")).toBeLessThan(html.indexOf("one@example.com</span>"));
     expect(html).toContain("a -&gt; b (auto)");
     expect(html).toContain("#2</span>");
-    expect(html).toContain("#1</span>");
     expect(html).toContain("login needed (refresh revoked)");
+  });
+
+  it("fresh panel: ordered collapsible headers, toggling, Use this account, no Rotate or name-switch", () => {
+    const h = mount();
+    const now = Date.now();
+    const panel: SwitchPanel = {
+      v: 1, ts: now / 1000, active: { email: "bilal@softween.com" }, priority: ["bilal@glossgo.com", "bilal@softween.com"],
+      paused: false, nextHint: "hold",
+      accounts: [{ email: "bilal@glossgo.com", rank: 1 }, { email: "bilal@softween.com", rank: 2 }],
+      events: [{ ts: now / 1000, kind: "switch", text: "a -> b (auto)" }],
+    };
+    const full = { ...gauge("session", "Session (5h)", 100), resetMs: Date.now() + 3_600_000 };
+    const week = gauge("weekly", "Weekly (7d)", 60);
+    const raw = [
+      { id: "codex", provider: "codex", label: "Codex", active: false, official: true, ts: now / 1000, note: null, gauges: [week] },
+      { id: "claude:s", provider: "claude", label: "Claude · bilal@softween.com", email: "bilal@softween.com", accountId: "s", active: true, official: true, ts: now / 1000, note: null, gauges: [gauge("session", "Session (5h)", 20), week] },
+      { id: "claude:g", provider: "claude", label: "Claude · bilal@glossgo.com", email: "bilal@glossgo.com", accountId: "g", active: false, official: true, ts: now / 1000, note: null, gauges: [full, week] },
+    ];
+    const names = displayNames(["bilal@glossgo.com", "bilal@softween.com"]);
+    const providers = orderCards(raw, panel).map((p) => {
+      const rank = p.email === "bilal@glossgo.com" ? 1 : p.email === "bilal@softween.com" ? 2 : undefined;
+      const hdr: CardHeader = {
+        ...(rank ? { rank } : {}), name: p.provider === "codex" ? "Codex" : names[p.email === "bilal@glossgo.com" ? 0 : 1],
+        ...headerChip({ active: p.active, loginNeeded: false, gauges: p.gauges }), worst: worstGauge(p.gauges),
+      };
+      return { ...p, hdr };
+    });
+    h.send({
+      type: "update", ts: now / 1000, official: true, accounts: [{ id: "s" }, { id: "g" }], eta: null, tokens: null, models: [],
+      switchHtml: renderSwitchBlock(panel, now), switchBadges: allBadges(panel), panelFresh: true,
+      ui: { switchActivityOpen: false, expandedAccounts: {} }, useEmails: ["bilal@glossgo.com", "bilal@softween.com"], providers,
+    });
+    let html = h.root.innerHTML;
+    expect(html).not.toContain("Rotate");
+    expect(html).not.toContain("data-switch=");
+    expect(html.indexOf("bilal@glossgo</span>")).toBeLessThan(html.indexOf("bilal@softween</span>"));
+    expect(html.indexOf("bilal@softween</span>")).toBeLessThan(html.indexOf(">Codex</span>"));
+    expect(html).toContain("exhausted · 1h");
+    expect(html).toContain("Session 100%");
+    expect(html).toContain('aria-expanded="true"'); // active card only (activity row is false)
+    expect((html.match(/data-toggle=/g) ?? [])).toHaveLength(3);
+    expect((html.match(/class="bar"/g) ?? []).length).toBe(2); // only the active card body
+    expect(html).not.toContain("Use this account");
+    expect(html).toContain('data-testid="csm-switch-activity" hidden');
+
+    h.click("toggle", "claude:g");
+    html = h.root.innerHTML;
+    expect((html.match(/class="bar"/g) ?? []).length).toBe(4);
+    expect(html).toContain("Use this account");
+    expect(h.posted).toContainEqual({ type: "setUi", key: "expandedAccounts", value: { "claude:g": true } });
+    h.key("toggle", "claude:s", "Enter");
+    expect((h.root.innerHTML.match(/class="bar"/g) ?? []).length).toBe(2);
+    expect(h.posted).toContainEqual({ type: "setUi", key: "expandedAccounts", value: { "claude:g": true, "claude:s": false } });
+
+    h.click("use", "bilal@glossgo.com");
+    expect(h.posted).toContainEqual({ type: "useAccount", email: "bilal@glossgo.com" });
+    expect(h.posted.some((m) => (m as { type: string }).type === "switchAccount")).toBe(false);
+
+    h.click("swtoggle", "1");
+    expect(h.root.innerHTML).toContain('aria-expanded="true"');
+    expect(h.root.innerHTML).not.toContain('data-testid="csm-switch-activity" hidden');
+    expect(h.posted).toContainEqual({ type: "setUi", key: "switchActivityOpen", value: true });
+    h.key("swtoggle", "1", " ");
+    expect(h.root.innerHTML).toContain('data-testid="csm-switch-activity" hidden');
   });
 });

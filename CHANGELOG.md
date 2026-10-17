@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.18.0
+- Every account header now lists all of its limits as plain text on the right (`Session 27% · Weekly 71% · Fable 100%`): session, weekly, then model-scoped weeklies, percentages from 90% in red. Below ~360 px of header width the labels shorten to `S · W · F`. Missing gauges are omitted; the status chip and expanded body are unchanged.
+
 ## 2.17.0
 - New setting `claudeSessionMonitor.showTokenStats` (default off): the `Tokens, all logins` row and the `Models, 7d share` block at the bottom of Usage Limits are hidden unless enabled, and the per-model share is not computed while it is off. Takes effect without a reload.
 - Compact layout for 8+ accounts: a collapsed account card is one 25 px line including its separator, the claude-switch block is tighter, and long names end in an ellipsis. Expanded cards keep the long thin 4 px bars.

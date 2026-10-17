@@ -17,7 +17,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, headerChip, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, worstGauge, type CardHeader } from "./switchPanel";
+import { SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, headerChip, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, headerGauges, type CardHeader } from "./switchPanel";
 import { gaugeColumn } from "./compact";
 import { execFile } from "child_process";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
@@ -971,10 +971,14 @@ function limitsHtml(): string {
   .card.ccard { padding:4px 0; }
   .card.ccard:first-child { padding-top:0; }
   .chdr { display:flex; align-items:center; gap:6px; cursor:pointer; min-width:0; overflow:hidden; height:16px; line-height:16px; user-select:none; }
-  .chdr .ctitle { flex:0 1 auto; min-width:0; }
+  .chdr { container-type:inline-size; }
+  .chdr .ctitle { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .chdr .chip { flex:none; }
   .chdr .chev { color: var(--vscode-descriptionForeground); font-size:10px; width:10px; flex:none; }
-  .chdr .cworst { margin-left:auto; flex:none; font-size:11px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
+  .chdr .cgauges { margin-left:auto; flex:none; font-size:11px; white-space:nowrap; }
+  .chdr .cgauges .hot { color: var(--vscode-charts-red, #f14c4c); }
+  .chdr .gs { display:none; }
+  @container (max-width: 360px) { .chdr .gl { display:none; } .chdr .gs { display:inline; } }
   .chip { font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .chip.login { color: var(--vscode-charts-red, #f14c4c); font-weight:600; }
   .cbody { margin-top:4px; padding-bottom:4px; }
@@ -1142,7 +1146,7 @@ function collapsibleCard(card){
     + '<span class="chev">'+(open?'▾':'▸')+'</span>'
     + '<span class="ctitle">'+(h.rank?'<span class="swrank num">#'+h.rank+'</span> ':'')+esc(h.name)+'</span>'
     + chipHtml(h)
-    + (h.worst ? '<span class="cworst num">'+esc(h.worst.label)+' '+fmtPct(h.worst.pct)+'%</span>' : '')
+    + (h.gauges && h.gauges.length ? '<span class="cgauges num" data-testid="csm-account-gauges">'+h.gauges.map(g=>'<span class="hg'+(g.hot?' hot':'')+'"><span class="gl">'+esc(g.label)+'</span><span class="gs">'+esc(g.short)+'</span> '+fmtPct(g.pct)+'%</span>').join(' · ')+'</span>' : '')
     + '</div>';
   if(open){
     out += '<div class="cbody">';
@@ -2320,7 +2324,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
             ...(b.rank !== undefined ? { rank: b.rank } : {}),
             name: p.provider === "claude" ? claudeNames[ci++] : "Codex",
             ...headerChip({ active: p.provider === "claude" && p.active, loginNeeded: !!p.loginNeeded || !!b.loginNeeded, gauges: p.official ? p.gauges : [] }),
-            worst: worstGauge(p.official ? p.gauges : []),
+            gauges: headerGauges(p.official ? p.gauges : []),
           };
           return { ...p, hdr };
         });

@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import vm from "node:vm";
-import { allBadges, displayNames, headerChip, orderCards, renderSwitchBlock, worstGauge, type CardHeader, type SwitchPanel } from "../src/switchPanel";
+import { allBadges, displayNames, headerChip, orderCards, renderSwitchBlock, headerGauges, type CardHeader, type SwitchPanel } from "../src/switchPanel";
 
 function webviewScript(): string {
   const src = readFileSync(join(__dirname, "..", "src", "extension.ts"), "utf8");
@@ -133,7 +133,7 @@ describe("Usage Limits webview", () => {
       const rank = p.email === "bilal@glossgo.com" ? 1 : p.email === "bilal@softween.com" ? 2 : undefined;
       const hdr: CardHeader = {
         ...(rank ? { rank } : {}), name: p.provider === "codex" ? "Codex" : names[p.email === "bilal@glossgo.com" ? 0 : 1],
-        ...headerChip({ active: p.active, loginNeeded: false, gauges: p.gauges }), worst: worstGauge(p.gauges),
+        ...headerChip({ active: p.active, loginNeeded: false, gauges: p.gauges }), gauges: headerGauges(p.gauges),
       };
       return { ...p, hdr };
     });
@@ -148,7 +148,7 @@ describe("Usage Limits webview", () => {
     expect(html.indexOf("bilal@glossgo</span>")).toBeLessThan(html.indexOf("bilal@softween</span>"));
     expect(html.indexOf("bilal@softween</span>")).toBeLessThan(html.indexOf(">Codex</span>"));
     expect(html).toContain("exhausted · 1h");
-    expect(html).toContain("Session 100%");
+    expect(html).toContain('</span> 100%</span> · <span class="hg"><span class="gl">Weekly</span><span class="gs">W</span> 60%');
     expect(html).toContain('aria-expanded="true"'); // active card only (activity row is false)
     expect((html.match(/data-toggle=/g) ?? [])).toHaveLength(3);
     expect((html.match(/class="bar"/g) ?? []).length).toBe(2); // only the active card body
@@ -194,7 +194,7 @@ describe("Usage Limits webview", () => {
   it("renders 8 Claude accounts + Codex as 9 collapsed headers and one expanded active card", () => {
     const h = mount();
     const now = Date.now();
-    const mkHdr = (name: string, active: boolean, g: ReturnType<typeof gauge>[]): CardHeader => ({ name, ...headerChip({ active, loginNeeded: false, gauges: g }), worst: worstGauge(g) });
+    const mkHdr = (name: string, active: boolean, g: ReturnType<typeof gauge>[]): CardHeader => ({ name, ...headerChip({ active, loginNeeded: false, gauges: g }), gauges: headerGauges(g) });
     const providers = Array.from({ length: 8 }, (_, n) => {
       const g = [gauge("session", "Session (5h)", 10 * n), gauge("weekly", "Weekly (7d)", 5 * n)];
       const email = `acct${n}@example.com`;
@@ -212,5 +212,28 @@ describe("Usage Limits webview", () => {
     expect(html.match(/aria-expanded="true"/g)).toHaveLength(1);
     expect(html.match(/class="cbody"/g)).toHaveLength(1);
     expect(html.match(/class="bar"/g)).toHaveLength(2);
+  });
+
+  it("account header lists every gauge with a percentage, omitting missing ones", () => {
+    const h = mount();
+    const now = Date.now();
+    const mk = (id: string, gauges: ReturnType<typeof gauge>[]) => {
+      const p = { id, provider: "claude", label: `Claude · ${id}@x.com`, email: `${id}@x.com`, accountId: id, active: false, official: true, ts: now / 1000, note: null, gauges };
+      return { ...p, hdr: { name: id, ...headerChip({ active: false, loginNeeded: false, gauges }), gauges: headerGauges(gauges) } as CardHeader };
+    };
+    h.send({
+      type: "update", ts: now / 1000, official: true, accounts: [], eta: null, tokens: null, models: [], switchHtml: "", switchBadges: {}, panelFresh: true,
+      ui: { switchActivityOpen: false, expandedAccounts: {} }, useEmails: [],
+      providers: [mk("full", [gauge("session", "Session (5h)", 27), gauge("weekly", "Weekly (7d)", 71), gauge("weekly-fable", "Weekly · Fable", 95)]), mk("two", [gauge("session", "Session (5h)", 10), gauge("weekly-fable", "Weekly · Fable", 20)])],
+    });
+    const spans = (id: string) => {
+      const row = h.root.innerHTML.split('data-testid="csm-account-row"').find((r) => r.includes(`title="Claude · ${id}@x.com"`)) ?? "";
+      return row.match(/<span class="hg[^"]*">/g) ?? [];
+    };
+    expect(spans("full")).toHaveLength(3);
+    expect(spans("two")).toHaveLength(2);
+    expect(h.root.innerHTML).toContain(">Session</span><span class=\"gs\">S</span> 27%");
+    expect(h.root.innerHTML).toContain("71%");
+    expect(spans("full")[2]).toContain("hot");
   });
 });

@@ -4,6 +4,7 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import type { AccountInfo, AccountsFile } from "./core";
 
 export const SWITCH_STATE_DIR = path.join(os.homedir(), ".claude", "state", "claude-switch");
 export const SWITCH_PANEL_FILE = path.join(SWITCH_STATE_DIR, "panel.json");
@@ -11,6 +12,7 @@ export const PANEL_STALE_SEC = 600;
 const MAX_EVENTS = 8;
 
 export interface PanelAccount {
+  uuid?: string;
   email: string;
   rank?: number;
   needsLogin?: boolean;
@@ -67,33 +69,97 @@ function rankOf(panel: SwitchPanel, email: string | undefined): number | undefin
   return i >= 0 ? i + 1 : undefined;
 }
 
-/** HTML for the claude-switch block (empty-state line when missing or stale). */
-export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number): string {
+/** True when a panel exists and is fresh enough for claude-switch to own switching. */
+export function panelFresh(panel: SwitchPanel | null, nowMs: number): panel is SwitchPanel {
+  return !!panel && panelAge(panel, nowMs) <= PANEL_STALE_SEC;
+}
+
+const ACTIVITY_KINDS = new Set(["switch", "restore", "needsLogin", "cleared", "error", "rollback", "paused", "resumed", "offline", "ratelimit"]);
+const MUTED_KINDS = new Set(["offline", "ratelimit"]);
+
+/** HTML for the claude-switch block (empty-state line when missing or stale). `activityOpen` is the persisted toggle (default collapsed). */
+export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number, activityOpen = false): string {
   const age = panel ? panelAge(panel, nowMs) : null;
   if (!panel || age === null || age > PANEL_STALE_SEC) {
     const why = panel && age !== null ? `${ageText(age)} old` : "file missing";
     return `<div class="swblock" data-testid="csm-switch-block"><div class="swline sw-info">claude-switch: no data (${esc(why)})</div></div>`;
   }
-  const email = panel.active?.email ?? "?";
   const rank = rankOf(panel, panel.active?.email);
-  const parts = [
-    `claude-switch`,
-    `active ${email}`,
-    ...(rank !== undefined ? [`priority #${rank}`] : []),
-    panel.paused ? "PAUSED" : "auto",
-    `breaker ${panel.breaker?.count ?? 0}/${panel.breaker?.max ?? 0}${panel.breaker?.open ? " OPEN" : ""}`,
-  ];
-  const ls = panel.lastSwitch;
-  if (ls && typeof ls.ts === "number") {
-    parts.push(`last: ${ls.from ?? "?"} → ${ls.to ?? "?"} (${ls.reason ?? "?"}, ${ageText(panelAge({ ...panel, ts: ls.ts }, nowMs))} ago)`);
-  }
+  const parts = [`claude-switch`, panel.active?.email ?? "?", ...(rank !== undefined ? [`#${rank}`] : []), panel.paused ? "PAUSED" : "auto"];
+  const events = [...(panel.events ?? [])]
+    .filter((e) => ACTIVITY_KINDS.has(e.kind))
+    .sort((a, b) => b.ts - a.ts)
+    .slice(0, MAX_EVENTS);
   let h = `<div class="swblock" data-testid="csm-switch-block"><div class="swline">${esc(parts.join(" · "))}</div>`;
   if (panel.nextHint) h += `<div class="swline sw-hint">next: ${esc(panel.nextHint)}</div>`;
-  const events = [...(panel.events ?? [])].sort((a, b) => b.ts - a.ts).slice(0, MAX_EVENTS);
+  h += `<div class="swtoggle" role="button" tabindex="0" data-swtoggle="1" aria-expanded="${activityOpen}" data-testid="csm-switch-activity-toggle"><span class="chev">${activityOpen ? "▾" : "▸"}</span> Activity (${events.length})</div>`;
+  h += `<div class="swevents" data-testid="csm-switch-activity"${activityOpen ? "" : " hidden"}>`;
   for (const e of events) {
-    h += `<div class="swline ${cls(e.kind)}"><span class="num">${hhmm(e.ts)}</span>  ${esc(e.text)}</div>`;
+    h += `<div class="swline ${cls(e.kind)}${MUTED_KINDS.has(e.kind) ? " sw-muted" : ""}"><span class="num">${hhmm(e.ts)}</span>  ${esc(e.text)}</div>`;
   }
-  return h + "</div>";
+  return h + "</div></div>";
+}
+
+export interface CardHeader {
+  rank?: number;
+  name: string;
+  chip: "active" | "ready" | "exhausted" | "login";
+  resetMs?: number; // exhausted: when the exhausting gauge(s) reset
+  worst?: { label: string; pct: number };
+}
+interface HGauge { label: string; pct: number | null; resetMs: number | null }
+
+/** Display names: email local part, plus the domain's first label when two local parts collide. */
+export function displayNames(emails: string[]): string[] {
+  const local = (e: string): string => e.split("@")[0] || e;
+  const counts = new Map<string, number>();
+  for (const e of emails) counts.set(local(e).toLowerCase(), (counts.get(local(e).toLowerCase()) ?? 0) + 1);
+  return emails.map((e) => {
+    const [l, d] = [local(e), e.split("@")[1]?.split(".")[0]];
+    return (counts.get(l.toLowerCase()) ?? 0) > 1 && d ? `${l}@${d}` : l;
+  });
+}
+
+/** The single most-used gauge (null when none has a percentage). */
+export function worstGauge(gauges: HGauge[]): { label: string; pct: number } | undefined {
+  let w: HGauge | undefined;
+  for (const g of gauges) if (typeof g.pct === "number" && (!w || g.pct > (w.pct as number))) w = g;
+  return w ? { label: w.label.replace(/\s*\((5h|7d)\)/, ""), pct: w.pct as number } : undefined;
+}
+
+/** Header chip: login needed > exhausted (a gauge at 100%) > active > ready. */
+export function headerChip(
+  a: { active: boolean; loginNeeded: boolean; gauges: HGauge[] },
+): Pick<CardHeader, "chip" | "resetMs"> {
+  if (a.loginNeeded) return { chip: "login" };
+  const full = a.gauges.filter((g) => typeof g.pct === "number" && g.pct >= 100);
+  if (full.length) {
+    const resets = full.map((g) => g.resetMs).filter((r): r is number => typeof r === "number");
+    return { chip: "exhausted", ...(resets.length ? { resetMs: Math.max(...resets) } : {}) };
+  }
+  return { chip: a.active ? "active" : "ready" };
+}
+
+/** Claude cards by claude-switch priority (rank, else priority order); unranked after, Codex last. Stable. */
+export function orderCards<T extends { provider: string; label: string; email?: string }>(cards: T[], panel: SwitchPanel | null): T[] {
+  const email = (c: T): string => c.email ?? c.label.replace(/^(Claude|Codex) · /, "");
+  const key = (c: T): number => {
+    if (c.provider !== "claude") return Infinity;
+    const r = panel ? rankOf(panel, email(c)) : undefined;
+    return r ?? 1e6;
+  };
+  return cards.map((c, i) => ({ c, i })).sort((x, y) => key(x.c) - key(y.c) || x.i - y.i).map((x) => x.c);
+}
+
+/** Add every panel account (uuid + email) missing from the registry; no tokens, active login untouched. */
+export function mergePanelAccounts(f: AccountsFile, panel: SwitchPanel | null): AccountsFile {
+  const add: AccountInfo[] = [];
+  for (const a of panel?.accounts ?? []) {
+    if (!a.uuid || !/^[0-9a-f-]{36}$/.test(a.uuid) || !a.email) continue;
+    if (f.accounts.some((x) => x.id === a.uuid) || add.some((x) => x.id === a.uuid)) continue;
+    add.push({ id: a.uuid, email: a.email, lastSeenTs: 0 });
+  }
+  return add.length ? { ...f, accounts: [...f.accounts, ...add] } : f;
 }
 
 /** Per-account decorations for the existing cards (empty when nothing to say). */

@@ -17,7 +17,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, readPanel, renderSwitchBlock } from "./switchPanel";
+import { SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, headerChip, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, worstGauge, type CardHeader } from "./switchPanel";
 import { gaugeColumn } from "./compact";
 import { execFile } from "child_process";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
@@ -513,6 +513,8 @@ interface UsageProviderCard {
   best?: boolean; // Claude account card: the account with the most headroom
   cols?: { session?: Gauge; weekly?: Gauge; fable?: Gauge }; // grid cells (see compact.ts)
   loginNeeded?: boolean; // note says the token is expired/revoked
+  email?: string; // Claude account card: the login email (label may be shortened)
+  hdr?: CardHeader; // one-line collapsible header (claude-switch panel fresh)
 }
 
 /** Add grid cells and the login flag to every card. */
@@ -544,6 +546,9 @@ interface LimitsPayload {
   providers: UsageProviderCard[];
   switchHtml?: string; // claude-switch block, rendered host-side by switchPanel.ts
   switchBadges?: Record<string, { rank?: number; loginNeeded?: string }>; // by account email
+  panelFresh?: boolean; // claude-switch owns switching: simplified cards, no Rotate
+  ui?: { switchActivityOpen: boolean; expandedAccounts: Record<string, boolean> }; // persisted in workspaceState
+  useEmails?: string[]; // non-active accounts the panel can switch to
 }
 
 // ---------------------------------------------------------------------------
@@ -888,6 +893,8 @@ class LimitsView implements vscode.WebviewViewProvider {
     private readonly onRefresh: () => void,
     private readonly onSwitch: (accountId: string) => void,
     private readonly onRotate: () => void,
+    private readonly onUse: (email: string) => void,
+    private readonly onUi: (key: string, value: unknown) => void,
   ) {}
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -898,6 +905,8 @@ class LimitsView implements vscode.WebviewViewProvider {
       if (m && m.type === "refresh") this.onRefresh();
       else if (m && m.type === "switchAccount" && typeof m.id === "string") this.onSwitch(m.id);
       else if (m && m.type === "rotateBest") this.onRotate();
+      else if (m && m.type === "useAccount" && typeof m.email === "string") this.onUse(m.email);
+      else if (m && m.type === "setUi" && typeof m.key === "string") this.onUi(m.key, m.value);
     });
     if (this.pending) view.webview.postMessage(this.pending);
   }
@@ -952,6 +961,18 @@ function limitsHtml(): string {
   .swrank { color: var(--vscode-descriptionForeground); font-size:11px; }
   .clogin { color: var(--vscode-charts-red, #f14c4c); font-size:10px; font-weight:600; }
   }
+  .swtoggle { font-size:11px; cursor:pointer; margin-top:3px; color: var(--vscode-descriptionForeground); user-select:none; }
+  .swtoggle:hover { color: var(--vscode-foreground); }
+  .swline.sw-muted { color: var(--vscode-descriptionForeground); opacity:.7; }
+  .swevents[hidden] { display:none; }
+  .chdr { display:flex; align-items:baseline; gap:6px; cursor:pointer; min-width:0; user-select:none; }
+  .chdr .chev { color: var(--vscode-descriptionForeground); font-size:10px; width:10px; flex:none; }
+  .chdr .cworst { margin-left:auto; font-size:11px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
+  .chip { font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
+  .chip.login { color: var(--vscode-charts-red, #f14c4c); font-weight:600; }
+  .cbody { margin-top:7px; }
+  .useacct { border:0; background:transparent; color: var(--vscode-textLink-foreground); font:inherit; font-size:11px; cursor:pointer; padding:0; margin-top:4px; }
+  .useacct:hover { text-decoration:underline; }
   .rot { display:flex; justify-content:flex-end; margin:0 0 2px; }
   .rot + .card { padding-top:2px; border-top:0; }
   .rotbtn { border:0; background:transparent; color: var(--vscode-textLink-foreground); font:inherit; font-size:11px; cursor:pointer; padding:0; }
@@ -1096,16 +1117,61 @@ function providerCard(card){
   else if(!card.official) h += '<div class="note">Official '+esc(card.label)+' usage is unavailable. Session state remains available.</div>';
   return h+'</div>';
 }
+let ui = null;
+function expandedOf(card){
+  const v = ui && ui.expandedAccounts ? ui.expandedAccounts[card.id] : undefined;
+  return v === undefined ? !!card.active : !!v;
+}
+function chipHtml(h){
+  if(h.chip==='active') return '<span class="adot" title="active login"></span><span class="chip">active</span>';
+  if(h.chip==='exhausted') return '<span class="chip">exhausted'+(h.resetMs?' · '+fmtLeft(h.resetMs).replace('resets now','now'):'')+'</span>';
+  if(h.chip==='login') return '<span class="chip login">login needed</span>';
+  return '<span class="chip">ready</span>';
+}
+// Simplified card: ONE always-visible header line, gauge rows only when expanded.
+function collapsibleCard(card){
+  const h = card.hdr, open = expandedOf(card);
+  let out = '<div class="card" data-testid="csm-account-row"><div class="chdr" role="button" tabindex="0" data-toggle="'+esc(card.id)+'" aria-expanded="'+open+'" title="'+esc(card.label)+'">'
+    + '<span class="chev">'+(open?'▾':'▸')+'</span>'
+    + '<span class="ctitle">'+(h.rank?'<span class="swrank num">#'+h.rank+'</span> ':'')+esc(h.name)+'</span>'
+    + chipHtml(h)
+    + (h.worst ? '<span class="cworst num">'+esc(h.worst.label)+' '+fmtPct(h.worst.pct)+'%</span>' : '')
+    + '</div>';
+  if(open){
+    out += '<div class="cbody">';
+    const gauges = card.official ? (card.gauges||[]) : [];
+    out += gauges.map(gaugeRow).join('');
+    if(card.provider==='claude' && card.active && gauges.some(g=>g.key==='session'||g.key==='5h')) out += etaLine(last.eta);
+    if(card.note) out += '<div class="note">'+esc(card.note)+'</div>';
+    else if(!card.official) out += '<div class="note">Official '+esc(card.label)+' usage is unavailable. Session state remains available.</div>';
+    const email = card.email || card.label.replace(/^(Claude|Codex) · /,'');
+    if(card.provider==='claude' && !card.active && last.useEmails && last.useEmails.indexOf(email)>=0)
+      out += '<button type="button" class="useacct" data-use="'+esc(email)+'">Use this account</button>';
+    out += '</div>';
+  }
+  return out+'</div>';
+}
+function switchBlock(){
+  let h = last.switchHtml || '';
+  if(ui && ui.switchActivityOpen) h = h.replace('data-swtoggle="1" aria-expanded="false"','data-swtoggle="1" aria-expanded="true"').replace('<span class="chev">▸</span>','<span class="chev">▾</span>').replace(' data-testid="csm-switch-activity" hidden',' data-testid="csm-switch-activity"');
+  return h;
+}
+function setUi(key, value){
+  ui[key] = value;
+  vscodeApi.postMessage({ type:'setUi', key: key, value: value });
+  render();
+}
 function render(){
   const root = document.getElementById('root');
   if(!last){ return; }
-  let h = last.switchHtml || '';
+  if(!ui) ui = last.ui || { switchActivityOpen:false, expandedAccounts:{} };
+  let h = switchBlock();
   const cards = (last.providers && last.providers.length) ? last.providers : [{
     id:'claude', provider:'claude', label:'Claude', active:true, ts:last.ts, official:last.official, gauges:last.gauges||[],
     note:last.usageNote||last.accountNote||null, sevenDayTokens:null, lifetimeTokens:null
   }];
-  if(last.accounts && last.accounts.length > 1) h += '<div class="rot"><button type="button" class="rotbtn" data-rotate="1" title="Switch Claude Code to the account with the most headroom">Rotate ▸</button></div>';
-  for(const c of cards) h += providerCard(c);
+  if(!last.panelFresh && last.accounts && last.accounts.length > 1) h += '<div class="rot"><button type="button" class="rotbtn" data-rotate="1" title="Switch Claude Code to the account with the most headroom">Rotate ▸</button></div>';
+  for(const c of cards) h += (last.panelFresh && c.hdr) ? collapsibleCard(c) : providerCard(c);
   if(cards.some(c=>c.provider==='claude')){
     const multiAcct = !!(last.accounts && last.accounts.length > 1);
     h += tokenFoot(last.tokens, multiAcct);
@@ -1122,16 +1188,27 @@ function render(){
   }
   root.innerHTML = h;
 }
+function toggleAccount(id){
+  const card = ((last && last.providers) || []).find(c=>c.id===id);
+  const next = Object.assign({}, ui.expandedAccounts);
+  next[id] = !(card ? expandedOf(card) : next[id]);
+  setUi('expandedAccounts', next);
+}
 document.getElementById('root').addEventListener('keydown', (ev) => {
   if(ev.key !== 'Enter' && ev.key !== ' ') return;
   const d = ev.target && ev.target.dataset;
   if(!d) return;
   if(d.switch){ vscodeApi.postMessage({ type:'switchAccount', id: d.switch }); ev.preventDefault(); }
+  else if(d.toggle){ toggleAccount(d.toggle); ev.preventDefault(); }
+  else if(d.swtoggle){ setUi('switchActivityOpen', !ui.switchActivityOpen); ev.preventDefault(); }
 });
 document.getElementById('root').addEventListener('click', (ev) => {
   let el = ev.target;
   while(el && el !== ev.currentTarget){
     if(el.dataset && el.dataset.switch){ vscodeApi.postMessage({ type:'switchAccount', id: el.dataset.switch }); return; }
+    if(el.dataset && el.dataset.use){ vscodeApi.postMessage({ type:'useAccount', email: el.dataset.use }); return; }
+    if(el.dataset && el.dataset.toggle){ toggleAccount(el.dataset.toggle); return; }
+    if(el.dataset && el.dataset.swtoggle){ setUi('switchActivityOpen', !ui.switchActivityOpen); return; }
     if(el.dataset && el.dataset.rotate){ vscodeApi.postMessage({ type:'rotateBest' }); return; }
     if(el.classList && el.classList.contains('sech') && el.dataset.sec){
       collapsed[el.dataset.sec] = !collapsed[el.dataset.sec];
@@ -1212,7 +1289,24 @@ export function activate(ctx: vscode.ExtensionContext): void {
     () => vscode.commands.executeCommand("claudeSessionMonitor.refreshUsage"),
     (id) => void switchToAccount(id),
     () => void vscode.commands.executeCommand("claudeSessionMonitor.switchToBestAccount"),
+    (email) => useAccountViaCli(email),
+    (key, value) => {
+      if (key === "switchActivityOpen") void ctx.workspaceState.update("csm.switchActivityOpen", value === true);
+      else if (key === "expandedAccounts" && value && typeof value === "object") void ctx.workspaceState.update("csm.expandedAccounts", value);
+    },
   );
+
+  /** claude-switch owns switching; this only shells out to its `use` command (no shell, no token in args or logs). */
+  function useAccountViaCli(email: string): void {
+    const panel = readPanel();
+    const known = panelFresh(panel, Date.now()) && (panel.accounts ?? []).some((a) => a.email === email);
+    if (!known) return;
+    execFile(path.join(os.homedir(), ".claude", "bin", "claude-switch"), ["use", email], { timeout: 60_000 }, (err, stdout, stderr) => {
+      const out = String(err ? stderr || stdout || err.message : stdout || stderr || "done").trim().split("\n").filter(Boolean).pop() ?? "";
+      vscode.window.setStatusBarMessage(`claude-switch use ${email}: ${out.slice(0, 160)}`, 8000);
+      pushUsagePayload();
+    });
+  }
   ctx.subscriptions.push(
     vscode.window.registerWebviewViewProvider("claudeSessionMonitor.limits", limitsView),
   );
@@ -2199,11 +2293,35 @@ export function activate(ctx: vscode.ExtensionContext): void {
           planLabels(),
       );
       const panel = readPanel();
+      const fresh = panelFresh(panel, Date.now());
+      const open = ctx.workspaceState.get<boolean>("csm.switchActivityOpen", false);
+      const emailById = new Map(payload.accounts.map((a) => [a.id, a.email] as const));
+      let providers = decorateCards(payload.providers).map((p) => ({ ...p, email: p.accountId ? emailById.get(p.accountId) ?? p.label.replace(/^Claude · /, "") : p.label.replace(/^(Claude|Codex) · /, "") }));
+      if (fresh) {
+        providers = orderCards(providers, panel);
+        const claudeNames = displayNames(providers.filter((p) => p.provider === "claude").map((p) => p.email ?? p.label));
+        let ci = 0;
+        const badges = allBadges(panel);
+        providers = providers.map((p) => {
+          const email = p.email ?? p.label;
+          const b = p.provider === "claude" ? badges[email] ?? {} : {};
+          const hdr: CardHeader = {
+            ...(b.rank !== undefined ? { rank: b.rank } : {}),
+            name: p.provider === "claude" ? claudeNames[ci++] : "Codex",
+            ...headerChip({ active: p.provider === "claude" && p.active, loginNeeded: !!p.loginNeeded || !!b.loginNeeded, gauges: p.official ? p.gauges : [] }),
+            worst: worstGauge(p.official ? p.gauges : []),
+          };
+          return { ...p, hdr };
+        });
+      }
       limitsView.update({
         ...payload,
-        providers: decorateCards(payload.providers),
-        switchHtml: renderSwitchBlock(panel, Date.now()),
+        providers,
+        switchHtml: renderSwitchBlock(panel, Date.now(), open),
         switchBadges: allBadges(panel),
+        panelFresh: fresh,
+        ui: { switchActivityOpen: open, expandedAccounts: ctx.workspaceState.get<Record<string, boolean>>("csm.expandedAccounts", {}) },
+        useEmails: fresh ? (panel.accounts ?? []).map((a) => a.email) : [],
       });
       updateStatusBar(
         statusBar,
@@ -2273,6 +2391,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (claudeEnabled() && now - lastOthersCheck > 30) {
       lastOthersCheck = now;
       accountsFile = readAccountsFile();
+      const panel0 = readPanel();
+      if (panelFresh(panel0, Date.now())) {
+        const merged = mergePanelAccounts(accountsFile, panel0);
+        if (merged !== accountsFile) {
+          accountsFile = merged;
+          writeAccountsFile(accountsFile);
+        }
+      }
       void pollOtherAccounts(false);
     }
 

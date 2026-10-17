@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.17.0
+- New setting `claudeSessionMonitor.showTokenStats` (default off): the `Tokens, all logins` row and the `Models, 7d share` block at the bottom of Usage Limits are hidden unless enabled, and the per-model share is not computed while it is off. Takes effect without a reload.
+- Compact layout for 8+ accounts: a collapsed account card is one 25 px line including its separator, the claude-switch block is tighter, and long names end in an ellipsis. Expanded cards keep the long thin 4 px bars.
+
 ## 2.16.0
 - Usage Limits view simplified. The claude-switch block is now two lines (`claude-switch · <email> · #<rank> · auto|PAUSED`, then `next: ...`) plus a collapsed `Activity (n)` row that opens the last 8 meaningful events (switch, restore, login, error, rollback, pause/resume, offline, rate limit); state is remembered per workspace.
 - Account cards are ordered by claude-switch priority (Codex last) and collapse to one header line: `#rank name`, a status chip (`active`, `ready`, `exhausted · time to reset`, `login needed`) and the worst gauge. The active account starts expanded, the rest collapsed; the choice is remembered per account.

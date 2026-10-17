@@ -546,6 +546,7 @@ interface LimitsPayload {
   providers: UsageProviderCard[];
   switchHtml?: string; // claude-switch block, rendered host-side by switchPanel.ts
   switchBadges?: Record<string, { rank?: number; loginNeeded?: string }>; // by account email
+  showTokenStats?: boolean; // render the Tokens row + Models block (claudeSessionMonitor.showTokenStats)
   panelFresh?: boolean; // claude-switch owns switching: simplified cards, no Rotate
   ui?: { switchActivityOpen: boolean; expandedAccounts: Record<string, boolean> }; // persisted in workspaceState
   useEmails?: string[]; // non-active accounts the panel can switch to
@@ -705,6 +706,7 @@ function buildLimitsPayload(
   codexSnapshot: CodexProviderSnapshot | null = null,
   enabledProviders: ReadonlyArray<AgentProvider> = ["claude"],
   planLabels: Record<string, string> = {},
+  showTokenStats = false,
 ): LimitsPayload {
   const now = Date.now() / 1000;
   const gauges: Gauge[] = [];
@@ -755,7 +757,7 @@ function buildLimitsPayload(
   const eta = computeBurnEta(history, g5?.pct ?? null, g5?.resetMs ?? null, Date.now());
 
   let models: ModelRow[] = [];
-  if (tokens?.byModel7d) {
+  if (showTokenStats && tokens?.byModel7d) {
     const entries = Object.entries(tokens.byModel7d).sort((a, b) => b[1].tokens - a[1].tokens);
     const total = entries.reduce((s, [, m]) => s + m.tokens, 0) || 1;
     models = entries.slice(0, 6).map(([id, m]) => ({
@@ -954,8 +956,8 @@ function limitsHtml(): string {
   .ctitle.sw:hover { text-decoration:underline; }
   .best { color: var(--vscode-charts-yellow, #e6b800); font-size:11px; }
   .cwarn { color: var(--vscode-charts-yellow, #e6b800); font-size:11px; cursor:help; }
-  .swblock { padding:0 0 8px; margin-bottom:2px; border-bottom:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
-  .swline { font-size:11px; line-height:1.45; overflow-wrap:anywhere; }
+  .swblock { padding:0 0 4px; margin-bottom:0; border-bottom:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
+  .swline { font-size:11px; line-height:1.3; overflow-wrap:anywhere; }
   .swline.sw-hint, .swline.sw-info { color: var(--vscode-descriptionForeground); }
   .swline.sw-error, .swline.sw-needsLogin { color: var(--vscode-descriptionForeground); }
   .swrank { color: var(--vscode-descriptionForeground); font-size:11px; }
@@ -965,12 +967,17 @@ function limitsHtml(): string {
   .swtoggle:hover { color: var(--vscode-foreground); }
   .swline.sw-muted { color: var(--vscode-descriptionForeground); opacity:.7; }
   .swevents[hidden] { display:none; }
-  .chdr { display:flex; align-items:baseline; gap:6px; cursor:pointer; min-width:0; user-select:none; }
+  /* Collapsed card = one 16px line + 4px padding top and bottom + 1px separator = 25px. */
+  .card.ccard { padding:4px 0; }
+  .card.ccard:first-child { padding-top:0; }
+  .chdr { display:flex; align-items:center; gap:6px; cursor:pointer; min-width:0; overflow:hidden; height:16px; line-height:16px; user-select:none; }
+  .chdr .ctitle { flex:0 1 auto; min-width:0; }
+  .chdr .chip { flex:none; }
   .chdr .chev { color: var(--vscode-descriptionForeground); font-size:10px; width:10px; flex:none; }
-  .chdr .cworst { margin-left:auto; font-size:11px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
+  .chdr .cworst { margin-left:auto; flex:none; font-size:11px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .chip { font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .chip.login { color: var(--vscode-charts-red, #f14c4c); font-weight:600; }
-  .cbody { margin-top:7px; }
+  .cbody { margin-top:4px; padding-bottom:4px; }
   .useacct { border:0; background:transparent; color: var(--vscode-textLink-foreground); font:inherit; font-size:11px; cursor:pointer; padding:0; margin-top:4px; }
   .useacct:hover { text-decoration:underline; }
   .rot { display:flex; justify-content:flex-end; margin:0 0 2px; }
@@ -1131,7 +1138,7 @@ function chipHtml(h){
 // Simplified card: ONE always-visible header line, gauge rows only when expanded.
 function collapsibleCard(card){
   const h = card.hdr, open = expandedOf(card);
-  let out = '<div class="card" data-testid="csm-account-row"><div class="chdr" role="button" tabindex="0" data-toggle="'+esc(card.id)+'" aria-expanded="'+open+'" title="'+esc(card.label)+'">'
+  let out = '<div class="card ccard" data-testid="csm-account-row"><div class="chdr" role="button" tabindex="0" data-toggle="'+esc(card.id)+'" aria-expanded="'+open+'" title="'+esc(card.label)+'">'
     + '<span class="chev">'+(open?'▾':'▸')+'</span>'
     + '<span class="ctitle">'+(h.rank?'<span class="swrank num">#'+h.rank+'</span> ':'')+esc(h.name)+'</span>'
     + chipHtml(h)
@@ -1174,8 +1181,10 @@ function render(){
   for(const c of cards) h += (last.panelFresh && c.hdr) ? collapsibleCard(c) : providerCard(c);
   if(cards.some(c=>c.provider==='claude')){
     const multiAcct = !!(last.accounts && last.accounts.length > 1);
-    h += tokenFoot(last.tokens, multiAcct);
-    h += modelSection(last.models);
+    if(last.showTokenStats){
+      h += tokenFoot(last.tokens, multiAcct);
+      h += modelSection(last.models);
+    }
   }
   const limited = last.limited||[];
   if(limited.length){
@@ -1234,6 +1243,7 @@ setInterval(render, 1000); // keep countdowns live
 
 export function activate(ctx: vscode.ExtensionContext): void {
   const cfg = () => vscode.workspace.getConfiguration("claudeSessionMonitor");
+  const showTokenStats = (): boolean => cfg().get<boolean>("showTokenStats", false);
   const workspaceCwd = () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const trackAllAccounts = () => cfg().get<boolean>("trackAllAccounts", true);
   // planLabels: { "<email>" | "claude" | "codex": "$200 Max" } — manual override
@@ -2291,6 +2301,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           codexEnabled() ? codexSnapshot : null,
           enabledProviders(),
           planLabels(),
+          showTokenStats(),
       );
       const panel = readPanel();
       const fresh = panelFresh(panel, Date.now());
@@ -2320,6 +2331,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         switchHtml: renderSwitchBlock(panel, Date.now(), open),
         switchBadges: allBadges(panel),
         panelFresh: fresh,
+        showTokenStats: showTokenStats(),
         ui: { switchActivityOpen: open, expandedAccounts: ctx.workspaceState.get<Record<string, boolean>>("csm.expandedAccounts", {}) },
         useEmails: fresh ? (panel.accounts ?? []).map((a) => a.email) : [],
       });
@@ -2991,6 +3003,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         clearInterval(pollTimer);
         pollTimer = setInterval(refresh, Math.max(500, cfg().get<number>("pollIntervalMs", 1500)));
       }
+      if (e.affectsConfiguration("claudeSessionMonitor.showTokenStats")) pushUsagePayload();
       if (
         e.affectsConfiguration("claudeSessionMonitor.enableClaude") ||
         e.affectsConfiguration("claudeSessionMonitor.enableCodex") ||

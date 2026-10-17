@@ -175,4 +175,42 @@ describe("Usage Limits webview", () => {
     h.key("swtoggle", "1", " ");
     expect(h.root.innerHTML).toContain('data-testid="csm-switch-activity" hidden');
   });
+  it("hides the Tokens row and Models block unless showTokenStats is set", () => {
+    const base = {
+      type: "update", ts: Date.now() / 1000, official: true, accounts: [], eta: null,
+      tokens: { fiveHour: 1e6, sevenDay: 5e7 }, models: [{ name: "Opus", tokens: 5e7, pct: 100, cost: null }],
+      providers: [{ id: "c:a", provider: "claude", label: "one@example.com", active: true, official: true, ts: Date.now() / 1000, note: null, gauges: [gauge("session", "Session (5h)", 30)] }],
+    };
+    const off = mount();
+    off.send(base);
+    expect(off.root.innerHTML).not.toContain("Tokens");
+    expect(off.root.innerHTML).not.toContain("Models, 7d share");
+    const on = mount();
+    on.send({ ...base, showTokenStats: true });
+    expect(on.root.innerHTML).toContain("Tokens");
+    expect(on.root.innerHTML).toContain("Models, 7d share");
+  });
+
+  it("renders 8 Claude accounts + Codex as 9 collapsed headers and one expanded active card", () => {
+    const h = mount();
+    const now = Date.now();
+    const mkHdr = (name: string, active: boolean, g: ReturnType<typeof gauge>[]): CardHeader => ({ name, ...headerChip({ active, loginNeeded: false, gauges: g }), worst: worstGauge(g) });
+    const providers = Array.from({ length: 8 }, (_, n) => {
+      const g = [gauge("session", "Session (5h)", 10 * n), gauge("weekly", "Weekly (7d)", 5 * n)];
+      const email = `acct${n}@example.com`;
+      return { id: `claude:${n}`, provider: "claude", label: `Claude · ${email}`, email, accountId: String(n), active: n === 3, official: true, ts: now / 1000, note: null, gauges: g, hdr: mkHdr(`acct${n}`, n === 3, g) };
+    });
+    const cg = [gauge("primary", "Session", 0)];
+    providers.push({ id: "codex", provider: "codex", label: "Codex", email: "Codex", accountId: "", active: false, official: true, ts: now / 1000, note: null, gauges: cg, hdr: mkHdr("Codex", false, cg) });
+    h.send({
+      type: "update", ts: now / 1000, official: true, accounts: providers.slice(0, 8).map((p) => ({ id: p.accountId })), eta: null, tokens: null, models: [],
+      panelFresh: true, ui: { switchActivityOpen: false, expandedAccounts: {} }, useEmails: [], providers,
+    });
+    const html = h.root.innerHTML;
+    expect(html.match(/data-toggle=/g)).toHaveLength(9);
+    expect(html.match(/aria-expanded="false"/g)).toHaveLength(8);
+    expect(html.match(/aria-expanded="true"/g)).toHaveLength(1);
+    expect(html.match(/class="cbody"/g)).toHaveLength(1);
+    expect(html.match(/class="bar"/g)).toHaveLength(2);
+  });
 });

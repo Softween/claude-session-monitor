@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.19.0
+- Phantom hook records are hidden and cleaned up: the burst of one-per-tab `SessionStart`/`SessionEnd` records an account switch leaves behind (no transcript, dead pid or past a 10 min grace) no longer shows as empty "your turn" rows.
+- The Usage Limits refresh button also runs `claude-switch tick --fresh` (when the CLI is installed) so pressing it lets claude-switch decide on a switch.
+
 ## 2.18.0
 - Every account header now lists all of its limits as plain text on the right (`Session 27% · Weekly 71% · Fable 100%`): session, weekly, then model-scoped weeklies, percentages from 90% in red. Below ~360 px of header width the labels shorten to `S · W · F`. Missing gauges are omitted; the status chip and expanded body are unchanged.
 

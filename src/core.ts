@@ -675,6 +675,39 @@ export interface CollectOpts {
   hookStatuses?: Map<string, HookStatus>; // injectable for tests; default readHookStatuses()
   showEnded?: boolean; // default false: closed/ended sessions are hidden entirely
   globalEffort?: string; // injectable for tests; default readGlobalEffort()
+  phantomGraceSec?: number; // default 600
+  pidAlive?: (pid?: number) => boolean | undefined; // injectable for tests
+}
+
+/** true: alive, false: dead, undefined: unknown (no/invalid pid). */
+export function pidAlive(pid?: number): boolean | undefined {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return undefined;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    return undefined;
+  }
+}
+
+/**
+ * A hook record whose transcript never appeared and whose tab is gone: the
+ * burst of SessionStart/SessionEnd records an account switch leaves behind.
+ * A brand-new tab (pid alive, no prompt yet, within the grace period) is kept.
+ */
+export function isPhantom(
+  hook: HookStatus,
+  now: number,
+  opts: { graceSec?: number; alive?: (pid?: number) => boolean | undefined; exists?: (p: string) => boolean } = {},
+): boolean {
+  const exists = opts.exists ?? ((p: string) => fs.existsSync(p));
+  if (hook.transcript_path && exists(hook.transcript_path)) return false;
+  const alive = opts.alive ?? pidAlive;
+  const graceSec = opts.graceSec ?? 600;
+  return hook.state === "ended" || alive(hook.pid) === false || now - hook.ts > graceSec;
 }
 
 function entrypointAllowed(ep: string | undefined, allowed: string[]): boolean {
@@ -706,6 +739,10 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
       txCache.set(txPath, tx);
     }
     const hook = hooks.get(sid);
+
+    // Drop phantom hook records (account-switch tab bursts that never got a transcript).
+    if (hook && !(txPath && fs.existsSync(txPath)) && isPhantom(hook, now, { graceSec: opts.phantomGraceSec, alive: opts.pidAlive }))
+      continue;
 
     // Filter out observer / SDK-subagent sessions.
     if (!entrypointAllowed(tx?.entrypoint, allowed)) continue;
@@ -815,7 +852,7 @@ export function cleanupEndedMonitorFiles(now: number, staleMs = 12 * 3600 * 1000
       let ended = false;
       try {
         const obj = JSON.parse(fs.readFileSync(full, "utf8")) as HookStatus;
-        ended = obj.state === "ended";
+        ended = obj.state === "ended" || isPhantom(obj, now);
       } catch {
         ended = true; // unreadable -> safe to drop
       }

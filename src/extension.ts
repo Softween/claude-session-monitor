@@ -2860,6 +2860,22 @@ export function activate(ctx: vscode.ExtensionContext): void {
           : Promise.resolve(),
         codexEnabled() ? pollCodex(true) : Promise.resolve(),
       ]);
+      try {
+        const cli = path.join(os.homedir(), ".claude", "bin", "claude-switch");
+        if (fs.existsSync(cli)) {
+          execFile(cli, ["tick", "--fresh"], { timeout: 90_000 }, (err, stdout, stderr) => {
+            try {
+              const out = String(err ? stderr || stdout || err.message : stdout || stderr || "done").trim().split("\n").filter(Boolean).pop() ?? "";
+              vscode.window.setStatusBarMessage(`claude-switch: ${out.slice(0, 160)}`, 8000);
+              pushUsagePayload();
+            } catch {
+              /* never fail the refresh */
+            }
+          });
+        }
+      } catch {
+        /* never fail the refresh */
+      }
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.switchAccount", () => pickAndSwitchAccount()),
     vscode.commands.registerCommand("claudeSessionMonitor.switchToBestAccount", () => rotateToBest()),

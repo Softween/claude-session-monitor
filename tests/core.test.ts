@@ -9,6 +9,9 @@ import {
   humanizeAge,
   parseTranscriptTail,
   collectSessions,
+  isPhantom,
+  pidAlive,
+  cleanupEndedMonitorFiles,
   readGlobalEffort,
   writeGlobalEffort,
   countBuckets,
@@ -1064,5 +1067,57 @@ describe("account registry", () => {
     const file = path.join(tmp, "snap-acct.json");
     writeOfficialSnapshot({ gauges: [{ key: "session", label: "Session (5h)", pct: 7, resetMs: null }], ts: 123, tokenStale: true }, file);
     expect(readOfficialSnapshot(file)!.tokenStale).toBe(true);
+  });
+});
+
+// --- phantom hook records ---------------------------------------------------
+
+describe("phantom hook records", () => {
+  const NOW_S = 1_800_000_000;
+  const mk = (over: Partial<HookStatus>): HookStatus =>
+    ({ session_id: "s1", state: "idle", event: "SessionStart", ts: NOW_S - 30, cwd: "/x", ...over }) as HookStatus;
+  const collect = (h: HookStatus, alive: boolean | undefined) =>
+    collectSessions({
+      now: NOW_S,
+      hookStatuses: new Map([[h.session_id, h]]),
+      extraTranscripts: [],
+      globalEffort: "high",
+      pidAlive: () => alive,
+    });
+
+  it("hides idle record with dead pid and no transcript", () => {
+    expect(collect(mk({ pid: 99999999, transcript_path: path.join(tmp, "nope.jsonl") }), false)).toHaveLength(0);
+  });
+  it("shows idle record with alive pid, 30s old, no transcript", () => {
+    expect(collect(mk({ pid: 1, transcript_path: path.join(tmp, "nope.jsonl") }), true)).toHaveLength(1);
+  });
+  it("shows record whose transcript exists even if pid is dead", () => {
+    const t = path.join(tmp, "t.jsonl");
+    fs.writeFileSync(t, JSON.stringify({ type: "user", message: { role: "user", content: "hi" }, timestamp: new Date(NOW_S * 1000).toISOString() }) + "\n");
+    expect(collect(mk({ pid: 99999999, transcript_path: t }), false)).toHaveLength(1);
+  });
+  it("isPhantom: ended without transcript, and old without pid", () => {
+    const exists = () => false;
+    expect(isPhantom(mk({ state: "ended" }), NOW_S, { exists, alive: () => true })).toBe(true);
+    expect(isPhantom(mk({ ts: NOW_S - 700 }), NOW_S, { exists, alive: () => undefined })).toBe(true);
+    expect(isPhantom(mk({}), NOW_S, { exists, alive: () => true })).toBe(false);
+  });
+  it("pidAlive: own pid alive, invalid undefined", () => {
+    expect(pidAlive(process.pid)).toBe(true);
+    expect(pidAlive(undefined)).toBeUndefined();
+  });
+  it("cleanup removes phantoms, keeps live-tab and transcript records", () => {
+    const real = Math.floor(Date.now() / 1000);
+    const t = path.join(tmp, "t.jsonl");
+    fs.writeFileSync(t, "{}\n");
+    const w = (n: string, h: HookStatus) => fs.writeFileSync(path.join(tmp, n), JSON.stringify(h));
+    w("phantom.json", mk({ session_id: "phantom", ts: real - 3000, transcript_path: path.join(tmp, "none.jsonl") }));
+    w("live.json", mk({ session_id: "live", pid: process.pid, ts: real - 30, transcript_path: path.join(tmp, "none2.jsonl") }));
+    w("withtx.json", mk({ session_id: "withtx", ts: real - 3000, transcript_path: t }));
+    const removed = cleanupEndedMonitorFiles(real, 12 * 3600 * 1000, tmp);
+    expect(removed).toBe(1);
+    expect(fs.existsSync(path.join(tmp, "phantom.json"))).toBe(false);
+    expect(fs.existsSync(path.join(tmp, "live.json"))).toBe(true);
+    expect(fs.existsSync(path.join(tmp, "withtx.json"))).toBe(true);
   });
 });

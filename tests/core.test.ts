@@ -8,6 +8,7 @@ import {
   formatReset,
   humanizeAge,
   parseTranscriptTail,
+  parseClosingStatus,
   collectSessions,
   isPhantom,
   pidAlive,
@@ -729,6 +730,70 @@ describe("resolve / collectSessions branch coverage", () => {
       { type: "assistant", entrypoint: "claude-vscode", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 7200) },
     ], NOW - 7200);
     expect(collect([{ session_id: "mx", state: "idle", ts: NOW - 7200, cwd: "/repo", transcript_path: old }], { maxAgeSec: 3600 }).find((x) => x.sessionId === "mx")).toBeUndefined();
+  });
+});
+
+describe("parseClosingStatus", () => {
+  it("parses the three canonical closing lines", () => {
+    expect(parseClosingStatus("body\n\n✅ Bu sohbetteki işler tamamlandı, kapatabilirsin.")).toEqual({
+      kind: "done",
+      text: "Bu sohbetteki işler tamamlandı, kapatabilirsin.",
+    });
+    expect(parseClosingStatus("body\n⏳ Kapatma: CI   bitince  (~10 dk)")).toEqual({ kind: "pending", text: "Kapatma: CI bitince (~10 dk)" });
+    expect(parseClosingStatus("🟡 Senden bekliyor: deploy onayı")).toEqual({ kind: "blocked", text: "Senden bekliyor: deploy onayı" });
+  });
+
+  it("accepts markdown emphasis and a trailing whitespace-only or plain line", () => {
+    expect(parseClosingStatus("body\n**✅ Bu sohbetteki işler tamamlandı, kapatabilirsin.**")).toEqual({
+      kind: "done",
+      text: "Bu sohbetteki işler tamamlandı, kapatabilirsin.",
+    });
+    expect(parseClosingStatus("body\n⏳ Kapatma: deploy bekleniyor\n   \n")?.kind).toBe("pending");
+    expect(parseClosingStatus("body\n🟡 Senden bekliyor: onay\nfootnote")?.kind).toBe("blocked");
+  });
+
+  it("ignores a marker mid-message and empty text", () => {
+    expect(parseClosingStatus("Tests ✅ all green\nmore detail\nplain last line")).toBeUndefined();
+    expect(parseClosingStatus("")).toBeUndefined();
+  });
+});
+
+describe("closing status line from transcripts", () => {
+  const closingLines = (id: string) => [
+    { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "ship it" }] }, timestamp: iso(NOW - 40) },
+    { type: "assistant", message: { id, content: [{ type: "thinking", thinking: "plan" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 31) },
+    { type: "assistant", message: { id, content: [{ type: "text", text: "Pushed.\n\n⏳ Kapatma: deploy bekleniyor" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 30) },
+  ];
+  const collect = (hooks: HookStatus[]) =>
+    collectSessions({
+      now: NOW,
+      hookStatuses: new Map(hooks.map((h) => [h.session_id, h])),
+      extraTranscripts: [],
+      maxAgeSec: 24 * 3600,
+      hideEndedOlderThanSec: 24 * 3600,
+    });
+
+  it("reads the marker from the end_turn text line and clears it on a newer user line", () => {
+    const p = writeTranscript("cl.jsonl", closingLines("msg_1"));
+    expect(parseTranscriptTail(p).closing).toEqual({ kind: "pending", text: "Kapatma: deploy bekleniyor" });
+    fs.appendFileSync(p, JSON.stringify({ type: "user", message: { content: [{ type: "text", text: "next" }] }, timestamp: iso(NOW - 5) }) + "\n");
+    expect(parseTranscriptTail(p).closing).toBeUndefined();
+  });
+
+  it("surfaces closing only on a your-turn session", () => {
+    const idle = writeTranscript("ci.jsonl", closingLines("msg_2"));
+    const busy = writeTranscript("cw.jsonl", closingLines("msg_3"));
+    const views = collect([
+      { session_id: "ci", state: "idle", ts: NOW - 35, cwd: "/repo", transcript_path: idle },
+      { session_id: "cw", state: "working", ts: NOW - 10, cwd: "/repo", transcript_path: busy },
+    ]);
+    const ci = views.find((x) => x.sessionId === "ci");
+    expect(ci?.sub).toBe("your turn");
+    expect(ci?.closing?.kind).toBe("pending");
+    expect(ci?.tooltip).toContain("closing: ⏳");
+    const cw = views.find((x) => x.sessionId === "cw");
+    expect(cw?.bucket).toBe("working");
+    expect(cw?.closing).toBeUndefined();
   });
 });
 

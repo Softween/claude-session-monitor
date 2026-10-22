@@ -2,6 +2,9 @@ export type AgentProvider = "claude" | "codex";
 
 export type SessionBucket = "limited" | "attention" | "working" | "ended" | "unknown";
 
+export type ClosingKind = "done" | "pending" | "blocked";
+export interface ClosingStatus { kind: ClosingKind; text: string }
+
 export interface SessionCapabilities {
   focus: boolean;
   transcript: boolean;
@@ -51,6 +54,8 @@ export interface SessionView {
   entrypoint?: string;
   pid?: number;
   stale: boolean;
+  /** Closing status line of the final assistant message; set only for idle "your turn" sessions. */
+  closing?: ClosingStatus;
   model?: string;
   effort?: string;
   tokens?: number;

@@ -5,6 +5,7 @@
  */
 import {
   classifyLimit,
+  closingEmoji,
   collectSessions,
   countBuckets,
   findRecentTranscripts,
@@ -52,8 +53,9 @@ console.log(`  buckets: ${JSON.stringify(countBuckets(views))}  (total ${views.l
 for (const v of views) {
   const age = humanizeAge(v.lastActivityMs ? now - v.lastActivityMs / 1000 : 0);
   const me = [v.model, v.effort].filter(Boolean).join("·") || "-";
+  const mark = v.closing ? ` ${closingEmoji(v.closing.kind)} ${v.closing.text.slice(0, 40)}` : "";
   console.log(
-    `  [${v.bucket.padEnd(9)}] ${v.sub.padEnd(22)} ${age.padEnd(5)} ${me.padEnd(26)} ${JSON.stringify(v.title.slice(0, 42))} ${v.cwdLabel ?? ""}`,
+    `  [${v.bucket.padEnd(9)}] ${v.sub.padEnd(22)} ${age.padEnd(5)} ${me.padEnd(26)} ${JSON.stringify(v.title.slice(0, 42))} ${v.cwdLabel ?? ""}${mark}`,
   );
 }
 

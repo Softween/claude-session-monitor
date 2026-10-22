@@ -97,6 +97,7 @@ import {
   providerLabel,
   sessionKey,
   type AgentProvider,
+  type ClosingKind,
   type ProviderHealth,
 } from "./providers/types";
 import {
@@ -238,6 +239,8 @@ interface SessionRow {
   rssMb: number | null;
   cpuHog: boolean;
   stale: boolean; // "working" but silent — warning tint on the state dot
+  closing: "" | ClosingKind; // "your turn" closing status line, replaces the dot ("" when none)
+  closingText: string; // text after the closing emoji ("" when none)
   ended: boolean;
   canTranscript: boolean;
   canKill: boolean;
@@ -316,13 +319,14 @@ function sessionsHtml(): string {
      (actions replace the age on hover). The hairline under the row is this chat's
      share of the machine's 5h total — who is eating the limit reads as geometry.
      Kept to one line so the list stays short; the usage view below is the main event. */
-  .row { position:relative; display:grid; grid-template-columns: 8px minmax(0,1fr) auto auto;
+  .row { position:relative; display:grid; grid-template-columns: 14px minmax(0,1fr) auto auto;
     column-gap:8px; align-items:center; padding:3px 12px 4px; cursor:pointer; }
   .row:hover { background: var(--vscode-list-hoverBackground, rgba(127,127,127,.12)); }
   .row:focus { outline: 1px solid var(--vscode-focusBorder, #007fd4); outline-offset: -1px; }
   .row.ended { opacity: .5; }
-  .dot { grid-row:1; width:7px; height:7px; border-radius:50%; }
+  .dot { grid-row:1; justify-self:center; width:7px; height:7px; border-radius:50%; }
   .dot.stale { box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-charts-yellow, #e6b800) 35%, transparent); }
+  .mark { grid-row:1; justify-self:center; font-size:11px; line-height:1; }
   .title { grid-row:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .right { grid-row:1; display:flex; align-items:center; gap:2px; color: var(--vscode-descriptionForeground); }
   .meta { font-size:11px; color: var(--vscode-descriptionForeground); }
@@ -355,6 +359,8 @@ const GCOLOR = {
   ended: 'var(--vscode-disabledForeground, #888)',
   unknown: 'var(--vscode-disabledForeground, #888)'
 };
+const MARK = { done:'✅', pending:'⏳', blocked:'🟡' };
+const MARK_LABEL = { done:'done, safe to close', pending:'waiting on a background job', blocked:'needs your decision' };
 // Ended and unknown sessions are the long tail; they fold to one line by default.
 const FOLDABLE = { ended:true, unknown:true };
 const saved = vscodeApi.getState() || {};
@@ -390,7 +396,9 @@ function rowHtml(r, gkey){
             ? '<button class="act" data-act="kill" title="Kill process (SIGTERM)" aria-label="Kill process">⊘</button>'
             : (r.canResume?'<button class="act" data-act="resume" title="Resume in terminal" aria-label="Resume in terminal">↻</button>':'')));
   return '<div class="row'+(r.ended?' ended':'')+'" role="row" tabindex="0" data-id="'+esc(r.id)+'" title="'+esc(r.tip)+'">'
-    + '<span class="dot'+(r.stale?' stale':'')+'" style="background:'+GCOLOR[gkey]+'"></span>'
+    + (r.closing
+        ? '<span class="mark" role="img" aria-label="'+MARK_LABEL[r.closing]+'" title="'+esc(MARK[r.closing]+' '+r.closingText)+'">'+MARK[r.closing]+'</span>'
+        : '<span class="dot'+(r.stale?' stale':'')+'" style="background:'+GCOLOR[gkey]+'"></span>')
     + '<span class="title">'+esc(r.title)+(meta?' <span class="meta">· '+meta+'</span>':'')+'</span>'
     + '<span class="tok num">'+(r.tokens ? '<b>'+esc(r.tokens)+'</b>'+(r.share>=1?' · '+r.share+'%':'') : '')+'</span>'
     + '<span class="right"><span class="num age" data-last="'+r.lastMs+'">'+fmtAge(r.lastMs)+'</span><span class="acts">'+acts+'</span></span>'
@@ -3238,6 +3246,8 @@ function buildSessionsPayload(
       rssMb: res ? res.rssMb : null,
       cpuHog: !!res && res.cpu >= cpuHogThreshold,
       stale: g === "working" && v.stale,
+      closing: g === "done" && v.closing ? v.closing.kind : "",
+      closingText: g === "done" && v.closing ? v.closing.text : "",
       ended: g === "ended",
       canTranscript: v.capabilities.transcript,
       canKill: v.capabilities.kill,

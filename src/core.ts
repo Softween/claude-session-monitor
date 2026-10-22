@@ -21,12 +21,14 @@ import * as path from "path";
 import {
   defaultCapabilities,
   sessionKey,
+  type ClosingKind,
+  type ClosingStatus,
   type SessionBucket,
   type SessionHookStatus,
   type SessionView,
 } from "./providers/types";
 
-export type { AgentProvider, SessionView } from "./providers/types";
+export type { AgentProvider, ClosingKind, ClosingStatus, SessionView } from "./providers/types";
 
 export const HOME = os.homedir();
 export const MONITOR_DIR = path.join(HOME, ".claude", "session-monitor");
@@ -73,6 +75,7 @@ export interface TxInfo {
   sizeBytes: number;
   cwd?: string;
   model?: string; // model id of the newest assistant line (message.model)
+  closing?: ClosingStatus; // closing status line of the newest end_turn text
 }
 
 export const BUCKET_ORDER: Record<Bucket, number> = {
@@ -187,6 +190,19 @@ function extractText(obj: any): string {
   return "";
 }
 
+/** Like extractText, but the LAST text block (the closing status line ends the message). */
+function lastText(obj: any): string {
+  const content = obj?.message?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    for (let i = content.length - 1; i >= 0; i--) {
+      const block = content[i];
+      if (block && typeof block.text === "string") return block.text;
+    }
+  }
+  return "";
+}
+
 /**
  * Trim + collapse whitespace on a title candidate, and reject machine-generated
  * blobs (task-notification / system-reminder XML-ish content that leaks into
@@ -210,6 +226,27 @@ export function classifyLimit(text: string, status?: number): LimitInfo | null {
     return { kind: "rate", text, status };
   }
   return null;
+}
+
+const CLOSING_RE = /^[\s*_>`#-]*(✅|⏳|🟡)\uFE0F?\s*(.*?)[\s*_`]*$/u;
+const CLOSING_KIND: Record<string, ClosingKind> = { "✅": "done", "⏳": "pending", "🟡": "blocked" };
+const CLOSING_EMOJI: Record<ClosingKind, string> = { done: "✅", pending: "⏳", blocked: "🟡" };
+
+/**
+ * The house-rule closing status line (✅ done / ⏳ pending / 🟡 blocked) that
+ * ends a final assistant message. Checks the last two non-empty lines, newest first.
+ */
+export function parseClosingStatus(text: string): ClosingStatus | undefined {
+  const lines = text.split("\n").filter((l) => l.trim()).slice(-2).reverse();
+  for (const ln of lines) {
+    const m = ln.match(CLOSING_RE);
+    if (m) return { kind: CLOSING_KIND[m[1]], text: m[2].replace(/\s+/g, " ").trim().slice(0, 240) };
+  }
+  return undefined;
+}
+
+export function closingEmoji(kind: ClosingKind): string {
+  return CLOSING_EMOJI[kind];
 }
 
 /** Classify one user/assistant transcript line. */
@@ -312,6 +349,11 @@ function parseWindow(file: string, stat: fs.Stats, maxBytes: number): TxInfo {
         info.convKind = c.kind;
         info.convType = c.ctype;
         info.limit = c.kind === "api_error" ? c.limit : undefined;
+        // A thinking-only end_turn line has no text and keeps the marker its later
+        // text line sets; any other newer user/assistant line clears it.
+        const t = c.kind === "end_turn" ? lastText(obj) : "";
+        if (t) info.closing = parseClosingStatus(t);
+        else if (c.kind !== "end_turn") info.closing = undefined;
       }
     }
   }
@@ -508,6 +550,7 @@ function resolve(
     }
   }
 
+  const closing = bucket === "attention" && sub === "your turn" ? tx?.closing : undefined;
   const ageStr = lastActivity ? humanizeAge(now - lastActivity) : "";
   const parts: string[] = [];
   if (resetText) parts.push(`reset ${formatReset(resetText, now)}`);
@@ -519,6 +562,7 @@ function resolve(
     title,
     "provider: Claude",
     `status: ${sub}`,
+    closing ? `closing: ${closingEmoji(closing.kind)} ${closing.text}` : "",
     model ? `model: ${model}` : "",
     effort ? `effort: ${effort}` : "",
     cwd ? `cwd: ${cwd}` : "",
@@ -553,6 +597,7 @@ function resolve(
     entrypoint,
     pid: hook?.pid,
     stale,
+    closing,
     model,
     effort,
     matchLabels,

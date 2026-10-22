@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.20.0
+- Rows in the Your turn group show the session's closing status instead of the blue dot: ✅ done and safe to close, ⏳ waiting on a background job, 🟡 needs your decision. It is read from the last line of the final assistant message; rows without one keep the dot. The tooltip gains a `closing:` line.
+
 ## 2.19.0
 - Phantom hook records are hidden and cleaned up: the burst of one-per-tab `SessionStart`/`SessionEnd` records an account switch leaves behind (no transcript, dead pid or past a 10 min grace) no longer shows as empty "your turn" rows.
 - The Usage Limits refresh button also runs `claude-switch tick --fresh` (when the CLI is installed) so pressing it lets claude-switch decide on a switch.

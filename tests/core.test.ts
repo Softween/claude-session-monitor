@@ -405,6 +405,22 @@ describe("readGlobalEffort / effort + model surfacing", () => {
     expect(v?.tooltip).toContain("model: claude-opus-4-8");
     expect(v?.tooltip).toContain("effort: high");
   });
+
+  it("prefers the per-session effort stamped on assistant lines over the global setting", () => {
+    const p = writeTranscript("eff.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 30) },
+      { type: "assistant", effort: "max", perTurnEffort: "max", message: { content: [{ type: "text", text: "a" }], stop_reason: "end_turn", model: "claude-opus-5-5" }, timestamp: iso(NOW - 20) },
+      // Locally injected notices carry no effort and must not clear the real one.
+      { type: "assistant", perTurnEffort: "max", message: { content: [{ type: "text", text: "API Error" }], stop_reason: "end_turn", model: "<synthetic>" }, timestamp: iso(NOW - 10) },
+    ]);
+    const map = new Map<string, HookStatus>([
+      ["e", { session_id: "e", state: "idle", ts: NOW - 9, cwd: "/repo", transcript_path: p }],
+    ]);
+    const views = collectSessions({ now: NOW, hookStatuses: map, extraTranscripts: [], maxAgeSec: 24 * 3600, globalEffort: "medium" });
+    const v = views.find((x) => x.sessionId === "e");
+    expect(v?.effort).toBe("max");
+    expect(v?.tooltip).toContain("effort: max");
+  });
 });
 
 describe("countBuckets", () => {

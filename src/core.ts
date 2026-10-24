@@ -75,6 +75,7 @@ export interface TxInfo {
   sizeBytes: number;
   cwd?: string;
   model?: string; // model id of the newest assistant line (message.model)
+  effort?: string; // reasoning effort of the newest real assistant line (top-level `effort`)
   closing?: ClosingStatus; // closing status line of the newest end_turn text
 }
 
@@ -117,8 +118,8 @@ export function readHookStatuses(dir = MONITOR_DIR): Map<string, HookStatus> {
 
 /**
  * Read the global reasoning-effort level from ~/.claude/settings.json.
- * Effort is a global Claude Code setting (there is no per-session effort in the
- * transcript or hook files), so every live session shares this value.
+ * Only a fallback: each session's real effort is read from its transcript
+ * (TxInfo.effort); this covers sessions with no assistant turn yet.
  */
 export function readGlobalEffort(file = SETTINGS_FILE): string | undefined {
   try {
@@ -337,7 +338,11 @@ function parseWindow(file: string, stat: fs.Stats, maxBytes: number): TxInfo {
       // locally-injected messages (API-error notices, "out of credits", etc.),
       // not real turns, so the badge should keep showing the last real model.
       const m = obj.message.model.trim();
-      if (m && !m.startsWith("<")) info.model = m;
+      if (m && !m.startsWith("<")) {
+        info.model = m;
+        // Real turns also carry the session's effective effort (e.g. after /effort max).
+        if (typeof obj.effort === "string" && obj.effort.trim()) info.effort = obj.effort.trim();
+      }
     }
 
     if (type === "user" || type === "assistant") {
@@ -444,7 +449,7 @@ export function parseTranscriptTail(file: string, prev?: TxInfo): TxInfo {
 export interface ResolveOpts {
   now: number; // epoch seconds
   txPath?: string; // fallback transcript path (when no hook file)
-  effort?: string; // global reasoning-effort level (same for every session)
+  effort?: string; // global effortLevel, used when the transcript carries none
 }
 
 function resolve(
@@ -476,7 +481,7 @@ function resolve(
   const transcriptPath = hook?.transcript_path || opts.txPath;
   const entrypoint = tx?.entrypoint;
   const model = tx?.model;
-  const effort = opts.effort;
+  const effort = tx?.effort ?? opts.effort;
 
   let bucket: Bucket = "unknown";
   let sub = "unknown";

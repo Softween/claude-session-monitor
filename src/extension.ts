@@ -3265,8 +3265,10 @@ function buildSessionsPayload(
     rows: grouped.get(m.key)!,
   }));
   // Effort also appears per row (user preference); the meta strip keeps the
-  // value visible on narrow panels where the eff column is hidden.
-  const effort = shortEffort(views.find((v) => v.effort)?.effort) ?? "";
+  // value visible on narrow panels where the eff column is hidden. Effort is
+  // per session, so the strip shows it only when every session agrees.
+  const efforts = new Set(views.map((v) => v.effort).filter(Boolean));
+  const effort = efforts.size === 1 ? (shortEffort([...efforts][0]) ?? "") : "";
   return {
     type: "update",
     groups,

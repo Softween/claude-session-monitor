@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.20.1
+- The effort column shows each session's real reasoning effort, read from the `effort` field Claude Code stamps on every assistant turn, so a session switched to `max` (or running at a per-model `modelSettings` level) no longer shows the global `effortLevel` from `~/.claude/settings.json`. That setting remains the fallback for sessions with no reply yet. The meta strip shows effort only when every session agrees.
+
 ## 2.20.0
 - Rows in the Your turn group show the session's closing status instead of the blue dot: ✅ done and safe to close, ⏳ waiting on a background job, 🟡 needs your decision. It is read from the last line of the final assistant message; rows without one keep the dot. The tooltip gains a `closing:` line.
 

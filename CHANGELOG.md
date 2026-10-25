@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.20.2
+- A usage API 429 now waits for the server's Retry-After (60 s when it sends none, at most 15 min) instead of doubling on every repeat. The endpoint throttles only the active account's token, which every running Claude CLI polls too, and the throttle is short, so the doubling left the active account's gauges showing "usage API rate-limited" for up to 15 minutes.
+
 ## 2.20.1
 - The effort column shows each session's real reasoning effort, read from the `effort` field Claude Code stamps on every assistant turn, so a session switched to `max` (or running at a per-model `modelSettings` level) no longer shows the global `effortLevel` from `~/.claude/settings.json`. That setting remains the fallback for sessions with no reply yet. The meta strip shows effort only when every session agrees.
 

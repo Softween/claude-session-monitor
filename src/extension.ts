@@ -1591,7 +1591,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         checkUsageWarn(r.usage);
         maybeAutoRotate();
       } else if (r.status === 429) {
-        const b = nextUsageBackoffSec(cur.backoffSec, r.retryAfterSec);
+        const b = nextUsageBackoffSec(r.retryAfterSec);
         writeOfficialSnapshot({ ...cur, attemptTs: nowSec, backoffUntil: nowSec + b, backoffSec: b });
         usageNote = "usage API rate-limited — backing off, showing last known data";
         log(`usage backoff ${b}s`);
@@ -1752,7 +1752,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           changed = true;
           log(`usage acct ${a.id.slice(0, 8)}: token rejected (${r.status})`);
         } else if (r.status === 429) {
-          const b = nextUsageBackoffSec(cur2.backoffSec, r.retryAfterSec);
+          const b = nextUsageBackoffSec(r.retryAfterSec);
           writeOfficialSnapshot({ ...cur2, attemptTs: now2, backoffUntil: now2 + b, backoffSec: b }, file);
         }
       }

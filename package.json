@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.20.1",
+  "version": "2.20.2",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -316,7 +316,7 @@
           "type": "number",
           "default": 30,
           "minimum": 5,
-          "description": "How often to refresh official account usage limits from Anthropic, in seconds. The poll is shared across ALL VS Code windows (single-flight through a snapshot file), and a 429 triggers an exponential backoff every window honors."
+          "description": "How often to refresh official account usage limits from Anthropic, in seconds. The poll is shared across ALL VS Code windows (single-flight through a snapshot file), and a 429 triggers a backoff (the server's Retry-After, else 60 s, at most 15 min) every window honors."
         },
         "claudeSessionMonitor.trackAllAccounts": {
           "type": "boolean",

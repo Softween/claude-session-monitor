@@ -379,10 +379,9 @@ export function shortModelName(id: string): string {
   return `${family} ${rest.join(sep)}`;
 }
 
-/** Exponential 429 backoff: honor Retry-After, else double the previous, clamp [60, 900]. */
-export function nextUsageBackoffSec(prevSec: number | undefined, retryAfterSec: number | undefined): number {
-  const doubled = prevSec && prevSec > 0 ? prevSec * 2 : 60;
-  return Math.max(60, Math.min(900, Math.max(retryAfterSec ?? 0, doubled)));
+/** 429 backoff: honor Retry-After, else 60s, clamp [60, 900]. No growth: the throttle is short and per-token. */
+export function nextUsageBackoffSec(retryAfterSec: number | undefined): number {
+  return Math.max(60, Math.min(900, retryAfterSec ?? 60));
 }
 
 export interface PsRow {

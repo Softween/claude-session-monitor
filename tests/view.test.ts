@@ -296,16 +296,14 @@ describe("fmtTokensCompact", () => {
 });
 
 describe("nextUsageBackoffSec", () => {
-  it("starts at 60s and doubles up to the 15m cap", () => {
-    expect(nextUsageBackoffSec(undefined, undefined)).toBe(60);
-    expect(nextUsageBackoffSec(60, undefined)).toBe(120);
-    expect(nextUsageBackoffSec(480, undefined)).toBe(900);
-    expect(nextUsageBackoffSec(900, undefined)).toBe(900);
+  it("stays at 60s on repeated 429s without Retry-After (no growth)", () => {
+    const repeated = [1, 2, 3, 4, 5].map(() => nextUsageBackoffSec(undefined));
+    expect(repeated).toEqual([60, 60, 60, 60, 60]);
   });
-  it("honors a larger Retry-After and floors at 60s", () => {
-    expect(nextUsageBackoffSec(undefined, 300)).toBe(300);
-    expect(nextUsageBackoffSec(undefined, 5)).toBe(60);
-    expect(nextUsageBackoffSec(120, 1000)).toBe(900);
+  it("honors Retry-After, clamped to [60s, 15m]", () => {
+    expect(nextUsageBackoffSec(300)).toBe(300);
+    expect(nextUsageBackoffSec(5)).toBe(60);
+    expect(nextUsageBackoffSec(1000)).toBe(900);
   });
 });
 

@@ -1012,7 +1012,7 @@ export interface OfficialSnapshot {
   ts: number; // epoch sec of last SUCCESSFUL fetch (0 = never)
   attemptTs?: number; // epoch sec of last attempt by any window (single-flight)
   backoffUntil?: number; // epoch sec all windows wait until after a 429
-  backoffSec?: number; // last backoff length, for exponential growth
+  backoffSec?: number; // last backoff length (Retry-After or 60s), shared with other windows
   tokenStale?: boolean; // stored token rejected/expired — gauges are last-known only
 }
 

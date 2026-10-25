@@ -236,6 +236,7 @@ const CLOSING_EMOJI: Record<ClosingKind, string> = { done: "✅", pending: "⏳"
 /**
  * The house-rule closing status line (✅ done / ⏳ pending / 🟡 blocked) that
  * ends a final assistant message. Checks the last two non-empty lines, newest first.
+ * Sessions surface it only with claudeSessionMonitor.closingStatusMarkers on (ResolveOpts.closingMarkers).
  */
 export function parseClosingStatus(text: string): ClosingStatus | undefined {
   const lines = text.split("\n").filter((l) => l.trim()).slice(-2).reverse();
@@ -450,6 +451,7 @@ export interface ResolveOpts {
   now: number; // epoch seconds
   txPath?: string; // fallback transcript path (when no hook file)
   effort?: string; // global effortLevel, used when the transcript carries none
+  closingMarkers?: boolean; // surface the closing status line on "your turn" sessions (default off)
 }
 
 function resolve(
@@ -555,7 +557,7 @@ function resolve(
     }
   }
 
-  const closing = bucket === "attention" && sub === "your turn" ? tx?.closing : undefined;
+  const closing = opts.closingMarkers && bucket === "attention" && sub === "your turn" ? tx?.closing : undefined;
   const ageStr = lastActivity ? humanizeAge(now - lastActivity) : "";
   const parts: string[] = [];
   if (resetText) parts.push(`reset ${formatReset(resetText, now)}`);
@@ -725,6 +727,7 @@ export interface CollectOpts {
   hookStatuses?: Map<string, HookStatus>; // injectable for tests; default readHookStatuses()
   showEnded?: boolean; // default false: closed/ended sessions are hidden entirely
   globalEffort?: string; // injectable for tests; default readGlobalEffort()
+  closingMarkers?: boolean; // default false: no closing status line (claudeSessionMonitor.closingStatusMarkers)
   phantomGraceSec?: number; // default 600
   pidAlive?: (pid?: number) => boolean | undefined; // injectable for tests
 }
@@ -799,7 +802,7 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
     const cwd = hook?.cwd || tx?.cwd;
     if (cwd && dirExcluded(cwd)) continue;
 
-    const view = resolve(sid, hook, tx, { now, txPath, effort });
+    const view = resolve(sid, hook, tx, { now, txPath, effort, closingMarkers: opts.closingMarkers });
     views.push(view);
   }
 

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { accountBadges, displayNames, headerChip, headerGauges, mergePanelAccounts, orderCards, panelAge, panelFresh, readPanel, renderSwitchBlock, worstGauge, type SwitchPanel } from "../src/switchPanel";
+import { accountBadges, displayNames, headerChip, headerGauges, installedPanel, mergePanelAccounts, orderCards, panelAge, panelFresh, readPanel, renderSwitchBlock, switchInstalled, worstGauge, type SwitchPanel } from "../src/switchPanel";
 
 const NOW = 1_792_200_000_000;
 const sec = NOW / 1000;
@@ -36,6 +36,20 @@ describe("readPanel", () => {
   it("panelAge is seconds and never negative", () => {
     expect(panelAge(full(), NOW)).toBe(30);
     expect(panelAge(full({ ts: sec + 99 }), NOW)).toBe(0);
+  });
+});
+
+describe("switchInstalled / installedPanel", () => {
+  it("reads the panel only while the claude-switch CLI exists: a leftover panel.json alone never counts", () => {
+    const d = mkdtempSync(join(tmpdir(), "swp-"));
+    const cli = join(d, "claude-switch");
+    const file = join(d, "panel.json");
+    writeFileSync(file, JSON.stringify(full()));
+    expect(switchInstalled(cli)).toBe(false);
+    expect(installedPanel(cli, file)).toBeNull();
+    writeFileSync(cli, "#!/bin/sh\n");
+    expect(switchInstalled(cli)).toBe(true);
+    expect(installedPanel(cli, file)?.active?.email).toBe("bilal@softween.com");
   });
 });
 

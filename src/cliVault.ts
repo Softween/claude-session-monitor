@@ -1,6 +1,8 @@
 // Shared vault with ~/.claude/bin/claude-switch: one JSON file per account
 // (<accountUuid>.json) in ~/.claude/state/claude-switch/vault/ (dir 0700, files 0600).
-// The CLI keeper owns refreshing passive tokens; the extension only reads/seeds this vault.
+// The CLI keeper owns refreshing passive tokens; the extension only reads/seeds this vault,
+// and only while the CLI is installed (switchInstalled): without it nothing here is read
+// or created and the extension refreshes passive tokens itself.
 // Pure helpers first (unit-tested), thin file I/O last. Token values are never logged.
 
 import * as fs from "fs";

@@ -1,15 +1,23 @@
 // Read-only feed from ~/.claude/bin/claude-switch: panel.json in the same state
 // dir as the vault. Pure helpers (no vscode import) so they are unit-tested; the
 // extension host renders the block and the webview only injects the HTML.
+// claude-switch is an optional local CLI: every surface of it (this block, the
+// badges, the shared vault, `use` and `tick`) is gated on switchInstalled().
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import type { AccountInfo, AccountsFile } from "./core";
 
+export const SWITCH_CLI = path.join(os.homedir(), ".claude", "bin", "claude-switch");
 export const SWITCH_STATE_DIR = path.join(os.homedir(), ".claude", "state", "claude-switch");
 export const SWITCH_PANEL_FILE = path.join(SWITCH_STATE_DIR, "panel.json");
 export const PANEL_STALE_SEC = 600;
 const MAX_EVENTS = 8;
+
+/** True when the claude-switch CLI is installed (the one detection point for every claude-switch surface). */
+export function switchInstalled(cli: string = SWITCH_CLI): boolean {
+  return fs.existsSync(cli);
+}
 
 export interface PanelAccount {
   uuid?: string;
@@ -40,6 +48,11 @@ export function readPanel(file: string = SWITCH_PANEL_FILE): SwitchPanel | null 
   } catch {
     return null;
   }
+}
+
+/** The panel only while the CLI is installed: a leftover panel.json alone never counts. */
+export function installedPanel(cli: string = SWITCH_CLI, file: string = SWITCH_PANEL_FILE): SwitchPanel | null {
+  return switchInstalled(cli) ? readPanel(file) : null;
 }
 
 /** Age of the panel in seconds (never negative). */

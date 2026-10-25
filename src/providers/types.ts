@@ -54,7 +54,7 @@ export interface SessionView {
   entrypoint?: string;
   pid?: number;
   stale: boolean;
-  /** Closing status line of the final assistant message; set only for idle "your turn" sessions. */
+  /** Closing status line of the final assistant message; set only for idle "your turn" sessions while closingStatusMarkers is on. */
   closing?: ClosingStatus;
   model?: string;
   effort?: string;

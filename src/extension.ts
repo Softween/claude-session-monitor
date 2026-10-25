@@ -17,7 +17,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, headerChip, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, headerGauges, type CardHeader } from "./switchPanel";
+import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, headerGauges, switchInstalled, type CardHeader } from "./switchPanel";
 import { gaugeColumn } from "./compact";
 import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, useStuck, type ActiveCandidate } from "./activeAccount";
 import { execFile } from "child_process";
@@ -1391,7 +1391,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       finish(false, `already switching to ${usePending.email}`, null);
       return;
     }
-    const panel = readPanel();
+    const panel = installedPanel();
     if (!panelFresh(panel, Date.now()) || !(panel.accounts ?? []).some((a) => a.email === email)) {
       finish(false, "claude-switch does not list this account right now (panel.json missing, stale or without it)", null);
       return;
@@ -1401,7 +1401,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     pushUsagePayload();
     const started = Date.now();
     try {
-      execFile(path.join(os.homedir(), ".claude", "bin", "claude-switch"), ["use", email], { timeout: 60_000 }, (err, stdout, stderr) => {
+      execFile(SWITCH_CLI, ["use", email], { timeout: 60_000 }, (err, stdout, stderr) => {
         const cliMs = Date.now() - started;
         const out = useOutcome(err, String(stdout ?? ""), String(stderr ?? ""));
         void syncActive(true)
@@ -1736,6 +1736,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     let changed = false;
     try {
       const cadence = Math.max(120, cfg().get<number>("usagePollSeconds", 30) * 2);
+      // Without claude-switch its vault is never read, seeded or created: our own refresh keeps passive tokens alive.
+      const cliPresent = switchInstalled();
       for (const a0 of others) {
         let a = a0;
         const file = officialUsageFileFor(a.id);
@@ -1747,7 +1749,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           changed = true; // another window fetched it
         }
         let vault = await readVaultOauth(a.id);
-        const cliBlob = await readCliVault(a.id, log);
+        const cliBlob = cliPresent ? await readCliVault(a.id, log) : null;
         const cliOauth = cliBlob?.claudeAiOauth;
         const source = decidePassiveSource(vault, cliOauth);
         let seeded = false;
@@ -1772,7 +1774,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
             a = accountsFile.accounts.find((x) => x.id === a.id) ?? a;
             changed = true;
           }
-        } else if (vault && source === "use-own-and-seed" && shouldSeed(seededRefreshTokens.get(a.id), vault.refreshToken)) {
+        } else if (cliPresent && vault && source === "use-own-and-seed" && shouldSeed(seededRefreshTokens.get(a.id), vault.refreshToken)) {
           let ident: Record<string, unknown> | undefined;
           try {
             ident = parseJsonObject(await ctx.secrets.get(vaultIdentKey(a.id)));
@@ -1786,7 +1788,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
           }
         }
         // The keeper owns refresh as soon as the CLI vault holds this account; our own refresh stays only for machines without it.
-        const keeperOwns = !!cliOauth || seeded || seededRefreshTokens.has(a.id);
+        const keeperOwns = cliPresent && (!!cliOauth || seeded || seededRefreshTokens.has(a.id));
+        if (!keeperOwns && keeperWaiting.delete(a.id)) changed = true; // our own refresh owns it (again): no keeper note
         if (vault && healNeedsLogin(a, vault)) changed = true;
         if (keeperOwns) {
           if (a.needsLogin && source === "use-cli") {
@@ -2268,7 +2271,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   // --- Active login (pure resolution in src/activeAccount.ts) ---------------
   // ~/.claude.json oauthAccount (a stat per tick, parsed on change) and a fresh
-  // claude-switch panel.json both name the active login; the fresher one becomes
+  // claude-switch panel.json (only with its CLI installed) both name the active login; the fresher one becomes
   // the registry's activeId right away. A usage fetch or a vault write used to be
   // the only way to move it, and after a claude-switch switch neither happens:
   // the usage API 429s the newly active token and the token is already vaulted.
@@ -2289,7 +2292,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       if (run < activeApplied) return false;
       activeApplied = run;
       if (ident && mtimeMs !== undefined) ownActive = { id: ident.id, email: ident.email, atMs: mtimeMs, source: "claude.json" };
-      activeNow = pickActive(ownActive, panelActive(readPanel(), Date.now()));
+      activeNow = pickActive(ownActive, panelActive(installedPanel(), Date.now()));
       return activeNow ? applyActive(activeNow) : false;
     } finally {
       activeInflight--;
@@ -2489,7 +2492,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
           planLabels(),
           showTokenStats(),
       );
-      const panel = readPanel();
+      const installed = switchInstalled(); // without claude-switch: no block, no badges, the generic cards
+      const panel = installed ? readPanel() : null;
       const fresh = panelFresh(panel, Date.now());
       const open = ctx.workspaceState.get<boolean>("csm.switchActivityOpen", false);
       const emailById = new Map(payload.accounts.map((a) => [a.id, a.email] as const));
@@ -2514,7 +2518,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       limitsView.update({
         ...payload,
         providers,
-        switchHtml: renderSwitchBlock(panel, Date.now(), open),
+        switchHtml: installed ? renderSwitchBlock(panel, Date.now(), open) : undefined,
         switchBadges: allBadges(panel),
         panelFresh: fresh,
         showTokenStats: showTokenStats(),
@@ -2601,7 +2605,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (claudeEnabled() && now - lastOthersCheck > 30) {
       lastOthersCheck = now;
       setAccounts(readAccountsFile());
-      const panel0 = readPanel();
+      const panel0 = installedPanel();
       if (panelFresh(panel0, Date.now())) {
         const merged = mergePanelAccounts(accountsFile, panel0);
         if (merged !== accountsFile) {
@@ -2627,6 +2631,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           hideEndedOlderThanSec: c.get<number>("hideEndedAfterMinutes", 30) * 60,
           workspaceCwd: wsOnly ? workspaceCwd() : undefined,
           showEnded: c.get<boolean>("showEnded", false),
+          closingMarkers: c.get<boolean>("closingStatusMarkers", false),
         });
       } catch {
         claudeViews = [];
@@ -3050,9 +3055,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
         codexEnabled() ? pollCodex(true) : Promise.resolve(),
       ]);
       try {
-        const cli = path.join(os.homedir(), ".claude", "bin", "claude-switch");
-        if (fs.existsSync(cli)) {
-          execFile(cli, ["tick", "--fresh"], { timeout: 90_000 }, (err, stdout, stderr) => {
+        if (switchInstalled()) {
+          execFile(SWITCH_CLI, ["tick", "--fresh"], { timeout: 90_000 }, (err, stdout, stderr) => {
             try {
               const out = String(err ? stderr || stdout || err.message : stdout || stderr || "done").trim().split("\n").filter(Boolean).pop() ?? "";
               vscode.window.setStatusBarMessage(`claude-switch: ${out.slice(0, 160)}`, 8000);
@@ -3184,16 +3188,18 @@ export function activate(ctx: vscode.ExtensionContext): void {
       /* polling still covers it */
     }
   }
-  try {
-    const debouncedPanel = debounce(() => followActive(true), 1000);
-    ctx.subscriptions.push({ dispose: () => debouncedPanel.cancel() });
-    const w3 = fs.watch(SWITCH_STATE_DIR, (_ev, name) => {
-      if (!name || name === path.basename(SWITCH_PANEL_FILE)) debouncedPanel();
-    });
-    w3.on("error", () => {});
-    ctx.subscriptions.push({ dispose: () => w3.close() });
-  } catch {
-    /* state dir absent; the poll-driven refresh still re-reads the panel */
+  if (switchInstalled()) {
+    try {
+      const debouncedPanel = debounce(() => followActive(true), 1000);
+      ctx.subscriptions.push({ dispose: () => debouncedPanel.cancel() });
+      const w3 = fs.watch(SWITCH_STATE_DIR, (_ev, name) => {
+        if (!name || name === path.basename(SWITCH_PANEL_FILE)) debouncedPanel();
+      });
+      w3.on("error", () => {});
+      ctx.subscriptions.push({ dispose: () => w3.close() });
+    } catch {
+      /* state dir absent; the poll-driven refresh still re-reads the panel */
+    }
   }
   try {
     const w2 = fs.watch(PROJECTS_DIR, { recursive: true }, debouncedRefresh);

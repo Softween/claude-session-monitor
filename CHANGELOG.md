@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.22.0
+First Marketplace release since 2.6.0. In short, what 2.7.0 to 2.21.1 added, plus this release's changes:
+
+- **Multiple Claude accounts (macOS).** Every Claude Code login is remembered (its tokens in VS Code Secret Storage), inactive accounts keep their tokens and usage fresh in the background, and you can switch with **Agent Sessions: Switch Claude account**, **Switch to Claude account with most headroom**, or from the Usage limits panel. `autoRotate` (off by default) switches automatically at `rotateAtPercent`.
+- **Usage limits view.** One card per account with a bar per gauge, every gauge listed in the account header, the active account always marked (and named in the status bar once 2+ accounts are known), Team and Enterprise plan labels. Token totals and the per-model share are behind the new `showTokenStats` setting (off by default).
+- **More accurate data.** Each session shows its own reasoning effort, a usage API 429 waits for the server's Retry-After instead of growing, usage snapshots record the account they belong to, empty hook records left behind by account switches are hidden, and files shared across VS Code windows are written through unique temp files.
+- New setting `closingStatusMarkers` (default off). When on, a Your turn row whose final reply ends with a line starting with ✅, ⏳ or 🟡 shows that marker instead of the dot, and the tooltip gains a `closing:` line (the 2.20.0 behavior). When off, rows, tooltips and `npm run verify` show no closing status, so an ordinary reply that ends in "✅ All tests pass" no longer reads as done.
+- The `claude-switch` integration (status block, priority and login-needed badges, `Use this account`, its shared file vault, `tick --fresh` on refresh) is active only when `~/.claude/bin/claude-switch` exists. Without it the extension never runs it, never reads or creates `~/.claude/state/claude-switch/`, refreshes inactive accounts' tokens itself, and the Usage limits view shows no claude-switch block, `no data` line or badges.
+
 ## 2.21.1
 - The status bar no longer drops the active account's name every few seconds, and after a switch whose first usage fetch got a 429 it no longer shows the previous login's 5h gauge again: the resource sampler's redraws (every 3 s) now show the same account and usage as the panel instead of the last live poll.
 - The active card shows the newer of its own live poll and a background fetch for that account. An account switched back to after its 5h reset showed `active · exhausted` at 100% from before the switch until its live poll got past the usage API's backoff, and the older live poll also overwrote the newer background result.

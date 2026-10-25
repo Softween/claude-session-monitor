@@ -780,13 +780,14 @@ describe("closing status line from transcripts", () => {
     { type: "assistant", message: { id, content: [{ type: "thinking", thinking: "plan" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 31) },
     { type: "assistant", message: { id, content: [{ type: "text", text: "Pushed.\n\n⏳ Kapatma: deploy bekleniyor" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 30) },
   ];
-  const collect = (hooks: HookStatus[]) =>
+  const collect = (hooks: HookStatus[], closingMarkers?: boolean) =>
     collectSessions({
       now: NOW,
       hookStatuses: new Map(hooks.map((h) => [h.session_id, h])),
       extraTranscripts: [],
       maxAgeSec: 24 * 3600,
       hideEndedOlderThanSec: 24 * 3600,
+      closingMarkers,
     });
 
   it("reads the marker from the end_turn text line and clears it on a newer user line", () => {
@@ -796,13 +797,13 @@ describe("closing status line from transcripts", () => {
     expect(parseTranscriptTail(p).closing).toBeUndefined();
   });
 
-  it("surfaces closing only on a your-turn session", () => {
+  it("closingMarkers on: surfaces closing only on a your-turn session", () => {
     const idle = writeTranscript("ci.jsonl", closingLines("msg_2"));
     const busy = writeTranscript("cw.jsonl", closingLines("msg_3"));
     const views = collect([
       { session_id: "ci", state: "idle", ts: NOW - 35, cwd: "/repo", transcript_path: idle },
       { session_id: "cw", state: "working", ts: NOW - 10, cwd: "/repo", transcript_path: busy },
-    ]);
+    ], true);
     const ci = views.find((x) => x.sessionId === "ci");
     expect(ci?.sub).toBe("your turn");
     expect(ci?.closing?.kind).toBe("pending");
@@ -810,6 +811,28 @@ describe("closing status line from transcripts", () => {
     const cw = views.find((x) => x.sessionId === "cw");
     expect(cw?.bucket).toBe("working");
     expect(cw?.closing).toBeUndefined();
+  });
+
+  it("closingMarkers off (the default): a your-turn session carries no closing status and no tooltip line", () => {
+    const p = writeTranscript("co.jsonl", closingLines("msg_4"));
+    const hook: HookStatus = { session_id: "co", state: "idle", ts: NOW - 35, cwd: "/repo", transcript_path: p };
+    for (const views of [collect([hook]), collect([hook], false)]) {
+      const co = views.find((x) => x.sessionId === "co");
+      expect(co?.sub).toBe("your turn");
+      expect(co?.closing).toBeUndefined();
+      expect(co?.tooltip).toContain("status: your turn");
+      expect(co?.tooltip).not.toContain("closing:");
+    }
+  });
+
+  it("an ordinary reply ending in a ✅ line reads as done only with closingMarkers on", () => {
+    const p = writeTranscript("cg.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "run the tests" }] }, timestamp: iso(NOW - 40) },
+      { type: "assistant", message: { id: "msg_5", content: [{ type: "text", text: "Ran the suite.\n\n✅ All tests pass" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 30) },
+    ]);
+    const hook: HookStatus = { session_id: "cg", state: "idle", ts: NOW - 35, cwd: "/repo", transcript_path: p };
+    expect(collect([hook]).find((x) => x.sessionId === "cg")?.closing).toBeUndefined();
+    expect(collect([hook], true).find((x) => x.sessionId === "cg")?.closing).toEqual({ kind: "done", text: "All tests pass" });
   });
 });
 

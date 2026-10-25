@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.21.1",
+  "version": "2.22.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -312,6 +312,11 @@
           "default": false,
           "description": "Notify when a session finishes its turn (your turn)."
         },
+        "claudeSessionMonitor.closingStatusMarkers": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Show a closing status marker instead of the plain dot on **Your turn** rows when the final assistant message ends with a line starting with ✅ (done, safe to close), ⏳ (waiting on a background job) or 🟡 (needs your decision); the row tooltip gains a `closing:` line. Turn on only if you ask your assistant to end every turn with such a line: otherwise an ordinary reply ending in, say, \"✅ All tests pass\" would read as done."
+        },
         "claudeSessionMonitor.usagePollSeconds": {
           "type": "number",
           "default": 30,
@@ -321,7 +326,7 @@
         "claudeSessionMonitor.trackAllAccounts": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Remember every Claude account you log into (identity in `~/.claude/session-monitor/accounts.json`, access token in VS Code Secret Storage, i.e. your OS keychain) and keep fetching usage for non-active accounts in the background, so the Usage limits panel can show each account and switch between them. Turn off to track only the current login; run **Agent Sessions: Forget Other Claude Accounts** to also delete already-stored tokens."
+          "markdownDescription": "Remember every Claude account you log into (identity in `~/.claude/session-monitor/accounts.json`, OAuth access and refresh token in VS Code Secret Storage, i.e. your OS keychain) and keep refreshing tokens and fetching usage for non-active accounts in the background, so the Usage limits panel can show each account and switch between them. Turn off to track only the current login; run **Agent Sessions: Forget Other Claude Accounts** to also delete already-stored tokens."
         },
         "claudeSessionMonitor.autoRotate": {
           "type": "boolean",

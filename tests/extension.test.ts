@@ -158,6 +158,7 @@ vi.mock("vscode", () => {
 (globalThis as any).fetch = vi.fn(() => Promise.reject(new Error("mocked")));
 
 import * as ext from "../src/extension";
+import { keeperWaiting } from "../src/cliVault";
 
 beforeEach(() => {
   fs.rmSync(HOME, { recursive: true, force: true });
@@ -229,6 +230,7 @@ afterEach(() => {
   rec.spawns.length = 0;
   rec.terminals.length = 0;
   rec.execFileImpl = null;
+  keeperWaiting.clear(); // module-level: one test's claude-switch keeper state must not leak into the next
   lastCtx = undefined;
   vi.useRealTimers();
 });
@@ -543,10 +545,15 @@ describe("active login and Use this account", () => {
   function writeLogin(id: string, email: string): void {
     fs.writeFileSync(`${HOME}/.claude.json`, JSON.stringify({ oauthAccount: { accountUuid: id, emailAddress: email } }));
   }
-  function writePanel(id: string, email: string, tsSec = Date.now() / 1000): void {
+  function writePanel(id: string, email: string, tsSec = Date.now() / 1000, extra: object[] = []): void {
     fs.mkdirSync(SW, { recursive: true });
-    const accounts = [{ uuid: UA, email: "a@x.com", rank: 1 }, { uuid: UB, email: "b@x.com", rank: 2 }];
+    const accounts = [{ uuid: UA, email: "a@x.com", rank: 1 }, { uuid: UB, email: "b@x.com", rank: 2 }, ...extra];
     fs.writeFileSync(`${SW}/panel.json`, JSON.stringify({ v: 1, ts: tsSec, active: { uuid: id, email }, priority: ["a@x.com", "b@x.com"], accounts, events: [] }));
+  }
+  // Every claude-switch surface is gated on this executable existing.
+  function installSwitchCli(): void {
+    fs.mkdirSync(`${HOME}/.claude/bin`, { recursive: true });
+    fs.writeFileSync(`${HOME}/.claude/bin/claude-switch`, "#!/bin/sh\n", { mode: 0o755 });
   }
   // Registry still on A (the state the 2.20 panel was stuck in); the shared live
   // snapshot holds A's gauges without an acct tag, as an older build wrote it.
@@ -558,9 +565,10 @@ describe("active login and Use this account", () => {
     fs.writeFileSync(snapFile(UB), JSON.stringify({ gauges: session(12), ts: Date.now() / 1000 - 120 }));
     fs.writeFileSync(`${MON}/official-usage.json`, JSON.stringify({ gauges: session(100), ts: Date.now() / 1000 - 30 }));
   }
-  function activateWithLimitsView(): { posted: any[]; send: (m: any) => void } {
+  function activateWithLimitsView(secrets?: Record<string, string>): { posted: any[]; send: (m: any) => void } {
     const ctx = mkCtx();
     ctx.workspaceState = { get: (_k: string, def?: unknown) => def, update: () => Promise.resolve() };
+    if (secrets) ctx.secrets.get = (k: string) => Promise.resolve(secrets[k]);
     lastCtx = ctx;
     ext.activate(ctx);
     const posted: any[] = [];
@@ -588,6 +596,7 @@ describe("active login and Use this account", () => {
   });
 
   it("a claude-switch panel.json fresher than ~/.claude.json decides the active login", async () => {
+    installSwitchCli();
     seedRegistryOnA();
     writeLogin(UA, "a@x.com");
     const old = new Date(Date.now() - 60_000);
@@ -599,6 +608,7 @@ describe("active login and Use this account", () => {
   });
 
   it("Use this account: Switching… while claude-switch runs, then re-resolves and re-renders on exit", async () => {
+    installSwitchCli();
     seedRegistryOnA();
     writeLogin(UA, "a@x.com");
     writePanel(UA, "a@x.com");
@@ -630,6 +640,7 @@ describe("active login and Use this account", () => {
   });
 
   it("Use this account shows the CLI's error text in the panel and keeps the active login", async () => {
+    installSwitchCli();
     seedRegistryOnA();
     writeLogin(UA, "a@x.com");
     writePanel(UA, "a@x.com");
@@ -688,6 +699,7 @@ describe("active login and Use this account", () => {
   });
 
   it("Use this account recovers from a synchronous spawn failure: the error shows and the next click runs", async () => {
+    installSwitchCli();
     seedRegistryOnA();
     writeLogin(UA, "a@x.com");
     writePanel(UA, "a@x.com");
@@ -711,6 +723,7 @@ describe("active login and Use this account", () => {
 
   it("the host gives up a claude-switch use that never exits after 90 s, and its late exit does not clear a newer switch", async () => {
     fakeClock();
+    installSwitchCli();
     seedRegistryOnA();
     writeLogin(UA, "a@x.com");
     writePanel(UA, "a@x.com");
@@ -793,5 +806,107 @@ describe("active login and Use this account", () => {
     rec.config.set("autoResumeAfterReset", true);
     expect(start(12, 99)).not.toContain("auto-resume scheduled");
     expect(start(99, 10)).toContain("auto-resume scheduled");
+  });
+
+  it("without the claude-switch CLI a leftover panel.json is ignored: no block, badges, merged accounts or simplified cards, and nothing runs claude-switch", async () => {
+    const UC = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    seedRegistryOnA();
+    writeLogin(UB, "b@x.com");
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(`${HOME}/.claude.json`, old, old);
+    // Fresher than ~/.claude.json and naming A: with the CLI installed it would keep A active and add C.
+    writePanel(UA, "a@x.com", Date.now() / 1000, [{ uuid: UC, email: "c@x.com", rank: 3, needsLogin: true, needsLoginReason: "refresh token revoked" }]);
+    const calls: string[][] = [];
+    rec.execFileImpl = (args) => {
+      if (String(args[0]).endsWith("/.claude/bin/claude-switch")) calls.push(args[1]);
+      return false;
+    };
+    const { posted, send } = activateWithLimitsView();
+    await vi.waitFor(() => expect(registry().activeId).toBe(UB));
+    expect(debugLog()).toContain("active: b@x.com (acct bbbbbbbb, from claude.json)");
+    expect(debugLog()).not.toContain("from panel.json");
+    expect(registry().accounts.map((a: { id: string }) => a.id)).not.toContain(UC);
+    await vi.waitFor(() => expect(card(posted[posted.length - 1], UB).active).toBe(true));
+    const last = posted[posted.length - 1];
+    expect(last.switchHtml).toBeUndefined();
+    expect(last.switchBadges).toEqual({});
+    expect(last.panelFresh).toBe(false);
+    expect(last.useEmails).toEqual([]);
+    expect(last.providers.some((p: { hdr?: unknown }) => p.hdr)).toBe(false);
+    send({ type: "useAccount", email: "a@x.com", at: Date.now() });
+    await rec.commands.get("claudeSessionMonitor.refreshUsage")!();
+    expect(calls).toEqual([]);
+  });
+
+  it("without the claude-switch CLI a passive account keeps the extension's own token refresh and no claude-switch directory is created", async () => {
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    const expired = JSON.stringify({ accessToken: "at-b", refreshToken: "rt-b", expiresAt: Date.now() - 60_000 });
+    const { posted } = activateWithLimitsView({ [`csm.oauth.${UB}`]: expired });
+    await vi.waitFor(() => expect(debugLog()).toContain("oauth refresh failed (acct bbbbbbbb, transient)"));
+    await vi.waitFor(() => expect(card(posted[posted.length - 1], UB).note).toContain("token expired"));
+    expect(debugLog()).not.toContain("claude-switch");
+    expect(fs.existsSync(`${HOME}/.claude/state`)).toBe(false);
+  });
+
+  it("with the claude-switch CLI a passive account's token is seeded into its vault and the keeper owns the refresh, as before", async () => {
+    installSwitchCli();
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    const expired = JSON.stringify({ accessToken: "at-b", refreshToken: "rt-b", expiresAt: Date.now() - 60_000 });
+    const { posted } = activateWithLimitsView({ [`csm.oauth.${UB}`]: expired });
+    await vi.waitFor(() => expect(debugLog()).toContain("cli vault seeded (acct bbbbbbbb)"));
+    expect(fs.statSync(`${SW}/vault/${UB}.json`).mode & 0o777).toBe(0o600);
+    expect(debugLog()).toContain("acct bbbbbbbb: tokens expired, waiting for claude-switch keeper");
+    expect(debugLog()).not.toContain("oauth refresh failed");
+    await vi.waitFor(() => expect(card(posted[posted.length - 1], UB).note).toBe("waiting for claude-switch keeper"));
+    expect(posted[posted.length - 1].switchHtml).toContain("claude-switch: no data (file missing)");
+  });
+});
+
+describe("closingStatusMarkers setting", () => {
+  // A your-turn Claude session whose final reply ends in an ordinary "✅ ..." line.
+  function seedYourTurn(): void {
+    const now = Date.now() / 1000;
+    const iso = (s: number) => new Date(s * 1000).toISOString();
+    const dir = `${HOME}/.claude/projects/-repo`;
+    const mon = `${HOME}/.claude/session-monitor`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(mon, { recursive: true });
+    const tx = `${dir}/s-closing.jsonl`;
+    const lines = [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "run the tests" }] }, timestamp: iso(now - 40) },
+      { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "Ran the suite.\n\n✅ All tests pass" }], stop_reason: "end_turn" }, timestamp: iso(now - 30) },
+    ];
+    fs.writeFileSync(tx, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    fs.writeFileSync(`${mon}/s-closing.json`, JSON.stringify({ session_id: "s-closing", provider: "claude", state: "idle", ts: now - 35, cwd: "/repo", transcript_path: tx }));
+  }
+  function yourTurnRow(): any {
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    const posted: any[] = [];
+    rec.webviews.find((w) => w.id === "claudeSessionMonitor.view")!.p.resolveWebviewView({
+      webview: { options: {}, html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: (m: any) => { posted.push(m); } },
+    });
+    const done = posted[posted.length - 1].groups.find((g: { key: string }) => g.key === "done");
+    return done?.rows.find((r: { id: string }) => r.id === "claude:s-closing");
+  }
+
+  it("off by default: the your-turn row keeps the plain dot, with no closing text in the row or its tooltip", () => {
+    seedYourTurn();
+    const row = yourTurnRow();
+    expect(row).toBeDefined();
+    expect(row.closing).toBe("");
+    expect(row.closingText).toBe("");
+    expect(row.tip).not.toContain("closing:");
+  });
+
+  it("on: the your-turn row carries the closing marker and its text, and the tooltip a closing line", () => {
+    rec.config.set("closingStatusMarkers", true);
+    seedYourTurn();
+    const row = yourTurnRow();
+    expect(row.closing).toBe("done");
+    expect(row.closingText).toBe("All tests pass");
+    expect(row.tip).toContain("closing: ✅ All tests pass");
   });
 });

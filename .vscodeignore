@@ -3,6 +3,7 @@
 .claude/**
 src/**
 scripts/**
+tests/**
 media/hero.png
 media/hero.svg
 media/icon-marketplace.svg

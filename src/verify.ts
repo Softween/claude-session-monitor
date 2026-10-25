@@ -1,7 +1,9 @@
 /**
  * verify.ts — runs the pure core data layer against the user's REAL transcripts
  * so we can confirm title extraction, entrypoint filtering, "limited" detection,
- * and state resolution before packaging. Run via npm run verify.
+ * and state resolution before packaging. Run via npm run verify
+ * (`npm run verify -- --closing-markers` also prints the closing status line,
+ * like the closingStatusMarkers setting).
  */
 import {
   classifyLimit,
@@ -48,6 +50,7 @@ const views = collectSessions({
   maxAgeSec: 24 * 3600,
   hideEndedOlderThanSec: 24 * 3600,
   allowedEntrypoints: DEFAULT_ENTRYPOINTS,
+  closingMarkers: process.argv.includes("--closing-markers"),
 });
 console.log(`  buckets: ${JSON.stringify(countBuckets(views))}  (total ${views.length})\n`);
 for (const v of views) {

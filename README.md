@@ -152,11 +152,12 @@ provider-qualified ids and capability flags.
 - Codex communication stays on local stdio with the official Codex app-server.
 - Claude's account-usage request is a read-only request to Anthropic using the
   locally stored Claude credential; the token is never logged.
-- **Multi-account**: with `trackAllAccounts` on (default), each login's access token
-  is kept in **VS Code Secret Storage** (your OS keychain — same protection as the
+- **Multi-account**: with `trackAllAccounts` on (default), each login's OAuth tokens
+  (access and refresh token) are kept in **VS Code Secret Storage** (your OS keychain — same protection as the
   original) so the panel can keep refreshing the account you logged out of; account
   identity (uuid + email) lives in `~/.claude/session-monitor/accounts.json`. Tokens
-  never touch plain files or logs. Disable the setting to stop this, and run
+  never touch plain files or logs, unless the optional claude-switch integration
+  below is active (it shares a `0600` file vault). Disable the setting to stop this, and run
   **Agent Sessions: Forget Other Claude Accounts** to delete anything already stored.
 - Hook files contain bounded status metadata, not full transcripts. Codex prompt
   text is not copied into its status file. Provider monitor directories are `0700`
@@ -192,6 +193,7 @@ All settings are under `claudeSessionMonitor.*`:
 | `notifyOnWaiting` | `true` | Notify when a session starts waiting for you |
 | `notifyOnLimited` | `true` | Notify when a session hits a limit |
 | `notifyOnDone` | `false` | Notify when a session finishes its turn |
+| `closingStatusMarkers` | `false` | On a Your turn row, show ✅ / ⏳ / 🟡 instead of the dot when the final reply ends with a line starting with that marker (done, waiting on a background job, needs your decision). Turn on only if your assistant is told to end every turn with such a line |
 | `nativeNotifications` | `true` | Native macOS notification on limit/waiting |
 | `stuckAlertMinutes` | `5` | Alert when a working session is silent this long (0 = off) |
 | `cpuHogThreshold` | `60` | CPU% above which a session is flagged 🔥 |
@@ -256,7 +258,15 @@ use or share its output when transcript titles are sensitive.
 
 [MIT](LICENSE) © Softween
 
-## Shared vault with claude-switch
+## Optional: claude-switch integration
+
+This section applies only when the separate `claude-switch` CLI is installed at
+`~/.claude/bin/claude-switch`; it is not part of this extension. Without that
+executable the extension never runs it, never reads or creates
+`~/.claude/state/claude-switch/`, shows no claude-switch block or badges, and keeps
+refreshing inactive accounts itself as described under Account rotation.
+
+### Shared vault with claude-switch
 Passive (non-active) account tokens are read from the file vault of `claude-switch`: `~/.claude/state/claude-switch/vault/<accountUuid>.json` (directory mode 0700, files 0600, one JSON blob per account). The extension does not refresh them while that file exists, because refresh tokens rotate and two refreshers break each other.
 If the vault lacks an account, the extension seeds it once per refresh token from its own SecretStorage (temp file in the same directory, then atomic rename, mode 0600); without the CLI vault at all it falls back to its own refresh. The active login is still captured from the login keychain as before.
 

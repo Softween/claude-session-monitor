@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
   activeName,
+  alreadyActive,
   markActive,
+  newerUsage,
   panelActive,
   pickActive,
   snapshotAccount,
   usageForActive,
   useOutcome,
   useStartMs,
+  USE_STUCK_MS,
+  useStuck,
   type ActiveCandidate,
 } from "../src/activeAccount";
 import type { AccountsFile } from "../src/core";
@@ -75,22 +79,66 @@ describe("markActive", () => {
   });
 });
 
+describe("alreadyActive", () => {
+  it("is true only when the registry already names the account as the active login", () => {
+    const reg: AccountsFile = { v: 1, activeId: B, accounts: [{ id: B, email: "b@x.com", lastSeenTs: 1 }] };
+    expect(alreadyActive(reg, B)).toBe(true);
+    expect(alreadyActive(reg, A)).toBe(false);
+    expect(alreadyActive({ ...reg, accounts: [] }, B)).toBe(false); // activeId without its entry: rewrite
+    expect(alreadyActive({ v: 1, accounts: [] }, B)).toBe(false);
+  });
+});
+
 describe("snapshotAccount", () => {
-  it("trusts the acct tag, else attributes an untagged snapshot to the active login only when fetched after the last change", () => {
-    expect(snapshotAccount({ ts: 1, acct: A }, B, NOW)).toBe(A);
-    expect(snapshotAccount({ ts: NOW / 1000 + 1 }, B, NOW)).toBe(B);
-    expect(snapshotAccount({ ts: NOW / 1000 - 1 }, B, NOW)).toBeNull();
-    expect(snapshotAccount({ ts: 5 }, B, 0)).toBe(B); // nothing changed since activation
+  const after = NOW / 1000 + 1;
+  it("trusts the acct tag", () => {
+    expect(snapshotAccount({ ts: 1, acct: A }, B, NOW, undefined)).toBe(A);
+  });
+  it("attributes an untagged snapshot to the active login only when its own snapshot holds the same fetch, made after the last change", () => {
+    expect(snapshotAccount({ ts: after }, B, NOW, { ts: after })).toBe(B);
+    expect(snapshotAccount({ ts: 5 }, B, 0, { ts: 5 })).toBe(B); // nothing changed since activation
+    expect(snapshotAccount({ ts: NOW / 1000 - 1 }, B, NOW, { ts: NOW / 1000 - 1 })).toBeNull(); // fetched before the switch
+  });
+  it("leaves an untagged snapshot unknown without that proof", () => {
+    expect(snapshotAccount({ ts: after }, B, NOW, { ts: after - 90 })).toBeNull(); // the previous login's fetch
+    expect(snapshotAccount({ ts: after }, B, NOW, undefined)).toBeNull();
+    expect(snapshotAccount({ ts: 5 }, B, 0, undefined)).toBeNull(); // boot: the registry alone is no proof
+    expect(snapshotAccount({ ts: after }, null, NOW, { ts: after })).toBeNull();
+  });
+});
+
+describe("newerUsage", () => {
+  it("keeps the later fetch, the first one on a tie, and whichever exists", () => {
+    const old = { ts: 10 };
+    const fresh = { ts: 20 };
+    expect(newerUsage(old, fresh)).toBe(fresh);
+    expect(newerUsage(fresh, old)).toBe(fresh);
+    const tie = { ts: 10 };
+    expect(newerUsage(old, tie)).toBe(old);
+    expect(newerUsage(null, old)).toBe(old);
+    expect(newerUsage(old, null)).toBe(old);
+    expect(newerUsage(null, null)).toBeNull();
   });
 });
 
 describe("usageForActive", () => {
-  const per = new Map([[B, { usage: "b-usage" }]]);
+  const bUsage = { ts: 100, pct: 12 };
+  const per = new Map([[B, { usage: bUsage }]]);
   it("shows the live poll only for the account it was fetched for", () => {
-    expect(usageForActive(A, { usage: "live", acct: A }, per)).toBe("live");
-    expect(usageForActive(B, { usage: "live-of-a", acct: A }, per)).toBe("b-usage");
-    expect(usageForActive("unknown", { usage: "live", acct: A }, per)).toBeNull();
-    expect(usageForActive(null, { usage: "live", acct: null }, per)).toBe("live");
+    const live = { ts: 200, pct: 50 };
+    expect(usageForActive(A, { usage: live, acct: A }, per)).toBe(live);
+    expect(usageForActive(B, { usage: live, acct: A }, per)).toBe(bUsage);
+    expect(usageForActive("unknown", { usage: live, acct: A }, per)).toBeNull();
+    expect(usageForActive(null, { usage: live, acct: null }, per)).toBe(live);
+  });
+  it("prefers a newer per-account fetch over an older live poll of the same account (newest wins)", () => {
+    const stale = { ts: 50, pct: 100 }; // live poll before the switch away, A exhausted
+    const reset = { ts: 90, pct: 4 }; // background poll after A's reset
+    const perA = new Map([[A, { usage: reset }]]);
+    expect(usageForActive(A, { usage: stale, acct: A }, perA)).toBe(reset);
+    const newer = { ts: 95, pct: 6 };
+    expect(usageForActive(A, { usage: newer, acct: A }, perA)).toBe(newer);
+    expect(usageForActive(A, { usage: null, acct: A }, perA)).toBe(reset);
   });
 });
 
@@ -109,6 +157,15 @@ describe("useStartMs", () => {
     expect(useStartMs(NOW - 61_000, NOW)).toBe(NOW);
     expect(useStartMs("x", NOW)).toBe(NOW);
     expect(useStartMs(undefined, NOW)).toBe(NOW);
+  });
+});
+
+describe("useStuck", () => {
+  it("gives a use up only after 90 s, past the CLI's 60 s timeout", () => {
+    expect(USE_STUCK_MS).toBe(90_000);
+    expect(useStuck(NOW, NOW + 60_000)).toBe(false);
+    expect(useStuck(NOW, NOW + 90_000)).toBe(false);
+    expect(useStuck(NOW, NOW + 90_001)).toBe(true);
   });
 });
 

@@ -106,6 +106,7 @@ export interface CardHeader {
   chip: "active" | "ready" | "exhausted" | "login";
   resetMs?: number; // exhausted: when the exhausting gauge(s) reset
   exhausted?: boolean; // active login that is also exhausted (the chip stays "active")
+  loginNeeded?: boolean; // active login that claude-switch flags as needing a login (the chip stays "active")
   gauges?: HeaderGauge[];
 }
 export interface HeaderGauge { label: string; short: string; pct: number; hot: boolean }
@@ -145,14 +146,14 @@ export function headerGauges(gauges: HGauge[]): HeaderGauge[] {
     .map((x) => named(x.g));
 }
 
-/** Header chip: the active login is always "active" (an exhausted one adds its reset); others login needed > exhausted (a gauge at 100%) > ready. */
+/** Header chip: the active login is always "active" (adding login needed and an exhausted reset); others login needed > exhausted (a gauge at 100%) > ready. */
 export function headerChip(
   a: { active: boolean; loginNeeded: boolean; gauges: HGauge[] },
-): Pick<CardHeader, "chip" | "resetMs" | "exhausted"> {
+): Pick<CardHeader, "chip" | "resetMs" | "exhausted" | "loginNeeded"> {
   const full = a.gauges.filter((g) => typeof g.pct === "number" && g.pct >= 100);
   const resets = full.map((g) => g.resetMs).filter((r): r is number => typeof r === "number");
   const reset = resets.length ? { resetMs: Math.max(...resets) } : {};
-  if (a.active) return full.length ? { chip: "active", exhausted: true, ...reset } : { chip: "active" };
+  if (a.active) return { chip: "active", ...(a.loginNeeded ? { loginNeeded: true } : {}), ...(full.length ? { exhausted: true, ...reset } : {}) };
   if (a.loginNeeded) return { chip: "login" };
   if (full.length) return { chip: "exhausted", ...reset };
   return { chip: "ready" };

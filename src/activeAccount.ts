@@ -37,24 +37,44 @@ export function markActive(f: AccountsFile, acct: { id: string; email: string },
   return { ...f, accounts: accounts.sort((a, b) => b.lastSeenTs - a.lastSeenTs), activeId: acct.id };
 }
 
+/** True when the registry already names `id` as the active login (another window wrote the switch), so it needs no rewrite. */
+export function alreadyActive(f: AccountsFile, id: string): boolean {
+  return f.activeId === id && f.accounts.some((a) => a.id === id);
+}
+
 /**
- * Account a shared usage snapshot belongs to: its `acct` tag, else (a file
- * written before 2.21.0) the active login when it was fetched after this
- * window last saw the account change, else unknown.
+ * Account a shared usage snapshot belongs to: its `acct` tag. A file written
+ * before 2.21.0 has none and counts as the active login's only with proof:
+ * that login's own snapshot holds the same fetch (older builds write both
+ * files from one fetch, same ts) and it was fetched after this window last
+ * saw activeId change. Anything else is unknown.
  */
-export function snapshotAccount(snap: { ts: number; acct?: string }, activeId: string | null, activeChangedAtMs: number): string | null {
+export function snapshotAccount(
+  snap: { ts: number; acct?: string },
+  activeId: string | null,
+  activeChangedAtMs: number,
+  activeOwn: { ts: number } | undefined,
+): string | null {
   if (snap.acct) return snap.acct;
+  if (!activeId || activeOwn?.ts !== snap.ts) return null;
   return snap.ts * 1000 >= activeChangedAtMs ? activeId : null;
 }
 
-/** Usage of the active login: the live poll only when it was fetched for that account, else the account's last background fetch. */
-export function usageForActive<U>(
+/** The newer of two usage observations by fetch time; a tie keeps `a`. */
+export function newerUsage<U extends { ts: number }>(a: U | null, b: U | null): U | null {
+  if (!a || !b) return a ?? b;
+  return b.ts > a.ts ? b : a;
+}
+
+/** Usage of the active login: the newer of its live poll (only when fetched for that account) and its last per-account fetch. */
+export function usageForActive<U extends { ts: number }>(
   activeId: string | null,
   live: { usage: U | null; acct: string | null },
   perAccount: ReadonlyMap<string, { usage: U | null }>,
 ): U | null {
-  if (!activeId || live.acct === activeId) return live.usage;
-  return perAccount.get(activeId)?.usage ?? null;
+  if (!activeId) return live.usage;
+  const own = perAccount.get(activeId)?.usage ?? null;
+  return live.acct === activeId ? newerUsage(live.usage, own) : own;
 }
 
 /** Name of the active login as its card header shows it: the local part, plus the domain when two local parts collide. */
@@ -66,6 +86,14 @@ export function activeName(activeEmail: string, emails: string[]): string {
 /** Start of the click-to-render measurement: the webview's click time when plausible (same clock, under 60 s old), else receipt. */
 export function useStartMs(clickedAt: unknown, receivedMs: number): number {
   return typeof clickedAt === "number" && clickedAt <= receivedMs && receivedMs - clickedAt < 60_000 ? clickedAt : receivedMs;
+}
+
+/** How long a `claude-switch use` may stay unanswered before the host gives it up (the CLI timeout is 60 s; the webview's own fallback is also 90 s). */
+export const USE_STUCK_MS = 90_000;
+
+/** True when a `use` started at `startedMs` is still unanswered after USE_STUCK_MS. */
+export function useStuck(startedMs: number, nowMs: number): boolean {
+  return nowMs - startedMs > USE_STUCK_MS;
 }
 
 export interface UseOutcome {

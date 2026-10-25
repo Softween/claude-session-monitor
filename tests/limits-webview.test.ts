@@ -225,6 +225,30 @@ describe("Usage Limits webview", () => {
     expect(row(r, "ana@example.com")).toContain('data-use="ana@example.com" data-testid="csm-use-account">Use this account</button>');
   });
 
+  it("active login that claude-switch flags as needing a login shows both states in its chip", () => {
+    const now = Date.now();
+    const mk = (name: string, active: boolean, loginNeeded: boolean, gauges: ReturnType<typeof gauge>[]) => ({
+      id: `claude:${name}`, provider: "claude", label: `Claude · ${name}@x.com`, email: `${name}@x.com`, accountId: name, active, official: true, ts: now / 1000, note: null, gauges,
+      hdr: { name, ...headerChip({ active, loginNeeded, gauges }), gauges: headerGauges(gauges) } as CardHeader,
+    });
+    const base = {
+      type: "update", ts: now / 1000, official: true, accounts: [{ id: "ana" }, { id: "ben" }], eta: null, tokens: null, models: [], switchHtml: "", switchBadges: {},
+      panelFresh: true, ui: { switchActivityOpen: false, expandedAccounts: {} }, useEmails: [],
+    };
+    const row = (h: Harness, name: string) => h.root.innerHTML.split('data-testid="csm-account-row"').find((r) => r.includes(`title="Claude · ${name}@x.com"`)) ?? "";
+    const ok = [gauge("session", "Session (5h)", 20)];
+    const full = [{ ...gauge("session", "Session (5h)", 100), resetMs: now + 3_600_000 }];
+
+    const h = mount();
+    h.send({ ...base, providers: [mk("ana", true, true, ok), mk("ben", false, true, ok)] });
+    expect(row(h, "ana")).toContain('<span class="adot" title="active login"></span><span class="chip login">active · login needed</span>');
+    expect(row(h, "ben")).toContain('<span class="chip login">login needed</span>');
+    h.send({ ...base, providers: [mk("ana", true, true, full), mk("ben", false, false, ok)] });
+    expect(row(h, "ana")).toContain('<span class="chip login">active · login needed · exhausted · 1h');
+    h.send({ ...base, providers: [mk("ana", true, false, ok), mk("ben", false, false, ok)] });
+    expect(row(h, "ana")).toContain('<span class="adot" title="active login"></span><span class="chip">active</span>');
+  });
+
   it("hides the Tokens row and Models block unless showTokenStats is set", () => {
     const base = {
       type: "update", ts: Date.now() / 1000, official: true, accounts: [], eta: null,

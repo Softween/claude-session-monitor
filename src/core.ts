@@ -1233,11 +1233,25 @@ function readJson<T>(file: string, fallback: T): T {
   }
 }
 
-/** Write atomically (temp + rename) so a mid-write kill cannot truncate the target. */
+/**
+ * Write atomically (temp + rename) so a mid-write kill cannot truncate the
+ * target. The temp name is unique per write: every VS Code window rewrites the
+ * shared files, and one fixed temp let a window truncate the temp file another
+ * was renaming, leaving the target briefly empty.
+ */
 function atomicWrite(file: string, content: string): void {
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, content);
-  fs.renameSync(tmp, file);
+  const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    fs.writeFileSync(tmp, content);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* temp may not have been created */
+    }
+    throw e;
+  }
 }
 
 export interface TokenScanOpts {

@@ -652,4 +652,146 @@ describe("active login and Use this account", () => {
     expect(posted[posted.length - 1].useResult).toMatchObject({ email: "nobody@x.com", ok: false });
     expect(posted[posted.length - 1].useResult.text).toContain("does not list this account");
   });
+
+  // Fake timers and Date only: setImmediate stays real, so settleAsync() lets file reads finish.
+  const fakeClock = () => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+
+  it("every status bar redraw, the resource sampler's too, names the active login with its own usage", async () => {
+    fakeClock();
+    seedRegistryOnA(); // the live snapshot still holds A's 100%
+    writeLogin(UB, "b@x.com");
+    activateWithLimitsView();
+    await vi.waitFor(() => expect(rec.statusBars[0].text).toContain("$(account) b 12%"));
+    const bar = rec.statusBars[0];
+    const texts: string[] = [];
+    let text: string = bar.text;
+    Object.defineProperty(bar, "text", { get: () => text, set: (v: string) => { text = v; texts.push(v); } });
+    vi.advanceTimersByTime(10_000); // ~6 ticks and 2-3 resource samples (no session pids: the sampler redraws at once)
+    expect(texts.length).toBeGreaterThan(6);
+    for (const t of texts) expect(t).toContain("$(account) b 12%");
+  });
+
+  it("the active card shows a background fetch newer than its live poll, and the live poll never overwrites it", async () => {
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    // A's live poll is from before a switch away (100%); a background poll since then saw it at 4% after its reset.
+    fs.writeFileSync(`${MON}/official-usage.json`, JSON.stringify({ gauges: session(100), ts: Date.now() / 1000 - 600, acct: UA }));
+    fs.writeFileSync(snapFile(UA), JSON.stringify({ gauges: session(4), ts: Date.now() / 1000 - 30 }));
+    const { posted } = activateWithLimitsView();
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
+    rec.commands.get("claudeSessionMonitor.refresh")!();
+    rec.commands.get("claudeSessionMonitor.refresh")!();
+    const last = posted[posted.length - 1];
+    expect(card(last, UA).active).toBe(true);
+    expect(card(last, UA).gauges[0].pct).toBe(4);
+    expect(rec.statusBars[0].text).toContain("$(account) a 4%");
+  });
+
+  it("Use this account recovers from a synchronous spawn failure: the error shows and the next click runs", async () => {
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    writePanel(UA, "a@x.com");
+    let calls = 0;
+    rec.execFileImpl = (args) => {
+      if (!String(args[0]).endsWith("/.claude/bin/claude-switch")) return false;
+      calls++;
+      throw Object.assign(new Error("spawn E2BIG"), { code: "E2BIG", syscall: "spawn" });
+    };
+    const { posted, send } = activateWithLimitsView();
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
+    const at = Date.now();
+    expect(() => send({ type: "useAccount", email: "b@x.com", at })).not.toThrow();
+    const last = posted[posted.length - 1];
+    expect(last.usePending).toBeUndefined();
+    expect(last.useResult).toEqual({ email: "b@x.com", at, ok: false, text: "could not start claude-switch: spawn E2BIG" });
+    send({ type: "useAccount", email: "b@x.com", at: Date.now() });
+    expect(calls).toBe(2); // not refused as "already switching"
+    expect(debugLog()).toContain("use: b@x.com");
+  });
+
+  it("the host gives up a claude-switch use that never exits after 90 s, and its late exit does not clear a newer switch", async () => {
+    fakeClock();
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    writePanel(UA, "a@x.com");
+    const exits: Array<(err: unknown, stdout: string, stderr: string) => void> = [];
+    rec.execFileImpl = (args) => {
+      if (!String(args[0]).endsWith("/.claude/bin/claude-switch")) return false;
+      exits.push(args[args.length - 1]); // a hung child: no exit yet
+      return true;
+    };
+    const { posted, send } = activateWithLimitsView();
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
+    const at = Date.now();
+    send({ type: "useAccount", email: "b@x.com", at });
+    expect(posted[posted.length - 1].usePending).toBe("b@x.com");
+    vi.advanceTimersByTime(88_000);
+    expect(posted[posted.length - 1].usePending).toBe("b@x.com");
+    vi.advanceTimersByTime(4_000);
+    expect(posted[posted.length - 1].usePending).toBeUndefined();
+    expect(posted[posted.length - 1].useResult).toEqual({ email: "b@x.com", at, ok: false, text: "claude-switch use did not exit within 90 s" });
+
+    send({ type: "useAccount", email: "b@x.com", at: Date.now() }); // the buttons are back
+    expect(exits).toHaveLength(2);
+    expect(posted[posted.length - 1].usePending).toBe("b@x.com");
+    exits[0](null, "active: b@x.com (Max)\n", ""); // the first child exits late
+    await vi.waitFor(() => expect(debugLog()).toContain("exited without error but the active login is a@x.com"));
+    expect(posted[posted.length - 1].usePending).toBe("b@x.com"); // still the second switch
+  });
+
+  it("an untagged snapshot of the previous login never shows on the new active card when another window moved the registry", async () => {
+    fakeClock();
+    seedRegistryOnA(); // the shared live snapshot holds A's 100% without an acct tag (a 2.20.x window wrote it)
+    const { posted } = activateWithLimitsView(); // no ~/.claude.json and no panel: only the registry names the login
+    await settleAsync();
+    const accounts = [{ id: UB, email: "b@x.com", lastSeenTs: 200 }, { id: UA, email: "a@x.com", lastSeenTs: 100 }];
+    fs.writeFileSync(`${MON}/accounts.json`, JSON.stringify({ v: 1, activeId: UB, accounts }));
+    vi.advanceTimersByTime(32_000); // the 30 s registry reload moves activeId to B
+    await settleAsync();
+    vi.advanceTimersByTime(7_000); // a usage poll reads the untagged snapshot
+    await settleAsync();
+    const last = posted[posted.length - 1];
+    expect(card(last, UB).active).toBe(true);
+    expect(card(last, UB).gauges[0].pct).toBe(12);
+    expect(rec.statusBars[0].text).toContain("$(account) b 12%");
+  });
+
+  it("follows a switch another window already wrote to the registry without rewriting the file", async () => {
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    const { posted } = activateWithLimitsView();
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
+    await settleAsync();
+    const written = JSON.stringify({ v: 1, activeId: UB, accounts: [{ id: UB, email: "b@x.com", lastSeenTs: 777 }, { id: UA, email: "a@x.com", lastSeenTs: 100 }] });
+    fs.writeFileSync(`${MON}/accounts.json`, written);
+    writeLogin(UB, "b@x.com");
+    const later = new Date(Date.now() + 5_000);
+    fs.utimesSync(`${HOME}/.claude.json`, later, later); // a distinct mtime: the identity parse is memoized on it
+    rec.commands.get("claudeSessionMonitor.refresh")!(); // skipped while an earlier probe still runs: the next 1.5 s tick follows
+    await vi.waitFor(() => expect(card(posted[posted.length - 1], UB).active).toBe(true), { timeout: 3000 });
+    expect(fs.readFileSync(`${MON}/accounts.json`, "utf8")).toBe(written);
+    expect(debugLog()).toContain("active: b@x.com (acct bbbbbbbb, from claude.json)");
+  });
+
+  it("auto-resume follows the active login's own 5h gauge, not the previous login's live poll", () => {
+    vi.useFakeTimers();
+    const reset = Date.now() + 600_000;
+    const s5 = (pct: number) => [{ key: "session", label: "Session (5h)", pct, resetMs: reset }];
+    const start = (activePct: number, livePct: number): string => {
+      disposeCtx(lastCtx);
+      fs.rmSync(MON, { recursive: true, force: true });
+      fs.mkdirSync(MON, { recursive: true });
+      const accounts = [{ id: UB, email: "b@x.com", lastSeenTs: 200 }, { id: UA, email: "a@x.com", lastSeenTs: 100 }];
+      fs.writeFileSync(`${MON}/accounts.json`, JSON.stringify({ v: 1, activeId: UB, accounts }));
+      fs.writeFileSync(`${MON}/official-usage.json`, JSON.stringify({ gauges: s5(livePct), ts: Date.now() / 1000 - 30, acct: UA })); // still A's live poll
+      fs.writeFileSync(snapFile(UB), JSON.stringify({ gauges: s5(activePct), ts: Date.now() / 1000 - 60 }));
+      lastCtx = mkCtx();
+      ext.activate(lastCtx);
+      return debugLog();
+    };
+    rec.config.set("enableClaude", true);
+    rec.config.set("autoResumeAfterReset", true);
+    expect(start(12, 99)).not.toContain("auto-resume scheduled");
+    expect(start(99, 10)).toContain("auto-resume scheduled");
+  });
 });

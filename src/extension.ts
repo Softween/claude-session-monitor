@@ -19,7 +19,7 @@ import * as os from "os";
 import * as path from "path";
 import { SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, headerChip, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, headerGauges, type CardHeader } from "./switchPanel";
 import { gaugeColumn } from "./compact";
-import { activeName, markActive, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, type ActiveCandidate } from "./activeAccount";
+import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, useStuck, type ActiveCandidate } from "./activeAccount";
 import { execFile } from "child_process";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import {
@@ -1159,7 +1159,7 @@ function expandedOf(card){
   return v === undefined ? !!card.active : !!v;
 }
 function chipHtml(h){
-  if(h.chip==='active') return '<span class="adot" title="active login"></span><span class="chip">active'+(h.exhausted?' · exhausted'+(h.resetMs?' · '+fmtLeft(h.resetMs).replace('resets now','now'):''):'')+'</span>';
+  if(h.chip==='active') return '<span class="adot" title="active login"></span><span class="chip'+(h.loginNeeded?' login':'')+'">active'+(h.loginNeeded?' · login needed':'')+(h.exhausted?' · exhausted'+(h.resetMs?' · '+fmtLeft(h.resetMs).replace('resets now','now'):''):'')+'</span>';
   if(h.chip==='exhausted') return '<span class="chip">exhausted'+(h.resetMs?' · '+fmtLeft(h.resetMs).replace('resets now','now'):'')+'</span>';
   if(h.chip==='login') return '<span class="chip login">login needed</span>';
   return '<span class="chip">ready</span>';
@@ -1345,6 +1345,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // (registry file shared across windows; tokens in SecretStorage), and the
   // usage panel shows every one of them at once.
   let accountsFile: AccountsFile = readAccountsFile();
+  let activeChangedAtMs = 0; // when this window last saw activeId move (attributes snapshots of older builds)
+
+  /** Adopt a registry state; every path that moves activeId goes through here, so the change time is never stale. */
+  function setAccounts(next: AccountsFile): void {
+    if (next.activeId !== accountsFile.activeId) activeChangedAtMs = Date.now();
+    accountsFile = next;
+  }
   const usageByAccount = new Map<string, { usage: OfficialUsage | null; stale: boolean }>();
   let othersInflight = false;
   let lastOthersCheck = 0;
@@ -1360,7 +1367,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     },
   );
 
-  let usePending: string | null = null; // email `claude-switch use` is switching to right now
+  type UseFinish = (ok: boolean, text: string, cliMs: number | null) => void;
+  let usePending: { email: string; started: number; finish: UseFinish } | null = null; // the `claude-switch use` running right now
   let useDone: { email: string; at: number; ok: boolean; text: string; until: number } | null = null;
 
   /**
@@ -1373,14 +1381,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
     const received = Date.now();
     const t0 = useStartMs(clickedAt, received);
     const at = typeof clickedAt === "number" ? clickedAt : received;
-    const finish = (ok: boolean, text: string, cliMs: number | null): void => {
+    const finish: UseFinish = (ok, text, cliMs) => {
       useDone = { email, at, ok, text, until: Date.now() + (ok ? 10_000 : 30_000) };
       pushUsagePayload();
       log(`use: ${email} ${Date.now() - t0}ms (${cliMs === null ? "cli not run" : `cli ${cliMs}ms`}, ${ok ? "ok" : "failed"}: ${text})`);
       vscode.window.setStatusBarMessage(`claude-switch use ${email}: ${text.slice(0, 160)}`, 8000);
     };
     if (usePending) {
-      finish(false, `already switching to ${usePending}`, null);
+      finish(false, `already switching to ${usePending.email}`, null);
       return;
     }
     const panel = readPanel();
@@ -1388,24 +1396,39 @@ export function activate(ctx: vscode.ExtensionContext): void {
       finish(false, "claude-switch does not list this account right now (panel.json missing, stale or without it)", null);
       return;
     }
-    usePending = email;
+    const run = { email, started: Date.now(), finish };
+    usePending = run;
     pushUsagePayload();
     const started = Date.now();
-    execFile(path.join(os.homedir(), ".claude", "bin", "claude-switch"), ["use", email], { timeout: 60_000 }, (err, stdout, stderr) => {
-      const cliMs = Date.now() - started;
-      const out = useOutcome(err, String(stdout ?? ""), String(stderr ?? ""));
-      void syncActive(true)
-        .catch((e: unknown) => {
-          log("use: re-resolve failed " + String(e));
-          return false;
-        })
-        .then(() => {
-          usePending = null;
-          const now = accountsFile.accounts.find((a) => a.id === accountsFile.activeId)?.email;
-          if (out.ok && now?.toLowerCase() !== email.toLowerCase()) finish(false, `claude-switch exited without error but the active login is ${now ?? "unknown"}`, cliMs);
-          else finish(out.ok, out.text, cliMs);
-        });
-    });
+    try {
+      execFile(path.join(os.homedir(), ".claude", "bin", "claude-switch"), ["use", email], { timeout: 60_000 }, (err, stdout, stderr) => {
+        const cliMs = Date.now() - started;
+        const out = useOutcome(err, String(stdout ?? ""), String(stderr ?? ""));
+        void syncActive(true)
+          .catch((e: unknown) => {
+            log("use: re-resolve failed " + String(e));
+            return false;
+          })
+          .then(() => {
+            if (usePending === run) usePending = null; // a late exit (given up by expireStuckUse) must not clear a newer switch
+            const now = accountsFile.accounts.find((a) => a.id === accountsFile.activeId)?.email;
+            if (out.ok && now?.toLowerCase() !== email.toLowerCase()) finish(false, `claude-switch exited without error but the active login is ${now ?? "unknown"}`, cliMs);
+            else finish(out.ok, out.text, cliMs);
+          });
+      });
+    } catch (e) {
+      // A synchronous spawn failure (E2BIG, ENOMEM) never calls back: without this the button stays "Switching…" until reload.
+      usePending = null;
+      finish(false, `could not start claude-switch: ${e instanceof Error ? e.message : String(e)}`, null);
+    }
+  }
+
+  /** Called every tick: a `use` whose exit never arrived (a child the 60 s timeout could not end) is given up, so the Use buttons come back. */
+  function expireStuckUse(): void {
+    if (!usePending || !useStuck(usePending.started, Date.now())) return;
+    const run = usePending;
+    usePending = null;
+    run.finish(false, `claude-switch use did not exit within ${USE_STUCK_MS / 1000} s`, Date.now() - run.started);
   }
   ctx.subscriptions.push(
     vscode.window.registerWebviewViewProvider("claudeSessionMonitor.limits", limitsView),
@@ -1451,7 +1474,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const bootSnap = readOfficialSnapshot();
   if (bootSnap?.gauges.length && bootSnap.ts) {
     officialUsage = { gauges: bootSnap.gauges, ts: bootSnap.ts };
-    officialUsageAcct = bootSnap.acct ?? accountsFile.activeId ?? null;
+    const bootActive = accountsFile.activeId ?? null;
+    const bootOwn = bootActive && !bootSnap.acct ? readOfficialSnapshot(officialUsageFileFor(bootActive)) : undefined;
+    officialUsageAcct = snapshotAccount(bootSnap, bootActive, activeChangedAtMs, bootOwn);
   }
   for (const a of accountsFile.accounts) {
     const s = readOfficialSnapshot(officialUsageFileFor(a.id));
@@ -1518,7 +1543,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       return;
     }
     const nowMs = Date.now();
-    const g5 = officialUsage?.gauges.find((g) => g.key === "session");
+    const g5 = activeUsage()?.gauges.find((g) => g.key === "session");
     let target = 0;
     const limitedViews = views.filter((v) => v.provider === "claude" && groupOf(v) === "limited");
     if (limitedViews.length) {
@@ -1607,7 +1632,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     const usageEverySec = Math.max(5, cfg().get<number>("usagePollSeconds", 30));
     const snap = readOfficialSnapshot();
     const activeId = accountsFile.activeId ?? null;
-    const snapAcct = snap ? snapshotAccount(snap, activeId, activeChangedAtMs) : null;
+    const activeOwn = snap && !snap.acct && activeId ? readOfficialSnapshot(officialUsageFileFor(activeId)) : undefined;
+    const snapAcct = snap ? snapshotAccount(snap, activeId, activeChangedAtMs, activeOwn) : null;
     if (!force && snap?.gauges.length && snap.ts && snapAcct === activeId && (!officialUsage || officialUsageAcct !== snapAcct || snap.ts > officialUsage.ts)) {
       officialUsage = { gauges: snap.gauges, ts: snap.ts }; // another window fetched it for this login
       officialUsageAcct = snapAcct;
@@ -1656,7 +1682,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         log(`usage ok${force ? " (manual)" : ""}: ${r.usage.gauges.map((g) => `${g.key}=${Math.round(g.pct)}`).join(" ")}`);
         const reg = upsertActiveAccount(readAccountsFile(), { ...ident, tokenExpiresAt: creds.expiresAt, tier: creds.tier }, nowSec);
         // A fetch that raced an account switch (old token) keeps its usage but must not undo the switch.
-        accountsFile = activeNow && activeNow.id !== ident.id ? { ...reg, activeId: activeNow.id } : reg;
+        setAccounts(activeNow && activeNow.id !== ident.id ? { ...reg, activeId: activeNow.id } : reg);
         writeAccountsFile(accountsFile);
         usageByAccount.set(ident.id, { usage: r.usage, stale: false });
         writeOfficialSnapshot({ gauges: r.usage.gauges, ts: r.usage.ts, attemptTs: nowSec }, officialUsageFileFor(ident.id));
@@ -1738,10 +1764,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
             }
             vault = cliOauth;
             const f = readAccountsFile();
-            accountsFile = {
+            setAccounts({
               ...f,
               accounts: f.accounts.map((x) => (x.id === a.id ? { ...withoutNeedsLogin(x), tokenExpiresAt: cliOauth.expiresAt } : x)),
-            };
+            });
             writeAccountsFile(accountsFile);
             a = accountsFile.accounts.find((x) => x.id === a.id) ?? a;
             changed = true;
@@ -1765,7 +1791,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         if (keeperOwns) {
           if (a.needsLogin && source === "use-cli") {
             const f = readAccountsFile();
-            accountsFile = { ...f, accounts: f.accounts.map((x) => (x.id === a.id ? withoutNeedsLogin(x) : x)) };
+            setAccounts({ ...f, accounts: f.accounts.map((x) => (x.id === a.id ? withoutNeedsLogin(x) : x)) });
             writeAccountsFile(accountsFile);
             a = accountsFile.accounts.find((x) => x.id === a.id) ?? a;
           }
@@ -1937,10 +1963,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (settle.action === "wait") return "waiting";
     if (!(await writeVault(ident, creds, owners))) return "failed";
     refreshFailTs.delete(ident.id);
-    accountsFile = upsertActiveAccount(
-      readAccountsFile(),
-      { id: ident.id, email: ident.email, tokenExpiresAt: creds.expiresAt, tier: creds.tier },
-      Date.now() / 1000,
+    setAccounts(
+      upsertActiveAccount(
+        readAccountsFile(),
+        { id: ident.id, email: ident.email, tokenExpiresAt: creds.expiresAt, tier: creds.tier },
+        Date.now() / 1000,
+      ),
     );
     writeAccountsFile(accountsFile);
     log(`capture: vaulted login (acct ${ident.id.slice(0, 8)})`);
@@ -2021,7 +2049,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   function healNeedsLogin(a: AccountInfo, vault: OAuthBlob): boolean {
     if (!a.needsLogin || refreshBlocked(a, vault.refreshToken)) return false;
     const f = readAccountsFile(); // fresh read: another window may have written the registry
-    accountsFile = { ...f, accounts: f.accounts.map((x) => (x.id === a.id ? withoutNeedsLogin(x) : x)) };
+    setAccounts({ ...f, accounts: f.accounts.map((x) => (x.id === a.id ? withoutNeedsLogin(x) : x)) });
     writeAccountsFile(accountsFile);
     log(`needsLogin cleared (acct ${a.id.slice(0, 8)}): vault holds a newer refresh token`);
     return true;
@@ -2049,7 +2077,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     refreshFailTs.delete(id);
     const f = readAccountsFile(); // another window may have a fresher registry
     const flag = { needsLogin: true, needsLoginFp: tokenFingerprint(sentRefreshToken) };
-    accountsFile = { ...f, accounts: f.accounts.map((x) => (x.id === id ? { ...x, ...flag } : x)) };
+    setAccounts({ ...f, accounts: f.accounts.map((x) => (x.id === id ? { ...x, ...flag } : x)) });
     writeAccountsFile(accountsFile);
     const cur = usageByAccount.get(id);
     usageByAccount.set(id, { usage: cur?.usage ?? null, stale: true });
@@ -2079,10 +2107,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     } catch (e) {
       log("oauth vault store failed: " + String(e));
     }
-    accountsFile = {
+    setAccounts({
       ...accountsFile,
       accounts: accountsFile.accounts.map((x) => (x.id === id ? { ...withoutNeedsLogin(x), tokenExpiresAt: next.expiresAt } : x)),
-    };
+    });
     writeAccountsFile(accountsFile);
     const file = officialUsageFileFor(id);
     const snap = readOfficialSnapshot(file);
@@ -2154,7 +2182,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       return;
     }
     if (switchInflight) return;
-    accountsFile = readAccountsFile();
+    setAccounts(readAccountsFile());
     const target = accountsFile.accounts.find((a) => a.id === targetId);
     if (!target) {
       vscode.window.showErrorMessage("Agent Sessions: unknown Claude account.");
@@ -2175,7 +2203,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         await ctx.secrets.store(`csm.token.${targetId}`, r.refreshed.accessToken);
       }
       lastSwitchTs = Date.now();
-      accountsFile = { ...readAccountsFile(), activeId: targetId };
+      setAccounts({ ...readAccountsFile(), activeId: targetId });
       writeAccountsFile(accountsFile);
       cachedCreds = undefined;
       identityCache = undefined;
@@ -2249,7 +2277,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let activeRuns = 0; // syncActive calls started
   let activeApplied = 0; // newest call that resolved: an older one finishing later is dropped
   let activeInflight = 0;
-  let activeChangedAtMs = 0; // when this window last moved activeId (attributes snapshots of older builds)
 
   /** Re-resolve the active login (a tick skips while another call runs; `force` never does); true when activeId moved. */
   async function syncActive(force = false): Promise<boolean> {
@@ -2272,9 +2299,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
   /** Make `next` the registry's active login when it is not already; the next usage poll re-reads the keychain. */
   function applyActive(next: ActiveCandidate): boolean {
     if (next.id === accountsFile.activeId) return false;
-    accountsFile = markActive(readAccountsFile(), next, Date.now() / 1000);
-    writeAccountsFile(accountsFile);
-    activeChangedAtMs = Date.now();
+    const disk = readAccountsFile();
+    setAccounts(markActive(disk, next, Date.now() / 1000));
+    if (!alreadyActive(disk, next.id)) writeAccountsFile(accountsFile); // every window follows the switch within a tick: only the first one writes
     cachedCreds = undefined; // the keychain holds the new login's token now
     const snap = readOfficialSnapshot(officialUsageFileFor(next.id)); // another window may have polled it more recently
     const known = usageByAccount.get(next.id);
@@ -2292,7 +2319,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
   function currentAccountCtx(): AccountCtx & { usage: OfficialUsage | null } {
     const activeId = accountsFile.activeId ?? null;
     const track = trackAllAccounts();
-    if (activeId && officialUsage && officialUsageAcct === activeId) usageByAccount.set(activeId, { usage: officialUsage, stale: false });
+    // Mirror the live poll into the active card, unless a background poll (any window) fetched this account more recently.
+    const own = activeId ? usageByAccount.get(activeId)?.usage ?? null : null;
+    if (activeId && officialUsage && officialUsageAcct === activeId && newerUsage(officialUsage, own) === officialUsage) usageByAccount.set(activeId, { usage: officialUsage, stale: false });
     const selId = activeId;
     const list = track ? accountsFile.accounts : accountsFile.accounts.filter((a) => a.id === activeId);
     const labels = accountPillLabels(list.map((a) => a.email));
@@ -2314,14 +2343,18 @@ export function activate(ctx: vscode.ExtensionContext): void {
         needsLogin: a.id !== activeId && a.needsLogin === true,
       };
     });
-    const usage = usageForActive(activeId, { usage: officialUsage, acct: officialUsageAcct }, usageByAccount);
     return {
       accounts: accounts.length > 1 ? accounts : [],
       selectedId: selId,
       activeId,
       selectedStale: accounts.find((v) => v.id === selId)?.stale ?? false,
-      usage,
+      usage: activeUsage(),
     };
+  }
+
+  /** The active login's usage for the panel, the status bar and auto-resume: the newer of its live poll and its last per-account fetch. */
+  function activeUsage(): OfficialUsage | null {
+    return usageForActive(accountsFile.activeId ?? null, { usage: officialUsage, acct: officialUsageAcct }, usageByAccount);
   }
 
   function currentCodexClient(): CodexAppServerClient {
@@ -2487,20 +2520,25 @@ export function activate(ctx: vscode.ExtensionContext): void {
         showTokenStats: showTokenStats(),
         ui: { switchActivityOpen: open, expandedAccounts: ctx.workspaceState.get<Record<string, boolean>>("csm.expandedAccounts", {}) },
         useEmails: fresh ? (panel.accounts ?? []).map((a) => a.email) : [],
-        usePending: usePending ?? undefined,
+        usePending: usePending?.email,
         useResult: useDone && Date.now() < useDone.until ? { email: useDone.email, at: useDone.at, ok: useDone.ok, text: useDone.text } : undefined,
       });
-      const act = accountsFile.accounts.length > 1 ? accountsFile.accounts.find((a) => a.id === c.activeId) : undefined;
-      updateStatusBar(
-        statusBar,
-        lastAllViews,
-        resourceCache,
-        claudeEnabled() ? c.usage : null,
-        claudeEnabled() && act ? { name: activeName(act.email, accountsFile.accounts.map((a) => a.email)), email: act.email } : undefined,
-      );
+      renderStatusBar();
     } catch {
       /* ignore */
     }
+  }
+
+  /** Every status bar update (panel pushes and the resource sampler) shows the active login's usage and, with 2+ accounts, its name. */
+  function renderStatusBar(): void {
+    const act = accountsFile.accounts.length > 1 ? accountsFile.accounts.find((a) => a.id === accountsFile.activeId) : undefined;
+    updateStatusBar(
+      statusBar,
+      lastAllViews,
+      resourceCache,
+      claudeEnabled() ? activeUsage() : null,
+      claudeEnabled() && act ? { name: activeName(act.email, accountsFile.accounts.map((a) => a.email)), email: act.email } : undefined,
+    );
   }
 
   function refresh(): void {
@@ -2549,6 +2587,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     // keychain read only on change / every 60 s.
     if (claudeEnabled()) followActive();
     if (claudeEnabled()) void captureActiveLogin(false);
+    expireStuckUse();
 
     // Official usage poll — coordinated across ALL VS Code windows through the
     // shared snapshot file (see pollUsage).
@@ -2561,12 +2600,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
     // refresh their usage in the background on a slower cadence.
     if (claudeEnabled() && now - lastOthersCheck > 30) {
       lastOthersCheck = now;
-      accountsFile = readAccountsFile();
+      setAccounts(readAccountsFile());
       const panel0 = readPanel();
       if (panelFresh(panel0, Date.now())) {
         const merged = mergePanelAccounts(accountsFile, panel0);
         if (merged !== accountsFile) {
-          accountsFile = merged;
+          setAccounts(merged);
           writeAccountsFile(accountsFile);
         }
       }
@@ -2670,12 +2709,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const pids = allViews.map((v) => v.pid).filter((p): p is number => !!p);
       sampleResources(pids, resourceCache, () => {
         if (disposed) return;
-        updateStatusBar(
-          statusBar,
-          lastAllViews,
-          resourceCache,
-          claudeEnabled() ? officialUsage : null,
-        );
+        renderStatusBar();
         pushSessions(lastViews, lastAllViews);
       });
     }
@@ -3035,7 +3069,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claudeSessionMonitor.switchAccount", () => pickAndSwitchAccount()),
     vscode.commands.registerCommand("claudeSessionMonitor.switchToBestAccount", () => rotateToBest()),
     vscode.commands.registerCommand("claudeSessionMonitor.forgetOtherAccounts", async () => {
-      accountsFile = readAccountsFile(); // another window may have a fresher registry
+      setAccounts(readAccountsFile()); // another window may have a fresher registry
       const keepId = accountsFile.activeId;
       if (!keepId) {
         vscode.window.showWarningMessage(
@@ -3060,7 +3094,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         usageByAccount.delete(a.id);
       }
       const active = accountsFile.accounts.find((a) => a.id === keepId);
-      accountsFile = { v: 1, accounts: active ? [active] : [], activeId: keepId };
+      setAccounts({ v: 1, accounts: active ? [active] : [], activeId: keepId });
       writeAccountsFile(accountsFile);
       vscode.window.showInformationMessage(
         drop.length

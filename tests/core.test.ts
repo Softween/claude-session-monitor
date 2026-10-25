@@ -1144,6 +1144,23 @@ describe("account registry", () => {
     expect(officialUsageFileFor("")).toMatch(/official-usage-default\.json$/);
   });
 
+  it("writes through a temp file of its own: another window's temp is never truncated, none is left behind", () => {
+    const file = path.join(tmp, "accounts.json");
+    const foreign = `${file}.tmp`; // another window mid-write (the fixed temp name of 2.21.0 and older)
+    fs.writeFileSync(foreign, '{"v":1,"accou');
+    const f = upsertActiveAccount({ v: 1, accounts: [{ id: "a", email: "a@x.com", lastSeenTs: 1 }] }, { id: "b", email: "b@x.com" }, 2);
+    writeAccountsFile(f, file);
+    writeAccountsFile(f, file);
+    expect(readAccountsFile(file)).toEqual(f);
+    expect(fs.readFileSync(foreign, "utf8")).toBe('{"v":1,"accou'); // untouched: its owner's rename still finds it
+    expect(fs.readdirSync(tmp).sort()).toEqual(["accounts.json", "accounts.json.tmp"]);
+
+    const blocked = path.join(tmp, "official-usage.json");
+    fs.mkdirSync(path.join(blocked, "sub"), { recursive: true }); // a directory in the way: the rename fails
+    writeOfficialSnapshot({ gauges: [], ts: 1 }, blocked);
+    expect(fs.readdirSync(tmp).filter((n) => n.startsWith("official-usage.json."))).toEqual([]); // its temp was removed
+  });
+
   it("tokenStale survives the snapshot round-trip", () => {
     const file = path.join(tmp, "snap-acct.json");
     writeOfficialSnapshot({ gauges: [{ key: "session", label: "Session (5h)", pct: 7, resetMs: null }], ts: 123, tokenStale: true }, file);

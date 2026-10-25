@@ -15,6 +15,7 @@ const rec = vi.hoisted(() => ({
   statusBars: [] as any[],
   spawns: [] as any[],
   terminals: [] as any[],
+  execFileImpl: null as null | ((args: any[]) => boolean), // returns true when it handled the call
 }));
 
 vi.mock("os", async (orig) => {
@@ -29,6 +30,7 @@ vi.mock("child_process", async () => {
   return {
     execFile: (...args: any[]) => {
       const cb = args[args.length - 1];
+      if (rec.execFileImpl?.(args)) return { on() {} } as any;
       if (typeof cb === "function") cb(new Error("mocked"), "", "");
       return { on() {} } as any;
     },
@@ -226,6 +228,7 @@ afterEach(() => {
   rec.statusBars.length = 0;
   rec.spawns.length = 0;
   rec.terminals.length = 0;
+  rec.execFileImpl = null;
   lastCtx = undefined;
   vi.useRealTimers();
 });
@@ -524,5 +527,129 @@ describe("extension activate()", () => {
 
   it("deactivate() does not throw", () => {
     expect(() => ext.deactivate()).not.toThrow();
+  });
+});
+
+describe("active login and Use this account", () => {
+  const UA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const UB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const MON = `${HOME}/.claude/session-monitor`;
+  const SW = `${HOME}/.claude/state/claude-switch`;
+  const session = (pct: number) => [{ key: "session", label: "Session (5h)", pct, resetMs: null }];
+  const snapFile = (id: string) => `${MON}/official-usage-${id.slice(0, 16)}.json`;
+  const registry = () => JSON.parse(fs.readFileSync(`${MON}/accounts.json`, "utf8"));
+  const debugLog = () => fs.readFileSync(`${MON}/csm-debug.log`, "utf8");
+
+  function writeLogin(id: string, email: string): void {
+    fs.writeFileSync(`${HOME}/.claude.json`, JSON.stringify({ oauthAccount: { accountUuid: id, emailAddress: email } }));
+  }
+  function writePanel(id: string, email: string, tsSec = Date.now() / 1000): void {
+    fs.mkdirSync(SW, { recursive: true });
+    const accounts = [{ uuid: UA, email: "a@x.com", rank: 1 }, { uuid: UB, email: "b@x.com", rank: 2 }];
+    fs.writeFileSync(`${SW}/panel.json`, JSON.stringify({ v: 1, ts: tsSec, active: { uuid: id, email }, priority: ["a@x.com", "b@x.com"], accounts, events: [] }));
+  }
+  // Registry still on A (the state the 2.20 panel was stuck in); the shared live
+  // snapshot holds A's gauges without an acct tag, as an older build wrote it.
+  function seedRegistryOnA(): void {
+    fs.mkdirSync(MON, { recursive: true });
+    const accounts = [{ id: UA, email: "a@x.com", lastSeenTs: 100 }, { id: UB, email: "b@x.com", lastSeenTs: 50 }];
+    fs.writeFileSync(`${MON}/accounts.json`, JSON.stringify({ v: 1, activeId: UA, accounts }));
+    fs.writeFileSync(snapFile(UA), JSON.stringify({ gauges: session(100), ts: Date.now() / 1000 - 30 }));
+    fs.writeFileSync(snapFile(UB), JSON.stringify({ gauges: session(12), ts: Date.now() / 1000 - 120 }));
+    fs.writeFileSync(`${MON}/official-usage.json`, JSON.stringify({ gauges: session(100), ts: Date.now() / 1000 - 30 }));
+  }
+  function activateWithLimitsView(): { posted: any[]; send: (m: any) => void } {
+    const ctx = mkCtx();
+    ctx.workspaceState = { get: (_k: string, def?: unknown) => def, update: () => Promise.resolve() };
+    lastCtx = ctx;
+    ext.activate(ctx);
+    const posted: any[] = [];
+    let onMessage: (m: any) => void = () => undefined;
+    rec.webviews.find((w) => w.id === "claudeSessionMonitor.limits")!.p.resolveWebviewView({
+      webview: { options: {}, html: "", onDidReceiveMessage: (fn: (m: any) => void) => { onMessage = fn; }, postMessage: (m: any) => { posted.push(m); } },
+    });
+    return { posted, send: (m) => onMessage(m) };
+  }
+  const card = (payload: any, id: string) => payload.providers.find((p: any) => p.accountId === id);
+
+  it("marks the ~/.claude.json login active at once while usage fetches fail, with its own gauge in the card and status bar", async () => {
+    seedRegistryOnA();
+    writeLogin(UB, "b@x.com");
+    const { posted } = activateWithLimitsView();
+    await vi.waitFor(() => expect(registry().activeId).toBe(UB));
+    await vi.waitFor(() => expect(card(posted[posted.length - 1], UB).active).toBe(true));
+    const last = posted[posted.length - 1];
+    expect(card(last, UA).active).toBe(false);
+    expect(card(last, UB).gauges[0].pct).toBe(12); // B's own last fetch, not A's 100%
+    expect(rec.statusBars[0].text).toContain("$(account) b 12%");
+    expect(rec.statusBars[0].text).not.toContain("100%");
+    expect(rec.statusBars[0].tooltip).toContain("Claude account: b@x.com (active)");
+    expect(debugLog()).toContain("active: b@x.com (acct bbbbbbbb, from claude.json)");
+  });
+
+  it("a claude-switch panel.json fresher than ~/.claude.json decides the active login", async () => {
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(`${HOME}/.claude.json`, old, old);
+    writePanel(UB, "b@x.com");
+    activateWithLimitsView();
+    await vi.waitFor(() => expect(registry().activeId).toBe(UB));
+    expect(debugLog()).toContain("from panel.json");
+  });
+
+  it("Use this account: Switching… while claude-switch runs, then re-resolves and re-renders on exit", async () => {
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    writePanel(UA, "a@x.com");
+    const calls: string[][] = [];
+    rec.execFileImpl = (args) => {
+      if (!String(args[0]).endsWith("/.claude/bin/claude-switch")) return false;
+      calls.push(args[1]);
+      setTimeout(() => {
+        writeLogin(UB, "b@x.com");
+        writePanel(UB, "b@x.com");
+        args[args.length - 1](null, "active: b@x.com (Max)\n", "");
+      }, 30);
+      return true;
+    };
+    const { posted, send } = activateWithLimitsView();
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
+    const at = Date.now();
+    send({ type: "useAccount", email: "b@x.com", at });
+    expect(calls).toEqual([["use", "b@x.com"]]);
+    expect(posted[posted.length - 1].usePending).toBe("b@x.com");
+    await vi.waitFor(() => expect(posted[posted.length - 1].useResult).toEqual({ email: "b@x.com", at, ok: true, text: "active: b@x.com (Max)" }));
+    const last = posted[posted.length - 1];
+    expect(last.usePending).toBeUndefined();
+    expect(card(last, UB).active).toBe(true);
+    expect(card(last, UB).hdr.chip).toBe("active");
+    expect(card(last, UA).active).toBe(false);
+    expect(registry().activeId).toBe(UB);
+    expect(debugLog()).toMatch(/use: b@x\.com \d+ms \(cli \d+ms, ok: active: b@x\.com \(Max\)\)/);
+  });
+
+  it("Use this account shows the CLI's error text in the panel and keeps the active login", async () => {
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    writePanel(UA, "a@x.com");
+    rec.execFileImpl = (args) => {
+      if (!String(args[0]).endsWith("/.claude/bin/claude-switch")) return false;
+      const err = Object.assign(new Error("Command failed: claude-switch use b@x.com"), { code: 2 });
+      setTimeout(() => args[args.length - 1](err, "", "claude-switch: vault for b@x.com has no oauthAccount; log in once with that account\n"), 10);
+      return true;
+    };
+    const { posted, send } = activateWithLimitsView();
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
+    send({ type: "useAccount", email: "b@x.com", at: Date.now() });
+    await vi.waitFor(() => expect(posted[posted.length - 1].useResult?.ok).toBe(false));
+    const last = posted[posted.length - 1];
+    expect(last.useResult.text).toBe("claude-switch: vault for b@x.com has no oauthAccount; log in once with that account");
+    expect(card(last, UA).active).toBe(true);
+    expect(registry().activeId).toBe(UA);
+
+    send({ type: "useAccount", email: "nobody@x.com", at: Date.now() }); // not in panel.json: answered without running the CLI
+    expect(posted[posted.length - 1].useResult).toMatchObject({ email: "nobody@x.com", ok: false });
+    expect(posted[posted.length - 1].useResult.text).toContain("does not list this account");
   });
 });

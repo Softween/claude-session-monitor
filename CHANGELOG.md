@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.21.0
+- The active Claude account is always marked. Its Usage Limits card shows `active` with the green dot even when it is exhausted (`active · exhausted · 2h`) and never offers `Use this account`; with 2+ accounts the status bar names it with its 5h gauge (`ana 12%`, tooltip `Claude account: …`). The active login now follows `~/.claude.json` (a stat every tick, parsed on change) and claude-switch's `panel.json`, the fresher of the two winning. Before, only a successful usage fetch or a changed vault token moved it, so after a claude-switch switch (a token the extension had already vaulted, which the usage API answers with 429) the previous account stayed active until a manual refresh.
+- The active card and the status bar only show usage fetched for that account: right after a switch they show the new account's last background fetch, not the previous login's gauges. The shared usage snapshot records the account it belongs to.
+- `Use this account` turns into a disabled `Switching…` while `claude-switch use` runs (the other Use buttons are disabled meanwhile). When the command exits the active login is re-resolved and the panel re-rendered at once, with `Switched to <email>` or the CLI's error text in the panel. The debug log records `use: <email> <ms>ms (cli <ms>ms, …)` from click to re-render.
+- The VSIX no longer ships the repo's `.claude/` folder.
+
 ## 2.20.2
 - A usage API 429 now waits for the server's Retry-After (60 s when it sends none, at most 15 min) instead of doubling on every repeat. The endpoint throttles only the active account's token, which every running Claude CLI polls too, and the throttle is short, so the doubling left the active account's gauges showing "usage API rate-limited" for up to 15 minutes.
 

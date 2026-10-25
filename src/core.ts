@@ -1014,6 +1014,7 @@ export interface OfficialSnapshot {
   backoffUntil?: number; // epoch sec all windows wait until after a 429
   backoffSec?: number; // last backoff length (Retry-After or 60s), shared with other windows
   tokenStale?: boolean; // stored token rejected/expired — gauges are last-known only
+  acct?: string; // account UUID the gauges were fetched for (absent in files written before 2.21.0)
 }
 
 export function readOfficialSnapshot(file = OFFICIAL_USAGE_FILE): OfficialSnapshot | undefined {

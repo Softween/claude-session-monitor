@@ -165,7 +165,7 @@ describe("Usage Limits webview", () => {
     expect(h.posted).toContainEqual({ type: "setUi", key: "expandedAccounts", value: { "claude:g": true, "claude:s": false } });
 
     h.click("use", "bilal@glossgo.com");
-    expect(h.posted).toContainEqual({ type: "useAccount", email: "bilal@glossgo.com" });
+    expect(h.posted).toContainEqual({ type: "useAccount", email: "bilal@glossgo.com", at: expect.any(Number) });
     expect(h.posted.some((m) => (m as { type: string }).type === "switchAccount")).toBe(false);
 
     h.click("swtoggle", "1");
@@ -175,6 +175,56 @@ describe("Usage Limits webview", () => {
     h.key("swtoggle", "1", " ");
     expect(h.root.innerHTML).toContain('data-testid="csm-switch-activity" hidden');
   });
+  it("active login: marked active even when exhausted, no Use button; Use shows Switching… until the host's result", () => {
+    const now = Date.now();
+    const full = { ...gauge("session", "Session (5h)", 100), resetMs: now + 3_600_000 };
+    const card = (email: string, id: string, active: boolean, gauges: ReturnType<typeof gauge>[]) => ({
+      id: `claude:${id}`, provider: "claude", label: `Claude · ${email}`, email, accountId: id, active, official: true, ts: now / 1000, note: null, gauges,
+      hdr: { name: email.split("@")[0], ...headerChip({ active, loginNeeded: false, gauges }), gauges: headerGauges(gauges) } as CardHeader,
+    });
+    const base = {
+      type: "update", ts: now / 1000, official: true, accounts: [{ id: "s" }, { id: "b" }], eta: null, tokens: null, models: [], switchHtml: "", switchBadges: {},
+      panelFresh: true, ui: { switchActivityOpen: false, expandedAccounts: { "claude:b": true } }, useEmails: ["ben@example.com", "ana@example.com"],
+    };
+    const before = [card("ben@example.com", "s", true, [full]), card("ana@example.com", "b", false, [gauge("session", "Session (5h)", 0)])];
+    const after = [card("ben@example.com", "s", false, [full]), card("ana@example.com", "b", true, [gauge("session", "Session (5h)", 0)])];
+    const row = (h: Harness, email: string) => h.root.innerHTML.split('data-testid="csm-account-row"').find((r) => r.includes(`title="Claude · ${email}"`)) ?? "";
+
+    const h = mount();
+    h.send({ ...base, providers: before });
+    expect(row(h, "ben@example.com")).toContain('class="adot"');
+    expect(row(h, "ben@example.com")).toContain("active · exhausted · 1h");
+    expect(row(h, "ben@example.com")).not.toContain("Use this account");
+    expect(row(h, "ana@example.com")).toContain('data-use="ana@example.com"');
+    expect(row(h, "ana@example.com")).toContain(">ready</span>");
+
+    h.click("use", "ana@example.com");
+    const msg = h.posted.find((m) => (m as { type: string }).type === "useAccount") as { email: string; at: number };
+    expect(msg).toEqual({ type: "useAccount", email: "ana@example.com", at: expect.any(Number) });
+    expect(row(h, "ana@example.com")).toContain('disabled aria-busy="true" data-testid="csm-use-account">Switching…</button>');
+    expect(row(h, "ana@example.com")).not.toContain("data-use=");
+    h.click("use", "ana@example.com"); // a second click while switching posts nothing
+    expect(h.posted.filter((m) => (m as { type: string }).type === "useAccount")).toHaveLength(1);
+    h.send({ ...base, providers: before, usePending: "ana@example.com" }); // a tick while the CLI runs
+    expect(row(h, "ana@example.com")).toContain("Switching…");
+
+    h.send({ ...base, providers: after, useResult: { email: "ana@example.com", at: msg.at, ok: true, text: "active: ana@example.com (Max)" } });
+    expect(h.root.innerHTML).toContain('data-testid="csm-use-result">Switched to ana@example.com</div>');
+    expect(row(h, "ana@example.com")).toContain('<span class="adot" title="active login"></span><span class="chip">active</span>');
+    expect(row(h, "ana@example.com")).not.toContain("Use this account");
+    expect(row(h, "ana@example.com")).not.toContain("Switching…");
+    expect(row(h, "ben@example.com")).toContain("exhausted · 1h");
+    expect(row(h, "ben@example.com")).not.toContain('class="adot"');
+
+    // A reloaded webview learns the running switch from the host, then shows the CLI's error text.
+    const r = mount();
+    r.send({ ...base, providers: before, usePending: "ana@example.com" });
+    expect(row(r, "ana@example.com")).toContain("Switching…");
+    r.send({ ...base, providers: before, useResult: { email: "ana@example.com", at: 1, ok: false, text: "claude-switch: vault for ana@example.com has no oauthAccount" } });
+    expect(r.root.innerHTML).toContain('class="useres err" role="status" data-testid="csm-use-result">Could not switch to ana@example.com: claude-switch: vault for ana@example.com has no oauthAccount</div>');
+    expect(row(r, "ana@example.com")).toContain('data-use="ana@example.com" data-testid="csm-use-account">Use this account</button>');
+  });
+
   it("hides the Tokens row and Models block unless showTokenStats is set", () => {
     const base = {
       type: "update", ts: Date.now() / 1000, official: true, accounts: [], eta: null,

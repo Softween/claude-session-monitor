@@ -19,6 +19,7 @@ import * as os from "os";
 import * as path from "path";
 import { SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, headerChip, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, headerGauges, type CardHeader } from "./switchPanel";
 import { gaugeColumn } from "./compact";
+import { activeName, markActive, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, type ActiveCandidate } from "./activeAccount";
 import { execFile } from "child_process";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import {
@@ -558,6 +559,8 @@ interface LimitsPayload {
   panelFresh?: boolean; // claude-switch owns switching: simplified cards, no Rotate
   ui?: { switchActivityOpen: boolean; expandedAccounts: Record<string, boolean> }; // persisted in workspaceState
   useEmails?: string[]; // non-active accounts the panel can switch to
+  usePending?: string; // email `claude-switch use` is switching to right now
+  useResult?: { email: string; at: number; ok: boolean; text: string }; // last finished `use` (at = its click time), shown for a few seconds
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +650,16 @@ async function readIdentityFile(): Promise<ActiveIdentity | undefined> {
     /* missing or unparsable — identity stays unknown */
   }
   return undefined;
+}
+
+let identityAt: { mtimeMs: number; identity: ActiveIdentity | undefined } | undefined;
+
+/** readIdentityFile() memoized on the file's mtime: the capture loop and the active-login probe share one parse per change. */
+async function readIdentityFileAt(mtimeMs: number): Promise<ActiveIdentity | undefined> {
+  if (identityAt?.mtimeMs === mtimeMs) return identityAt.identity;
+  const identity = await readIdentityFile();
+  identityAt = { mtimeMs, identity };
+  return identity;
 }
 
 async function readActiveIdentity(token: string): Promise<ActiveIdentity | undefined> {
@@ -903,7 +916,7 @@ class LimitsView implements vscode.WebviewViewProvider {
     private readonly onRefresh: () => void,
     private readonly onSwitch: (accountId: string) => void,
     private readonly onRotate: () => void,
-    private readonly onUse: (email: string) => void,
+    private readonly onUse: (email: string, clickedAt?: number) => void,
     private readonly onUi: (key: string, value: unknown) => void,
   ) {}
 
@@ -915,7 +928,7 @@ class LimitsView implements vscode.WebviewViewProvider {
       if (m && m.type === "refresh") this.onRefresh();
       else if (m && m.type === "switchAccount" && typeof m.id === "string") this.onSwitch(m.id);
       else if (m && m.type === "rotateBest") this.onRotate();
-      else if (m && m.type === "useAccount" && typeof m.email === "string") this.onUse(m.email);
+      else if (m && m.type === "useAccount" && typeof m.email === "string") this.onUse(m.email, typeof m.at === "number" ? m.at : undefined);
       else if (m && m.type === "setUi" && typeof m.key === "string") this.onUi(m.key, m.value);
     });
     if (this.pending) view.webview.postMessage(this.pending);
@@ -992,6 +1005,9 @@ function limitsHtml(): string {
   .cbody { margin-top:4px; padding-bottom:4px; }
   .useacct { border:0; background:transparent; color: var(--vscode-textLink-foreground); font:inherit; font-size:11px; cursor:pointer; padding:0; margin-top:4px; }
   .useacct:hover { text-decoration:underline; }
+  .useacct[disabled] { cursor:default; opacity:.6; text-decoration:none; }
+  .useres { font-size:11px; line-height:1.3; margin:4px 0 2px; color: var(--vscode-descriptionForeground); overflow-wrap:anywhere; }
+  .useres.err { color: var(--vscode-charts-red, #f14c4c); }
   .rot { display:flex; justify-content:flex-end; margin:0 0 2px; }
   .rot + .card { padding-top:2px; border-top:0; }
   .rotbtn { border:0; background:transparent; color: var(--vscode-textLink-foreground); font:inherit; font-size:11px; cursor:pointer; padding:0; }
@@ -1137,12 +1153,13 @@ function providerCard(card){
   return h+'</div>';
 }
 let ui = null;
+let pendingUse = null; // { email, at }: a Use this account click waiting for the host's result
 function expandedOf(card){
   const v = ui && ui.expandedAccounts ? ui.expandedAccounts[card.id] : undefined;
   return v === undefined ? !!card.active : !!v;
 }
 function chipHtml(h){
-  if(h.chip==='active') return '<span class="adot" title="active login"></span><span class="chip">active</span>';
+  if(h.chip==='active') return '<span class="adot" title="active login"></span><span class="chip">active'+(h.exhausted?' · exhausted'+(h.resetMs?' · '+fmtLeft(h.resetMs).replace('resets now','now'):''):'')+'</span>';
   if(h.chip==='exhausted') return '<span class="chip">exhausted'+(h.resetMs?' · '+fmtLeft(h.resetMs).replace('resets now','now'):'')+'</span>';
   if(h.chip==='login') return '<span class="chip login">login needed</span>';
   return '<span class="chip">ready</span>';
@@ -1164,11 +1181,24 @@ function collapsibleCard(card){
     if(card.note) out += '<div class="note">'+esc(card.note)+'</div>';
     else if(!card.official) out += '<div class="note">Official '+esc(card.label)+' usage is unavailable. Session state remains available.</div>';
     const email = card.email || card.label.replace(/^(Claude|Codex) · /,'');
-    if(card.provider==='claude' && !card.active && last.useEmails && last.useEmails.indexOf(email)>=0)
-      out += '<button type="button" class="useacct" data-use="'+esc(email)+'">Use this account</button>';
+    if(card.provider==='claude' && !card.active && last.useEmails && last.useEmails.indexOf(email)>=0) out += useButton(email);
     out += '</div>';
   }
   return out+'</div>';
+}
+// While a switch runs its button reads "Switching…" (also after a webview reload,
+// via the host's usePending) and every other Use button is disabled.
+function useButton(email){
+  const busy = (pendingUse && pendingUse.email===email) || last.usePending===email;
+  if(busy) return '<button type="button" class="useacct" disabled aria-busy="true" data-testid="csm-use-account">Switching…</button>';
+  const locked = !!pendingUse || !!last.usePending;
+  return '<button type="button" class="useacct" data-use="'+esc(email)+'"'+(locked?' disabled':'')+' data-testid="csm-use-account">Use this account</button>';
+}
+function useResultLine(){
+  const r = last.useResult;
+  if(!r) return '';
+  return '<div class="useres'+(r.ok?'':' err')+'" role="status" data-testid="csm-use-result">'
+    + (r.ok ? 'Switched to '+esc(r.email) : 'Could not switch to '+esc(r.email)+': '+esc(r.text)) + '</div>';
 }
 function switchBlock(){
   let h = last.switchHtml || '';
@@ -1184,7 +1214,8 @@ function render(){
   const root = document.getElementById('root');
   if(!last){ return; }
   if(!ui) ui = last.ui || { switchActivityOpen:false, expandedAccounts:{} };
-  let h = switchBlock();
+  if(pendingUse && Date.now() - pendingUse.at > 90000) pendingUse = null; // the host always answers within the 60 s CLI timeout
+  let h = switchBlock() + useResultLine();
   const cards = (last.providers && last.providers.length) ? last.providers : [{
     id:'claude', provider:'claude', label:'Claude', active:true, ts:last.ts, official:last.official, gauges:last.gauges||[],
     note:last.usageNote||last.accountNote||null, sevenDayTokens:null, lifetimeTokens:null
@@ -1227,7 +1258,14 @@ document.getElementById('root').addEventListener('click', (ev) => {
   let el = ev.target;
   while(el && el !== ev.currentTarget){
     if(el.dataset && el.dataset.switch){ vscodeApi.postMessage({ type:'switchAccount', id: el.dataset.switch }); return; }
-    if(el.dataset && el.dataset.use){ vscodeApi.postMessage({ type:'useAccount', email: el.dataset.use }); return; }
+    if(el.dataset && el.dataset.use){
+      if(!pendingUse && !last.usePending){
+        pendingUse = { email: el.dataset.use, at: Date.now() };
+        vscodeApi.postMessage({ type:'useAccount', email: pendingUse.email, at: pendingUse.at });
+        render();
+      }
+      return;
+    }
     if(el.dataset && el.dataset.toggle){ toggleAccount(el.dataset.toggle); return; }
     if(el.dataset && el.dataset.swtoggle){ setUi('switchActivityOpen', !ui.switchActivityOpen); return; }
     if(el.dataset && el.dataset.rotate){ vscodeApi.postMessage({ type:'rotateBest' }); return; }
@@ -1241,7 +1279,11 @@ document.getElementById('root').addEventListener('click', (ev) => {
   }
 });
 window.addEventListener('message', e => {
-  if(e.data && e.data.type==='update'){ last = e.data; render(); }
+  if(e.data && e.data.type==='update'){
+    last = e.data;
+    if(pendingUse && last.useResult && last.useResult.at===pendingUse.at) pendingUse = null;
+    render();
+  }
 });
 setInterval(render, 1000); // keep countdowns live
 </script>
@@ -1311,22 +1353,58 @@ export function activate(ctx: vscode.ExtensionContext): void {
     () => vscode.commands.executeCommand("claudeSessionMonitor.refreshUsage"),
     (id) => void switchToAccount(id),
     () => void vscode.commands.executeCommand("claudeSessionMonitor.switchToBestAccount"),
-    (email) => useAccountViaCli(email),
+    (email, clickedAt) => useAccountViaCli(email, clickedAt),
     (key, value) => {
       if (key === "switchActivityOpen") void ctx.workspaceState.update("csm.switchActivityOpen", value === true);
       else if (key === "expandedAccounts" && value && typeof value === "object") void ctx.workspaceState.update("csm.expandedAccounts", value);
     },
   );
 
-  /** claude-switch owns switching; this only shells out to its `use` command (no shell, no token in args or logs). */
-  function useAccountViaCli(email: string): void {
-    const panel = readPanel();
-    const known = panelFresh(panel, Date.now()) && (panel.accounts ?? []).some((a) => a.email === email);
-    if (!known) return;
-    execFile(path.join(os.homedir(), ".claude", "bin", "claude-switch"), ["use", email], { timeout: 60_000 }, (err, stdout, stderr) => {
-      const out = String(err ? stderr || stdout || err.message : stdout || stderr || "done").trim().split("\n").filter(Boolean).pop() ?? "";
-      vscode.window.setStatusBarMessage(`claude-switch use ${email}: ${out.slice(0, 160)}`, 8000);
+  let usePending: string | null = null; // email `claude-switch use` is switching to right now
+  let useDone: { email: string; at: number; ok: boolean; text: string; until: number } | null = null;
+
+  /**
+   * claude-switch owns switching; this only shells out to its `use` command (no
+   * shell, no token in args or logs). The panel shows "Switching…" while it runs;
+   * on exit the active login is re-resolved and the panel re-rendered at once,
+   * with the outcome in the panel, and the click-to-render time is logged.
+   */
+  function useAccountViaCli(email: string, clickedAt?: number): void {
+    const received = Date.now();
+    const t0 = useStartMs(clickedAt, received);
+    const at = typeof clickedAt === "number" ? clickedAt : received;
+    const finish = (ok: boolean, text: string, cliMs: number | null): void => {
+      useDone = { email, at, ok, text, until: Date.now() + (ok ? 10_000 : 30_000) };
       pushUsagePayload();
+      log(`use: ${email} ${Date.now() - t0}ms (${cliMs === null ? "cli not run" : `cli ${cliMs}ms`}, ${ok ? "ok" : "failed"}: ${text})`);
+      vscode.window.setStatusBarMessage(`claude-switch use ${email}: ${text.slice(0, 160)}`, 8000);
+    };
+    if (usePending) {
+      finish(false, `already switching to ${usePending}`, null);
+      return;
+    }
+    const panel = readPanel();
+    if (!panelFresh(panel, Date.now()) || !(panel.accounts ?? []).some((a) => a.email === email)) {
+      finish(false, "claude-switch does not list this account right now (panel.json missing, stale or without it)", null);
+      return;
+    }
+    usePending = email;
+    pushUsagePayload();
+    const started = Date.now();
+    execFile(path.join(os.homedir(), ".claude", "bin", "claude-switch"), ["use", email], { timeout: 60_000 }, (err, stdout, stderr) => {
+      const cliMs = Date.now() - started;
+      const out = useOutcome(err, String(stdout ?? ""), String(stderr ?? ""));
+      void syncActive(true)
+        .catch((e: unknown) => {
+          log("use: re-resolve failed " + String(e));
+          return false;
+        })
+        .then(() => {
+          usePending = null;
+          const now = accountsFile.accounts.find((a) => a.id === accountsFile.activeId)?.email;
+          if (out.ok && now?.toLowerCase() !== email.toLowerCase()) finish(false, `claude-switch exited without error but the active login is ${now ?? "unknown"}`, cliMs);
+          else finish(out.ok, out.text, cliMs);
+        });
     });
   }
   ctx.subscriptions.push(
@@ -1351,6 +1429,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastSessLog = 0;
   let tokenUsage: TokenUsage | null = null;
   let officialUsage: OfficialUsage | null = null;
+  let officialUsageAcct: string | null = null; // account officialUsage was fetched for (the active card only shows its own)
   let usageNote: string | null = null;
   let lastUsageCheck = 0;
   let usageFetchInflight = false;
@@ -1370,7 +1449,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // Boot from the shared snapshots so gauges render immediately (with an honest
   // "updated Xs ago" age) even before the first live fetch succeeds.
   const bootSnap = readOfficialSnapshot();
-  if (bootSnap?.gauges.length && bootSnap.ts) officialUsage = { gauges: bootSnap.gauges, ts: bootSnap.ts };
+  if (bootSnap?.gauges.length && bootSnap.ts) {
+    officialUsage = { gauges: bootSnap.gauges, ts: bootSnap.ts };
+    officialUsageAcct = bootSnap.acct ?? accountsFile.activeId ?? null;
+  }
   for (const a of accountsFile.accounts) {
     const s = readOfficialSnapshot(officialUsageFileFor(a.id));
     if (s?.gauges.length && s.ts) usageByAccount.set(a.id, { usage: { gauges: s.gauges, ts: s.ts }, stale: !!s.tokenStale });
@@ -1524,8 +1606,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     const now = Date.now() / 1000;
     const usageEverySec = Math.max(5, cfg().get<number>("usagePollSeconds", 30));
     const snap = readOfficialSnapshot();
-    if (!force && snap?.gauges.length && snap.ts && (!officialUsage || snap.ts > officialUsage.ts)) {
-      officialUsage = { gauges: snap.gauges, ts: snap.ts }; // another window fetched it
+    const activeId = accountsFile.activeId ?? null;
+    const snapAcct = snap ? snapshotAccount(snap, activeId, activeChangedAtMs) : null;
+    if (!force && snap?.gauges.length && snap.ts && snapAcct === activeId && (!officialUsage || officialUsageAcct !== snapAcct || snap.ts > officialUsage.ts)) {
+      officialUsage = { gauges: snap.gauges, ts: snap.ts }; // another window fetched it for this login
+      officialUsageAcct = snapAcct;
     }
     const inBackoff = !force && !!snap?.backoffUntil && now < snap.backoffUntil;
     if (inBackoff) {
@@ -1560,19 +1645,18 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const nowSec = Date.now() / 1000;
       const cur = readOfficialSnapshot() ?? { gauges: [], ts: 0 };
       if (r.ok) {
-        officialUsage = r.usage;
-        usageNote = null;
-        writeOfficialSnapshot({ gauges: r.usage.gauges, ts: r.usage.ts, attemptTs: nowSec }); // clears backoff
-        log(`usage ok${force ? " (manual)" : ""}: ${r.usage.gauges.map((g) => `${g.key}=${Math.round(g.pct)}`).join(" ")}`);
         // Record which account this usage belongs to: registry entry, per-account
         // snapshot, and (when enabled) the token vault that lets the extension
         // keep refreshing this account after the user logs into another one.
         const ident = (await readActiveIdentity(creds.token)) ?? { id: "default", email: "this account" };
-        accountsFile = upsertActiveAccount(
-          readAccountsFile(),
-          { ...ident, tokenExpiresAt: creds.expiresAt, tier: creds.tier },
-          nowSec,
-        );
+        officialUsage = r.usage;
+        officialUsageAcct = ident.id;
+        usageNote = null;
+        writeOfficialSnapshot({ gauges: r.usage.gauges, ts: r.usage.ts, attemptTs: nowSec, acct: ident.id }); // clears backoff
+        log(`usage ok${force ? " (manual)" : ""}: ${r.usage.gauges.map((g) => `${g.key}=${Math.round(g.pct)}`).join(" ")}`);
+        const reg = upsertActiveAccount(readAccountsFile(), { ...ident, tokenExpiresAt: creds.expiresAt, tier: creds.tier }, nowSec);
+        // A fetch that raced an account switch (old token) keeps its usage but must not undo the switch.
+        accountsFile = activeNow && activeNow.id !== ident.id ? { ...reg, activeId: activeNow.id } : reg;
         writeAccountsFile(accountsFile);
         usageByAccount.set(ident.id, { usage: r.usage, stale: false });
         writeOfficialSnapshot({ gauges: r.usage.gauges, ts: r.usage.ts, attemptTs: nowSec }, officialUsageFileFor(ident.id));
@@ -1871,7 +1955,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   async function noteClaudeJson(mtimeMs: number | undefined): Promise<boolean> {
     if (mtimeMs === captureMtimeMs) return false;
     captureMtimeMs = mtimeMs;
-    const ident = mtimeMs === undefined ? undefined : await readIdentityFile();
+    const ident = mtimeMs === undefined ? undefined : await readIdentityFileAt(mtimeMs);
     const change = classifyIdentityChange(captureIdent, ident);
     captureIdent = ident;
     if (change === "block") captureDirty = true;
@@ -2154,6 +2238,53 @@ export function activate(ctx: vscode.ExtensionContext): void {
     await switchToAccount(best.id);
   }
 
+  // --- Active login (pure resolution in src/activeAccount.ts) ---------------
+  // ~/.claude.json oauthAccount (a stat per tick, parsed on change) and a fresh
+  // claude-switch panel.json both name the active login; the fresher one becomes
+  // the registry's activeId right away. A usage fetch or a vault write used to be
+  // the only way to move it, and after a claude-switch switch neither happens:
+  // the usage API 429s the newly active token and the token is already vaulted.
+  let ownActive: ActiveCandidate | undefined; // last ~/.claude.json read that had an identity
+  let activeNow: ActiveCandidate | undefined; // the last resolved active login
+  let activeRuns = 0; // syncActive calls started
+  let activeApplied = 0; // newest call that resolved: an older one finishing later is dropped
+  let activeInflight = 0;
+  let activeChangedAtMs = 0; // when this window last moved activeId (attributes snapshots of older builds)
+
+  /** Re-resolve the active login (a tick skips while another call runs; `force` never does); true when activeId moved. */
+  async function syncActive(force = false): Promise<boolean> {
+    if (!force && activeInflight) return false;
+    const run = ++activeRuns;
+    activeInflight++;
+    try {
+      const mtimeMs = await claudeJsonMtimeMs();
+      const ident = mtimeMs === undefined ? undefined : await readIdentityFileAt(mtimeMs);
+      if (run < activeApplied) return false;
+      activeApplied = run;
+      if (ident && mtimeMs !== undefined) ownActive = { id: ident.id, email: ident.email, atMs: mtimeMs, source: "claude.json" };
+      activeNow = pickActive(ownActive, panelActive(readPanel(), Date.now()));
+      return activeNow ? applyActive(activeNow) : false;
+    } finally {
+      activeInflight--;
+    }
+  }
+
+  /** Make `next` the registry's active login when it is not already; the next usage poll re-reads the keychain. */
+  function applyActive(next: ActiveCandidate): boolean {
+    if (next.id === accountsFile.activeId) return false;
+    accountsFile = markActive(readAccountsFile(), next, Date.now() / 1000);
+    writeAccountsFile(accountsFile);
+    activeChangedAtMs = Date.now();
+    cachedCreds = undefined; // the keychain holds the new login's token now
+    const snap = readOfficialSnapshot(officialUsageFileFor(next.id)); // another window may have polled it more recently
+    const known = usageByAccount.get(next.id);
+    if (snap?.gauges.length && snap.ts && (!known?.usage || snap.ts > known.usage.ts)) {
+      usageByAccount.set(next.id, { usage: { gauges: snap.gauges, ts: snap.ts }, stale: !!snap.tokenStale });
+    }
+    log(`active: ${next.email} (acct ${next.id.slice(0, 8)}, from ${next.source})`);
+    return true;
+  }
+
   /**
    * Resolve the account list the panel renders (one card each) and the active
    * login, whose gauges drive the burn-rate ETA and history.
@@ -2161,7 +2292,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   function currentAccountCtx(): AccountCtx & { usage: OfficialUsage | null } {
     const activeId = accountsFile.activeId ?? null;
     const track = trackAllAccounts();
-    if (activeId && officialUsage) usageByAccount.set(activeId, { usage: officialUsage, stale: false });
+    if (activeId && officialUsage && officialUsageAcct === activeId) usageByAccount.set(activeId, { usage: officialUsage, stale: false });
     const selId = activeId;
     const list = track ? accountsFile.accounts : accountsFile.accounts.filter((a) => a.id === activeId);
     const labels = accountPillLabels(list.map((a) => a.email));
@@ -2183,7 +2314,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         needsLogin: a.id !== activeId && a.needsLogin === true,
       };
     });
-    const usage = selId === activeId ? officialUsage : (selId && usageByAccount.get(selId)?.usage) || null;
+    const usage = usageForActive(activeId, { usage: officialUsage, acct: officialUsageAcct }, usageByAccount);
     return {
       accounts: accounts.length > 1 ? accounts : [],
       selectedId: selId,
@@ -2301,6 +2432,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
     sessionsView.setBadge(badge, `${badge} session(s) waiting / limited`);
   }
 
+  /** syncActive for ticks and watchers: re-render when the active login moved, or always when asked. */
+  function followActive(always = false): void {
+    void syncActive().then(
+      (moved) => {
+        if (moved || always) pushUsagePayload();
+      },
+      (e: unknown) => log("active sync error: " + String(e)),
+    );
+  }
+
   function pushUsagePayload(): void {
     try {
       const c = currentAccountCtx();
@@ -2346,12 +2487,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
         showTokenStats: showTokenStats(),
         ui: { switchActivityOpen: open, expandedAccounts: ctx.workspaceState.get<Record<string, boolean>>("csm.expandedAccounts", {}) },
         useEmails: fresh ? (panel.accounts ?? []).map((a) => a.email) : [],
+        usePending: usePending ?? undefined,
+        useResult: useDone && Date.now() < useDone.until ? { email: useDone.email, at: useDone.at, ok: useDone.ok, text: useDone.text } : undefined,
       });
+      const act = accountsFile.accounts.length > 1 ? accountsFile.accounts.find((a) => a.id === c.activeId) : undefined;
       updateStatusBar(
         statusBar,
         lastAllViews,
         resourceCache,
-        claudeEnabled() ? officialUsage : null,
+        claudeEnabled() ? c.usage : null,
+        claudeEnabled() && act ? { name: activeName(act.email, accountsFile.accounts.map((a) => a.email)), email: act.email } : undefined,
       );
     } catch {
       /* ignore */
@@ -2399,8 +2544,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
       }
     }
 
-    // Vault the active login on every tick, independent of the usage API (and its
-    // 429 backoff): a stat per tick, a keychain read only on change / every 60 s.
+    // Follow the active login on every tick (a stat, a parse only on change) and
+    // vault it, both independent of the usage API (and its 429 backoff): a
+    // keychain read only on change / every 60 s.
+    if (claudeEnabled()) followActive();
     if (claudeEnabled()) void captureActiveLogin(false);
 
     // Official usage poll — coordinated across ALL VS Code windows through the
@@ -3004,7 +3151,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
   }
   try {
-    const debouncedPanel = debounce(pushUsagePayload, 1000);
+    const debouncedPanel = debounce(() => followActive(true), 1000);
     ctx.subscriptions.push({ dispose: () => debouncedPanel.cancel() });
     const w3 = fs.watch(SWITCH_STATE_DIR, (_ev, name) => {
       if (!name || name === path.basename(SWITCH_PANEL_FILE)) debouncedPanel();
@@ -3142,7 +3289,8 @@ function updateStatusBar(
   item: vscode.StatusBarItem,
   views: SessionView[],
   cache: Map<number, ResStat>,
-  usage: OfficialUsage | null,
+  usage: OfficialUsage | null, // the active login's usage
+  account?: { name: string; email: string }, // the active login, once 2+ accounts are known
 ): void {
   const counts = countBuckets(views);
   let waiting = 0;
@@ -3158,9 +3306,11 @@ function updateStatusBar(
   if (done) segs.push(`$(comment) ${done}`);
   if (counts.limited) segs.push(`$(error) ${counts.limited}`);
 
-  // Surface 5h usage in the bar once it is worth watching (>= 70%).
+  // With 2+ accounts name the active login with its 5h gauge; a single login
+  // surfaces the gauge once it is worth watching (>= 70%).
   const g5 = usage?.gauges.find((g) => g.key === "session");
-  if (g5 && g5.pct >= 70) segs.push(`$(dashboard) C ${Math.round(g5.pct)}%`);
+  if (account) segs.push(`$(account) ${account.name}${g5 ? ` ${Math.round(g5.pct)}%` : ""}`);
+  else if (g5 && g5.pct >= 70) segs.push(`$(dashboard) C ${Math.round(g5.pct)}%`);
 
   item.text = segs.length ? `$(pulse) ${segs.join("  ")}` : "$(pulse) Agent: no sessions";
 
@@ -3174,9 +3324,9 @@ function updateStatusBar(
     }
   }
   const resLine = totalRss ? `\ntotal: CPU ${Math.round(totalCpu)}% · ${fmtMb(totalRss)}` : "";
-  const usageLine = usage?.gauges.length
-    ? `\nClaude usage: ${usage.gauges.map((g) => `${g.label} ${Math.round(g.pct)}%`).join(" · ")}`
-    : "";
+  const usageLine =
+    (account ? `\nClaude account: ${account.email} (active)` : "") +
+    (usage?.gauges.length ? `\nClaude usage: ${usage.gauges.map((g) => `${g.label} ${Math.round(g.pct)}%`).join(" · ")}` : "");
   const providers = countProviders(views);
   item.tooltip = `Agent sessions\nClaude: ${providers.claude} · Codex: ${providers.codex}\nworking: ${counts.working}\nwaiting: ${waiting}\nyour turn: ${done}\nlimited: ${counts.limited}${resLine}${usageLine}\n(click to open the panel)`;
 

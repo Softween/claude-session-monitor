@@ -126,11 +126,13 @@ describe("card helpers", () => {
   it("header gauges handle Codex session and weekly", () => {
     expect(headerGauges([g("Weekly (7d)", 12), g("Session (5h)", 3)]).map((x) => x.label)).toEqual(["Session", "Weekly"]);
   });
-  it("chip precedence: login > exhausted > active > ready", () => {
+  it("chip precedence: active (exhaustion noted) > login > exhausted > ready", () => {
     const base = { active: false, loginNeeded: false, gauges: [g("s", 10)] };
     expect(headerChip(base)).toEqual({ chip: "ready" });
     expect(headerChip({ ...base, active: true })).toEqual({ chip: "active" });
-    expect(headerChip({ ...base, active: true, loginNeeded: true })).toEqual({ chip: "login" });
+    expect(headerChip({ ...base, active: true, loginNeeded: true })).toEqual({ chip: "active" });
+    expect(headerChip({ ...base, active: true, gauges: [g("s", 100, 5000), g("w", 100, 9000)] })).toEqual({ chip: "active", exhausted: true, resetMs: 9000 });
+    expect(headerChip({ ...base, loginNeeded: true, gauges: [g("s", 100, 5000)] })).toEqual({ chip: "login" });
     expect(headerChip({ ...base, gauges: [g("s", 100, 5000), g("w", 100, 9000), g("f", 40, 99999)] })).toEqual({ chip: "exhausted", resetMs: 9000 });
     expect(headerChip({ ...base, gauges: [g("s", 99, 5000)] })).toEqual({ chip: "ready" });
   });

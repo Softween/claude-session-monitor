@@ -1,5 +1,6 @@
 .vscode/**
 .github/**
+.claude/**
 src/**
 scripts/**
 media/hero.png

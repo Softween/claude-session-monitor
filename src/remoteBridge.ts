@@ -42,7 +42,7 @@ export interface FleetCommand {
 
 export interface CommandOutcome { ok: boolean; message: string }
 
-export type TypedResult = { ok: true } | { ok: false; reason: string; detail: string };
+export type TypedResult = { ok: true; via?: "terminal" | "typed" } | { ok: false; reason: string; detail: string };
 
 const TYPED_REASON: Record<string, string> = {
   "not-frontmost": "VS Code not frontmost (Mac locked or another app in front)",
@@ -76,7 +76,7 @@ export async function deliverText(o: {
   } catch (e) {
     typed = { ok: false, reason: "keystroke", detail: String(e) };
   }
-  if (typed.ok) return { ok: true, message: `delivered via typed (uds ${udsWhy})` };
+  if (typed.ok) return { ok: true, message: `delivered via ${typed.via ?? "typed"} (uds ${udsWhy})` };
   const why = TYPED_REASON[typed.reason] ?? typed.reason;
   return { ok: false, message: `not delivered: uds ${udsWhy}; typed failed: ${why} (${typed.detail})` };
 }

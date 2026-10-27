@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.23.3
+- **Remote `send` no longer steals focus.** The text is written into the VS Code terminal that hosts the session through the terminal API (process-tree match first, unique tab label second), so the active tab and the keyboard focus stay where you are. The old jump-to-tab keystroke path remains the fallback when no terminal can be identified; the relay result says `delivered via terminal` or `delivered via typed`.
+
 ## 2.23.2
 - **Remote bridge reports macOS free memory from `memory_pressure`** (its system-wide free percentage of total memory) instead of `os.freemem()`, which counts only the kernel's free pages; those stay near zero on a busy Mac, so the remote view showed RAM as 100 % used. If `memory_pressure` fails, free + inactive + speculative + purgeable pages from `vm_stat` are used, then `os.freemem()`; other platforms keep `os.freemem()`. The machine sample is now taken at most once per 15 s instead of on every panel refresh.
 

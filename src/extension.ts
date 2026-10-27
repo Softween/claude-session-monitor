@@ -22,7 +22,8 @@ import { gaugeColumn } from "./compact";
 import { deliverText, registerRemoteBridge, type CommandOutcome, type FleetCommand, type RemoteBridge } from "./remoteBridge";
 import { sendToSession } from "./peerSend";
 import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, useStuck, type ActiveCandidate } from "./activeAccount";
-import { execFile } from "child_process";
+import { execFile, spawnSync } from "child_process";
+import { parseParentPid, pickSessionTerminal } from "./terminalMatch";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import {
   KEYCHAIN_SERVICE,
@@ -2725,7 +2726,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   }
 
   type FocusedTypeResult =
-    | { ok: true }
+    | { ok: true; via?: "terminal" | "typed" }
     | { ok: false; reason: "aborted" | "not-frontmost" | "tab-mismatch" | "accessibility" | "keystroke"; detail: string };
 
   /**
@@ -2772,9 +2773,31 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (resumeActive) return { ok: false, reason: "aborted", detail: "a typing sweep is running" };
     // osascript `keystroke` submits on every newline: one remote message is one Return.
     const line = text.replace(/[\r\n]+/g, " ").trim();
+    if (await sendToSessionTerminal(v, line)) return { ok: true, via: "terminal" };
     await jumpToSession(v);
     await sleep(500);
-    return typeIntoFocusedSession(v, line, undefined, () => !disposed && !resumeActive);
+    const r = await typeIntoFocusedSession(v, line, undefined, () => !disposed && !resumeActive);
+    return r.ok ? { ok: true, via: "typed" } : r;
+  }
+
+  /**
+   * Write `line` + Return straight into the VS Code terminal that hosts the
+   * session (process-tree match first, unique tab label second). No `show()`,
+   * no focus change: the user keeps working where they are. False when no
+   * terminal can be identified or the write throws, so the keystroke path runs.
+   */
+  async function sendToSessionTerminal(v: SessionView, line: string): Promise<boolean> {
+    try {
+      const terms = vscode.window.terminals;
+      const pids = await Promise.all(terms.map((t) => Promise.resolve(t.processId).catch(() => undefined)));
+      const candidates = terms.map((t, i) => ({ name: t.name, pid: pids[i] ?? undefined }));
+      const i = pickSessionTerminal(candidates, matchCandidates(v), ancestorPids(v.pid), labelsMatch);
+      if (i < 0) return false;
+      terms[i].sendText(line + "\r", false);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -3734,6 +3757,20 @@ function writeTabDebug(dbg: unknown): void {
 /** Every cleaned title candidate for `v`, falling back to just its title. */
 function matchCandidates(v: SessionView): string[] {
   return v.matchLabels?.length ? v.matchLabels : [v.title];
+}
+
+/** Parent chain of `pid` (nearest first), at most 8 levels, stopping at launchd. */
+function ancestorPids(pid: number | undefined): number[] {
+  const out: number[] = [];
+  let cur = pid;
+  for (let depth = 0; cur && cur > 1 && depth < 8; depth++) {
+    const r = spawnSync("ps", ["-o", "ppid=", "-p", String(cur)], { encoding: "utf8", timeout: 1000 });
+    const parent = r.status === 0 ? parseParentPid(r.stdout) : null;
+    if (!parent || parent <= 1) break;
+    out.push(parent);
+    cur = parent;
+  }
+  return out;
 }
 
 async function jumpToSession(v: SessionView): Promise<void> {

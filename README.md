@@ -225,6 +225,21 @@ and the identity in `~/.claude.json`); nothing else on your machine is touched. 
 Claude Code sessions use the new account, running sessions switch at their next token
 refresh. macOS only.
 
+## Remote bridge (optional)
+
+Off by default. When you run a relay that implements the `/fleet/*` routes, the extension can mirror the panel to it and take a few commands back, so a phone app or another client can see your sessions.
+
+1. Set `claudeSessionMonitor.remote.url` in your **user** settings to the relay's base URL, without a trailing `/fleet` (for example `https://<your-relay>/`). It must be `https://` (plain `http://` only for `localhost` / `127.0.0.1`). Workspace settings are ignored for `remote.url` and `remote.host`, so a repository cannot redirect the bridge.
+2. Run **Agent Sessions: Set remote bridge token** and paste the relay's bridge token. It is kept in VS Code Secret Storage, bound to the URL's origin: if you later point `remote.url` at another origin the bridge stays off until you set the token again. An empty input clears it.
+3. Optional: `claudeSessionMonitor.remote.host` names this machine (default: the OS host name).
+
+With both the URL and the token set, the extension:
+
+- posts a snapshot (sessions, accounts, a CPU / memory sample) to `POST <url>/fleet/ingest` when it changes, at most every 10 s, plus a heartbeat every 2 minutes;
+- long-polls `GET <url>/fleet/commands?host=<host>&wait=25` (about one request every 25 s) and runs `resume`, `kill`, `resumeAll`, `switchAccount` (`best`, an account id or email) and `send` (a message into a running Claude session over its local `uds-messaging` socket), then posts each result to `POST <url>/fleet/commands/<id>/result`.
+
+`resumeAll` still asks for confirmation on this machine before it types anything. Network errors back off from 2 s to 60 s. **Agent Sessions: Remote bridge status** shows the last push, the last poll and the last error. Clearing the URL or the token stops the bridge.
+
 ## Platform support
 
 | Feature | macOS | Linux | Windows |

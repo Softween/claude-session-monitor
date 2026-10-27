@@ -19,6 +19,8 @@ import * as os from "os";
 import * as path from "path";
 import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, headerGauges, switchInstalled, type CardHeader } from "./switchPanel";
 import { gaugeColumn } from "./compact";
+import { deliverText, registerRemoteBridge, type CommandOutcome, type FleetCommand, type RemoteBridge } from "./remoteBridge";
+import { sendToSession } from "./peerSend";
 import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, useStuck, type ActiveCandidate } from "./activeAccount";
 import { execFile } from "child_process";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
@@ -1445,6 +1447,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let recentCache: RecentTranscript[] = [];
   let lastViews: SessionView[] = [];
   let lastAllViews: SessionView[] = [];
+  let remoteBridge: RemoteBridge | undefined; // optional remote bridge (remoteBridge.ts), off unless url + token are set
   let lastRecentScan = 0;
   let lastCleanup = 0;
   let lastResourceSample = 0;
@@ -2671,6 +2674,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
     pushSessions(views, allViews);
     pushUsagePayload();
+    remoteBridge?.onRows(allViews);
 
     maybeScheduleAutoResume(allViews);
 
@@ -2718,6 +2722,59 @@ export function activate(ctx: vscode.ExtensionContext): void {
         pushSessions(lastViews, lastAllViews);
       });
     }
+  }
+
+  type FocusedTypeResult =
+    | { ok: true }
+    | { ok: false; reason: "aborted" | "not-frontmost" | "tab-mismatch" | "accessibility" | "keystroke"; detail: string };
+
+  /**
+   * Type `text` + Enter into the session whose tab is already active: bring VS Code
+   * and the Claude input forward, re-verify right before the keystroke that the
+   * session's tab is active AND VS Code is frontmost, then type. `alive` aborts
+   * between steps. Shared by the typing sweep and the remote `send` fallback.
+   */
+  async function typeIntoFocusedSession(
+    v: SessionView,
+    text: string,
+    submitDelayMs: number | undefined,
+    alive: () => boolean,
+  ): Promise<FocusedTypeResult> {
+    const aborted: FocusedTypeResult = { ok: false, reason: "aborted", detail: "stopped" };
+    await activateEditorApp();
+    await sleep(150);
+    try {
+      await vscode.commands.executeCommand("claude-vscode.focus");
+    } catch {
+      /* ignore */
+    }
+    await sleep(220);
+    if (!alive()) return aborted;
+    // Re-verify immediately before typing: correct tab active AND VS Code frontmost.
+    const a = activeTabLabel();
+    const front = await isEditorFrontmost();
+    if (!alive()) return aborted;
+    const matched = !!a && matchCandidates(v).some((c) => labelsMatch(a, c));
+    if (!front || !matched) {
+      return { ok: false, reason: front ? "tab-mismatch" : "not-frontmost", detail: `front=${front} activeMatched=${matched}` };
+    }
+    const r = await typeAndSubmit(text, submitDelayMs);
+    if (r.ok) return { ok: true };
+    const accessibility = /not allowed|assistive|accessibility|-1743|-25211|not permitted/i.test(r.err || "");
+    return { ok: false, reason: accessibility ? "accessibility" : "keystroke", detail: r.err || "keystroke failed" };
+  }
+
+  /** Remote `send` fallback: jump to that one session's tab and type the text + Enter, no confirmation dialog. */
+  async function typeIntoSession(v: SessionView, text: string): Promise<FocusedTypeResult> {
+    if (v.provider !== "claude" || !v.capabilities.bulkInput) {
+      return { ok: false, reason: "tab-mismatch", detail: "this session has no typable Claude input" };
+    }
+    if (resumeActive) return { ok: false, reason: "aborted", detail: "a typing sweep is running" };
+    // osascript `keystroke` submits on every newline: one remote message is one Return.
+    const line = text.replace(/[\r\n]+/g, " ").trim();
+    await jumpToSession(v);
+    await sleep(500);
+    return typeIntoFocusedSession(v, line, undefined, () => !disposed && !resumeActive);
   }
 
   /**
@@ -2781,30 +2838,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
               if (x === "Stop") stopResume("Claude Sessions: resume sweep stopped.");
             });
         } else {
-          await activateEditorApp();
-          await sleep(150);
-          try {
-            await vscode.commands.executeCommand("claude-vscode.focus");
-          } catch {
-            /* ignore */
-          }
-          await sleep(220);
-          if (!resumeActive) return;
-          // Re-verify immediately before typing: correct tab active AND VS Code frontmost.
-          const a = activeTabLabel();
-          const front = await isEditorFrontmost();
-          if (!resumeActive) return;
-          if (!front || !a || !matchCandidates(v).some((c) => labelsMatch(a, c))) {
+          const t = await typeIntoFocusedSession(v, text, opts.submitDelayMs, () => resumeActive);
+          if (!t.ok && t.reason === "aborted") return;
+          if (!t.ok && (t.reason === "not-frontmost" || t.reason === "tab-mismatch")) {
             skipped++;
-            log(
-              `${opts.doneLabel} skip ${v.key}: front=${front} activeMatched=${
-                !!a && matchCandidates(v).some((candidate) => labelsMatch(a, candidate))
-              }`,
-            );
+            log(`${opts.doneLabel} skip ${v.key}: ${t.detail}`);
           } else {
-            const r = await typeAndSubmit(text, opts.submitDelayMs);
-            if (!r.ok) {
-              if (/not allowed|assistive|accessibility|-1743|-25211|not permitted/i.test(r.err || "")) {
+            if (!t.ok) {
+              if (t.reason === "accessibility") {
                 stopResume();
                 vscode.window
                   .showErrorMessage(
@@ -3254,6 +3295,92 @@ export function activate(ctx: vscode.ExtensionContext): void {
       }
     }),
   );
+
+  // --- Remote bridge (optional) -------------------------------------------
+  // Commands arriving from the relay run through the same actions as the panel.
+  // kill skips the modal: the remote request is the confirmation, the pid is still
+  // re-verified. resumeAll keeps its own modal before any unattended typing.
+  const remoteAccounts = () => {
+    const accounts = currentAccountCtx().accounts;
+    if (accounts.length) return { accounts, bestId: pickBestAccount(accounts)?.id ?? null };
+    const active = accountsFile.accounts.find((a) => a.id === accountsFile.activeId);
+    if (!active) return { accounts: [], bestId: null };
+    const u = activeUsage();
+    const one = {
+      id: active.id,
+      email: active.email,
+      plan: planLabelFor(active.email) ?? claudePlanLabel(active.tier),
+      active: true,
+      gauges: (u?.gauges ?? []).map((g) => ({ key: g.key, label: g.label, pct: g.pct, resetMs: g.resetMs })),
+    };
+    return { accounts: [one], bestId: null };
+  };
+
+  async function remoteSwitch(account: string): Promise<CommandOutcome> {
+    if (switchInflight) return { ok: false, message: "an account switch is already running" };
+    const views = currentAccountCtx().accounts;
+    const want = account.trim().toLowerCase();
+    const target =
+      want === "best"
+        ? pickBestAccount(views)
+        : views.find((a) => a.id.toLowerCase() === want || a.email.toLowerCase() === want);
+    if (!target) return { ok: false, message: want === "best" ? "no other account with usage data" : `unknown account ${account}` };
+    if (target.active) return { ok: true, message: `already on ${target.email}` };
+    await switchToAccount(target.id);
+    return accountsFile.activeId === target.id
+      ? { ok: true, message: `switched to ${target.email}` }
+      : { ok: false, message: `switch to ${target.email} did not complete` };
+  }
+
+  async function executeRemote(cmd: FleetCommand): Promise<CommandOutcome> {
+    const find = () => (cmd.sessionId ? lastAllViews.find((v) => v.sessionId === cmd.sessionId) : undefined);
+    switch (cmd.type) {
+      case "resume": {
+        const v = find();
+        if (!v) return { ok: false, message: `unknown session ${cmd.sessionId}` };
+        if (!v.capabilities.resume) return { ok: false, message: "this provider cannot resume the session" };
+        resumeInTerminal(v);
+        return { ok: true, message: `resume terminal opened for "${truncate(v.title, 40)}"` };
+      }
+      case "kill": {
+        const v = find();
+        if (!v?.pid || !v.capabilities.kill) return { ok: false, message: "no process id known for this session" };
+        if (!(await verifyKillTarget(v))) return { ok: false, message: "the recorded process has exited or no longer matches" };
+        try {
+          process.kill(v.pid, "SIGTERM");
+        } catch (e) {
+          return { ok: false, message: "kill failed: " + String(e) };
+        }
+        refresh();
+        return { ok: true, message: `sent SIGTERM to pid ${v.pid}` };
+      }
+      case "resumeAll":
+        await vscode.commands.executeCommand("claudeSessionMonitor.resumeAll");
+        return {
+          ok: true,
+          message: cfg().get<boolean>("resumeAutoType", true)
+            ? "resume sweep requested; it starts after the confirmation on this machine"
+            : "resume sweep started",
+        };
+      case "switchAccount":
+        return cmd.account ? remoteSwitch(cmd.account) : { ok: false, message: "account is required" };
+      case "send": {
+        if (!cmd.sessionId || !cmd.text) return { ok: false, message: "sessionId and text are required" };
+        const v = find();
+        if (v && v.provider !== "claude") return { ok: false, message: "send is supported for Claude sessions only" };
+        const sessionId = cmd.sessionId;
+        const text = cmd.text;
+        return deliverText({
+          uds: () => sendToSession({ sessionId, text, timeoutMs: 5000, waitTranscriptMs: 15_000 }),
+          typed: async () => (v ? typeIntoSession(v, text) : { ok: false, reason: "tab-mismatch", detail: "session is not in the panel" }),
+        });
+      }
+      default:
+        return { ok: false, message: `unknown command type ${cmd.type}` };
+    }
+  }
+
+  remoteBridge = registerRemoteBridge(ctx, { log, accounts: remoteAccounts, execute: executeRemote });
 
   refresh();
 }

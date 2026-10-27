@@ -189,6 +189,7 @@ function mkCtx(state = new Map<string, unknown>()): any {
       get: () => Promise.resolve(undefined),
       store: () => Promise.resolve(),
       delete: () => Promise.resolve(),
+      onDidChange: () => ({ dispose() {} }),
     },
   };
 }

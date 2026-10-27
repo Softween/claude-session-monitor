@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.22.0",
+  "version": "2.23.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -25,7 +25,9 @@
         "claudeSessionMonitor.resumePrompt",
         "claudeSessionMonitor.resumeAutoType",
         "claudeSessionMonitor.autoResumeAfterReset",
-        "claudeSessionMonitor.trackAllAccounts"
+        "claudeSessionMonitor.trackAllAccounts",
+        "claudeSessionMonitor.remote.url",
+        "claudeSessionMonitor.remote.host"
       ]
     }
   },
@@ -201,6 +203,14 @@
         "command": "claudeSessionMonitor.switchToBestAccount",
         "title": "Agent Sessions: Switch to Claude account with most headroom",
         "shortTitle": "Rotate Claude Account"
+      },
+      {
+        "command": "claudeSessionMonitor.setRemoteToken",
+        "title": "Agent Sessions: Set remote bridge token"
+      },
+      {
+        "command": "claudeSessionMonitor.remoteStatus",
+        "title": "Agent Sessions: Remote bridge status"
       }
     ],
     "menus": {
@@ -434,6 +444,18 @@
           "type": "number",
           "default": 2000,
           "description": "Warn when idle sessions (waiting / your-turn, silent >1h) together hold more than this much RAM (MB). 0 disables."
+        },
+        "claudeSessionMonitor.remote.url": {
+          "type": "string",
+          "scope": "application",
+          "default": "",
+          "markdownDescription": "Optional remote bridge: base URL of a relay that implements the `/fleet/*` routes, without a trailing `/fleet` (for example `https://<your-relay>`). Empty keeps the bridge off. The bearer token is stored with **Agent Sessions: Set remote bridge token** (Secret Storage, never in settings)."
+        },
+        "claudeSessionMonitor.remote.host": {
+          "type": "string",
+          "scope": "application",
+          "default": "",
+          "markdownDescription": "Name this machine reports to the remote bridge. Empty uses the OS host name."
         }
       }
     },

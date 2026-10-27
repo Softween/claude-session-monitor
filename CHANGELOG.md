@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.23.5
+- **Remote `resume` never duplicates a running session.** The terminal match now counts the session's own process (terminals started with `claude --resume` report that pid), and when a running session has no addressable terminal (the Claude Code extension's own tab) the word `resume` is typed into that tab instead of starting a second `claude --resume`. Only a session whose process has exited is reopened in the background.
+
 ## 2.23.4
 - **Remote `resume` no longer opens duplicate terminals.** A session that is already open gets the word `resume` written into its own terminal (terminal API, no tab switch, no focus change). Only a session without a terminal is reopened with `claude --resume`, and that terminal is created in the background instead of being brought to the front. Three taps on the phone used to open three terminals and switch the panel each time.
 

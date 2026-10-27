@@ -83,6 +83,7 @@ import {
   type RecentTranscript,
   type TxInfo,
   type TokenUsage,
+  pidAlive,
 } from "./core";
 import {
   CODEX_MONITOR_DIR,
@@ -2791,7 +2792,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const terms = vscode.window.terminals;
       const pids = await Promise.all(terms.map((t) => Promise.resolve(t.processId).catch(() => undefined)));
       const candidates = terms.map((t, i) => ({ name: t.name, pid: pids[i] ?? undefined }));
-      const i = pickSessionTerminal(candidates, matchCandidates(v), ancestorPids(v.pid), labelsMatch);
+      const pidChain = v.pid ? [v.pid, ...ancestorPids(v.pid)] : [];
+      const i = pickSessionTerminal(candidates, matchCandidates(v), pidChain, labelsMatch);
       if (i < 0) return false;
       terms[i].sendText(line + "\r", false);
       return true;
@@ -3367,6 +3369,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
         // reopened, in the background, so the user keeps working where they are.
         if (v.provider === "claude" && v.capabilities.bulkInput && (await sendToSessionTerminal(v, "resume"))) {
           return { ok: true, message: `"resume" written into the open session "${truncate(v.title, 40)}"` };
+        }
+        if (v.pid && pidAlive(v.pid)) {
+          // The session is running somewhere without a terminal we can address
+          // (the Claude Code extension's own tab): a second `claude --resume`
+          // would duplicate it, so type into the tab instead.
+          const typed = await typeIntoSession(v, "resume");
+          return typed.ok
+            ? { ok: true, message: `"resume" typed into the running session "${truncate(v.title, 40)}" (tab focused)` }
+            : { ok: false, message: `session is running but "resume" could not be delivered: ${typed.reason} (${typed.detail})` };
         }
         resumeInTerminal(v, { show: false });
         return { ok: true, message: `resume terminal opened in the background for "${truncate(v.title, 40)}"` };

@@ -10,8 +10,9 @@ export interface TerminalCandidate {
 /**
  * Index of the terminal to write into, or -1.
  * 1. A terminal whose shell pid is an ancestor of the session's process wins (exact).
- * 2. Else the one terminal whose name matches a label candidate.
- * 3. Several name matches are ambiguous: never guess, return -1.
+ * 2. Else the terminal whose name matches a label candidate; with several
+ *    matches (duplicate resume terminals of the same session) the newest,
+ *    i.e. the last created, wins. They all run the same session id.
  */
 export function pickSessionTerminal(
   terminals: TerminalCandidate[],
@@ -25,7 +26,7 @@ export function pickSessionTerminal(
   terminals.forEach((t, i) => {
     if (t.name && candidates.some((c) => labelsMatch(t.name, c))) byName.push(i);
   });
-  return byName.length === 1 ? byName[0] : -1;
+  return byName.length ? byName[byName.length - 1] : -1;
 }
 
 /** Parse `ps -o ppid= -p <pid>` output into a parent pid, or null. */

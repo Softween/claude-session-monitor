@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.23.4
+- **Remote `resume` no longer opens duplicate terminals.** A session that is already open gets the word `resume` written into its own terminal (terminal API, no tab switch, no focus change). Only a session without a terminal is reopened with `claude --resume`, and that terminal is created in the background instead of being brought to the front. Three taps on the phone used to open three terminals and switch the panel each time.
+
 ## 2.23.3
 - **Remote `send` no longer steals focus.** The text is written into the VS Code terminal that hosts the session through the terminal API (process-tree match first, unique tab label second), so the active tab and the keyboard focus stay where you are. The old jump-to-tab keystroke path remains the fallback when no terminal can be identified; the relay result says `delivered via terminal` or `delivered via typed`.
 

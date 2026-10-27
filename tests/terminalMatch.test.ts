@@ -17,8 +17,8 @@ describe("pickSessionTerminal", () => {
     const t = [{ name: "zsh", pid: 100 }, { name: "Claude · fix login", pid: 200 }];
     expect(pickSessionTerminal(t, ["Claude · fix login"], [9999], eq)).toBe(1);
   });
-  it("returns -1 when several names match and no pid matches", () => {
-    expect(pickSessionTerminal(terms, ["Claude · fix login"], [9999], eq)).toBe(-1);
+  it("takes the newest terminal when several names match and no pid matches", () => {
+    expect(pickSessionTerminal(terms, ["Claude · fix login"], [9999], eq)).toBe(2);
   });
   it("returns -1 when nothing matches", () => {
     expect(pickSessionTerminal(terms, ["Claude · other"], [], eq)).toBe(-1);

@@ -3362,8 +3362,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
         const v = find();
         if (!v) return { ok: false, message: `unknown session ${cmd.sessionId}` };
         if (!v.capabilities.resume) return { ok: false, message: "this provider cannot resume the session" };
-        resumeInTerminal(v);
-        return { ok: true, message: `resume terminal opened for "${truncate(v.title, 40)}"` };
+        // An open session gets the word "resume" written into its own terminal
+        // (no tab switch, no focus change). Only a session with no terminal is
+        // reopened, in the background, so the user keeps working where they are.
+        if (v.provider === "claude" && v.capabilities.bulkInput && (await sendToSessionTerminal(v, "resume"))) {
+          return { ok: true, message: `"resume" written into the open session "${truncate(v.title, 40)}"` };
+        }
+        resumeInTerminal(v, { show: false });
+        return { ok: true, message: `resume terminal opened in the background for "${truncate(v.title, 40)}"` };
       }
       case "kill": {
         const v = find();
@@ -3890,7 +3896,7 @@ function asView(arg?: SessionView): SessionView | undefined {
   };
 }
 
-function resumeInTerminal(arg: SessionView): void {
+function resumeInTerminal(arg: SessionView, opts: { show?: boolean } = {}): void {
   const v = asView(arg);
   if (!v || !v.capabilities.resume) {
     vscode.window.showWarningMessage("This provider cannot resume the selected session.");
@@ -3913,7 +3919,7 @@ function resumeInTerminal(arg: SessionView): void {
         ? ["resume", v.sessionId]
         : ["--resume", v.sessionId],
   });
-  term.show();
+  if (opts.show !== false) term.show();
 }
 
 function openTranscript(arg?: SessionView): void {

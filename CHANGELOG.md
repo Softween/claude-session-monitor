@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.23.1
+- **Effort label follows Claude Code.** Each row now shows the effort the session sends on its next request. A `CLAUDE_CODE_EFFORT_LEVEL` in the `env` block of the Claude Code user settings overrides every session's own `/effort` pick (`unset` and `auto` show as `auto`); without it the transcript's last effort wins, then `modelSettings.<model>.effortLevel`, then the top-level `effortLevel`. `maxEffortLevel` (per model, else top-level) caps the result. Before, an idle session kept showing its last turn's effort or the top-level `effortLevel`, so a settings change looked unapplied until the session's next turn.
+
 ## 2.23.0
 - **Remote bridge (optional, off by default).** New settings `remote.url` and `remote.host` and commands **Agent Sessions: Set remote bridge token** (Secret Storage) and **Agent Sessions: Remote bridge status**. With a URL and a token set, the extension pushes a snapshot of the panel to `<url>/fleet/ingest` when it changes (at most every 10 s, heartbeat every 2 min) and long-polls `<url>/fleet/commands` for `resume`, `kill`, `resumeAll`, `switchAccount` and `send`, posting each result back. `send` delivers text into a running Claude Code session over its local `uds-messaging` socket. Network errors back off from 2 s to 60 s; without a URL nothing runs. `remote.url` and `remote.host` are user-level only (workspace values are ignored and restricted in untrusted workspaces), the URL must be https (http only for localhost), and the token is bound to the URL's origin. A remote `send` that the inbox does not confirm within 15 s is typed into that session's tab instead.
 

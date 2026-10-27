@@ -116,19 +116,55 @@ export function readHookStatuses(dir = MONITOR_DIR): Map<string, HookStatus> {
   return map;
 }
 
-/**
- * Read the global reasoning-effort level from ~/.claude/settings.json.
- * Only a fallback: each session's real effort is read from its transcript
- * (TxInfo.effort); this covers sessions with no assistant turn yet.
- */
-export function readGlobalEffort(file = SETTINGS_FILE): string | undefined {
+/** The ~/.claude/settings.json keys that decide which effort a session sends. */
+export interface EffortSettings {
+  env?: string; // env.CLAUDE_CODE_EFFORT_LEVEL: beats every session's own /effort pick
+  level?: string; // top-level effortLevel
+  cap?: string; // top-level maxEffortLevel
+  models?: Record<string, { effortLevel?: string; maxEffortLevel?: string }>; // modelSettings
+}
+
+const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+
+/** Read the effort keys from ~/.claude/settings.json ({} when missing or broken). */
+export function readEffortSettings(file = SETTINGS_FILE): EffortSettings {
+  const str = (x: unknown): string | undefined => (typeof x === "string" && x.trim() ? x.trim() : undefined);
   try {
-    const v = JSON.parse(fs.readFileSync(file, "utf8"));
-    const e = (v as { effortLevel?: unknown } | null)?.effortLevel;
-    return typeof e === "string" && e.trim() ? e.trim() : undefined;
+    const v = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown> | null;
+    const env = v?.env as Record<string, unknown> | undefined;
+    const models: NonNullable<EffortSettings["models"]> = {};
+    const ms = v?.modelSettings;
+    if (ms && typeof ms === "object" && !Array.isArray(ms)) {
+      for (const [k, m] of Object.entries(ms as Record<string, unknown>)) {
+        const o = (m && typeof m === "object" ? m : {}) as Record<string, unknown>;
+        models[k] = { effortLevel: str(o.effortLevel), maxEffortLevel: str(o.maxEffortLevel) };
+      }
+    }
+    return { env: str(env?.CLAUDE_CODE_EFFORT_LEVEL), level: str(v?.effortLevel), cap: str(v?.maxEffortLevel), models };
   } catch {
-    return undefined;
+    return {};
   }
+}
+
+/**
+ * The effort a session sends on its next request, in Claude Code's order: a
+ * valid env.CLAUDE_CODE_EFFORT_LEVEL beats the session's own pick ("unset" or
+ * "auto" sends none, shown as "auto"), then the transcript's last effort, then
+ * modelSettings.<model>.effortLevel, then the top-level effortLevel. The
+ * model's maxEffortLevel (else the top-level one) caps the result.
+ */
+export function effectiveEffort(
+  s: EffortSettings,
+  model: string | undefined,
+  txEffort: string | undefined,
+): string | undefined {
+  const env = s.env?.toLowerCase();
+  if (env === "unset" || env === "auto") return "auto";
+  const per = model ? s.models?.[model.replace(/\[1m\]$/i, "").replace(/-\d{8}$/, "")] : undefined;
+  const effort = (env && EFFORT_LEVELS.includes(env) ? env : undefined) ?? txEffort ?? per?.effortLevel ?? s.level;
+  const cap = per?.maxEffortLevel ?? s.cap;
+  if (!effort || !cap || !EFFORT_LEVELS.includes(cap)) return effort;
+  return EFFORT_LEVELS.indexOf(effort) > EFFORT_LEVELS.indexOf(cap) ? cap : effort;
 }
 
 /**
@@ -450,7 +486,7 @@ export function parseTranscriptTail(file: string, prev?: TxInfo): TxInfo {
 export interface ResolveOpts {
   now: number; // epoch seconds
   txPath?: string; // fallback transcript path (when no hook file)
-  effort?: string; // global effortLevel, used when the transcript carries none
+  effort?: EffortSettings; // settings.json effort keys (see effectiveEffort)
   closingMarkers?: boolean; // surface the closing status line on "your turn" sessions (default off)
 }
 
@@ -483,7 +519,7 @@ function resolve(
   const transcriptPath = hook?.transcript_path || opts.txPath;
   const entrypoint = tx?.entrypoint;
   const model = tx?.model;
-  const effort = tx?.effort ?? opts.effort;
+  const effort = effectiveEffort(opts.effort ?? {}, model, tx?.effort);
 
   let bucket: Bucket = "unknown";
   let sub = "unknown";
@@ -726,7 +762,7 @@ export interface CollectOpts {
   workspaceCwd?: string; // when set, only sessions under this cwd
   hookStatuses?: Map<string, HookStatus>; // injectable for tests; default readHookStatuses()
   showEnded?: boolean; // default false: closed/ended sessions are hidden entirely
-  globalEffort?: string; // injectable for tests; default readGlobalEffort()
+  effortSettings?: EffortSettings; // injectable for tests; default readEffortSettings()
   closingMarkers?: boolean; // default false: no closing status line (claudeSessionMonitor.closingStatusMarkers)
   phantomGraceSec?: number; // default 600
   pidAlive?: (pid?: number) => boolean | undefined; // injectable for tests
@@ -774,7 +810,7 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
   const hooks = opts.hookStatuses ?? readHookStatuses();
   const txCache = opts.txCache ?? new Map<string, TxInfo>();
   const allowed = opts.allowedEntrypoints ?? DEFAULT_ENTRYPOINTS;
-  const effort = opts.globalEffort ?? readGlobalEffort();
+  const effort = opts.effortSettings ?? readEffortSettings();
 
   const candidates = new Map<string, string | undefined>();
   for (const [sid, h] of hooks) candidates.set(sid, h.transcript_path);

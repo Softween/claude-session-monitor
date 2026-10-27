@@ -13,7 +13,8 @@ import {
   isPhantom,
   pidAlive,
   cleanupEndedMonitorFiles,
-  readGlobalEffort,
+  readEffortSettings,
+  effectiveEffort,
   writeGlobalEffort,
   countBuckets,
   scanTokenUsage,
@@ -350,19 +351,33 @@ describe("collectSessions", () => {
   });
 });
 
-describe("readGlobalEffort / effort + model surfacing", () => {
-  it("reads effortLevel from a settings.json, tolerating missing/broken files", () => {
+describe("readEffortSettings / effort + model surfacing", () => {
+  it("reads the effort keys from a settings.json, tolerating missing/broken files", () => {
     const good = path.join(tmp, "settings.json");
-    fs.writeFileSync(good, JSON.stringify({ effortLevel: "xhigh", other: 1 }));
-    expect(readGlobalEffort(good)).toBe("xhigh");
+    fs.writeFileSync(
+      good,
+      JSON.stringify({
+        effortLevel: "xhigh",
+        maxEffortLevel: "max",
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "max" },
+        modelSettings: { "claude-fable-5-1": { effortLevel: "high", maxEffortLevel: "xhigh" } },
+        other: 1,
+      }),
+    );
+    expect(readEffortSettings(good)).toEqual({
+      env: "max",
+      level: "xhigh",
+      cap: "max",
+      models: { "claude-fable-5-1": { effortLevel: "high", maxEffortLevel: "xhigh" } },
+    });
 
     const empty = path.join(tmp, "settings-empty.json");
     fs.writeFileSync(empty, JSON.stringify({ theme: "dark" }));
-    expect(readGlobalEffort(empty)).toBeUndefined();
+    expect(readEffortSettings(empty)).toEqual({ models: {} });
 
     fs.writeFileSync(good, "{ not json");
-    expect(readGlobalEffort(good)).toBeUndefined();
-    expect(readGlobalEffort(path.join(tmp, "nope.json"))).toBeUndefined();
+    expect(readEffortSettings(good)).toEqual({});
+    expect(readEffortSettings(path.join(tmp, "nope.json"))).toEqual({});
   });
 
   it("writeGlobalEffort updates effortLevel while preserving other keys", () => {
@@ -371,7 +386,7 @@ describe("readGlobalEffort / effort + model surfacing", () => {
     expect(writeGlobalEffort("xhigh", f)).toBe(true);
     const written = JSON.parse(fs.readFileSync(f, "utf8"));
     expect(written).toEqual({ effortLevel: "xhigh", theme: "dark", nested: { a: 1 } });
-    expect(readGlobalEffort(f)).toBe("xhigh");
+    expect(readEffortSettings(f).level).toBe("xhigh");
   });
 
   it("writeGlobalEffort aborts (returns false, touches nothing) on a missing/broken/non-object file", () => {
@@ -398,7 +413,7 @@ describe("readGlobalEffort / effort + model surfacing", () => {
     const map = new Map<string, HookStatus>([
       ["m", { session_id: "m", state: "idle", ts: NOW - 9, cwd: "/repo", transcript_path: p }],
     ]);
-    const views = collectSessions({ now: NOW, hookStatuses: map, extraTranscripts: [], maxAgeSec: 24 * 3600, globalEffort: "high" });
+    const views = collectSessions({ now: NOW, hookStatuses: map, extraTranscripts: [], maxAgeSec: 24 * 3600, effortSettings: { level: "high" } });
     const v = views.find((x) => x.sessionId === "m");
     expect(v?.model).toBe("claude-opus-4-8");
     expect(v?.effort).toBe("high");
@@ -416,10 +431,40 @@ describe("readGlobalEffort / effort + model surfacing", () => {
     const map = new Map<string, HookStatus>([
       ["e", { session_id: "e", state: "idle", ts: NOW - 9, cwd: "/repo", transcript_path: p }],
     ]);
-    const views = collectSessions({ now: NOW, hookStatuses: map, extraTranscripts: [], maxAgeSec: 24 * 3600, globalEffort: "medium" });
+    const views = collectSessions({ now: NOW, hookStatuses: map, extraTranscripts: [], maxAgeSec: 24 * 3600, effortSettings: { level: "medium" } });
     const v = views.find((x) => x.sessionId === "e");
     expect(v?.effort).toBe("max");
     expect(v?.tooltip).toContain("effort: max");
+  });
+
+  it("an env override beats each session's own effort, capped per model", () => {
+    const user = { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 30) };
+    const opus = writeTranscript("opus.jsonl", [
+      user,
+      { type: "assistant", effort: "medium", message: { content: [{ type: "text", text: "a" }], stop_reason: "end_turn", model: "claude-opus-5-5" }, timestamp: iso(NOW - 20) },
+    ]);
+    const fable = writeTranscript("fable.jsonl", [
+      user,
+      { type: "assistant", message: { content: [{ type: "text", text: "a" }], stop_reason: "end_turn", model: "claude-fable-5-1" }, timestamp: iso(NOW - 20) },
+    ]);
+    const map = new Map<string, HookStatus>([
+      ["o", { session_id: "o", state: "idle", ts: NOW - 9, cwd: "/repo", transcript_path: opus }],
+      ["f", { session_id: "f", state: "idle", ts: NOW - 9, cwd: "/repo", transcript_path: fable }],
+    ]);
+    const effortSettings = { env: "max", level: "medium", models: { "claude-fable-5-1": { maxEffortLevel: "xhigh" } } };
+    const views = collectSessions({ now: NOW, hookStatuses: map, extraTranscripts: [], maxAgeSec: 24 * 3600, effortSettings });
+    expect(views.find((x) => x.sessionId === "o")?.effort).toBe("max");
+    expect(views.find((x) => x.sessionId === "f")?.effort).toBe("xhigh");
+  });
+
+  it("effectiveEffort follows Claude Code's order without an env override", () => {
+    const s = { level: "medium", models: { "claude-fable-5-1": { effortLevel: "xhigh" } } };
+    expect(effectiveEffort(s, "claude-opus-5-5", "high")).toBe("high"); // the session's own pick
+    expect(effectiveEffort(s, "claude-fable-5-1[1m]", undefined)).toBe("xhigh"); // per-model setting
+    expect(effectiveEffort(s, "claude-opus-5-5", undefined)).toBe("medium"); // top-level fallback
+    expect(effectiveEffort({ ...s, env: "unset" }, "claude-opus-5-5", "max")).toBe("auto"); // no effort is sent
+    expect(effectiveEffort({ cap: "high" }, "claude-opus-5-5", "max")).toBe("high"); // top-level cap
+    expect(effectiveEffort({ env: "bogus", level: "low" }, undefined, undefined)).toBe("low"); // invalid env ignored
   });
 });
 
@@ -1202,7 +1247,7 @@ describe("phantom hook records", () => {
       now: NOW_S,
       hookStatuses: new Map([[h.session_id, h]]),
       extraTranscripts: [],
-      globalEffort: "high",
+      effortSettings: { level: "high" },
       pidAlive: () => alive,
     });
 

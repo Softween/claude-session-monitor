@@ -600,7 +600,7 @@ describe("provider registry", () => {
         ],
       ]),
       allowedEntrypoints: [],
-      globalEffort: "high",
+      effortSettings: { level: "high" },
       showEnded: true,
       maxAgeSec: 3600,
     });

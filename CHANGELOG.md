@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.23.2
+- **Remote bridge reports macOS free memory from `memory_pressure`** (its system-wide free percentage of total memory) instead of `os.freemem()`, which counts only the kernel's free pages; those stay near zero on a busy Mac, so the remote view showed RAM as 100 % used. If `memory_pressure` fails, free + inactive + speculative + purgeable pages from `vm_stat` are used, then `os.freemem()`; other platforms keep `os.freemem()`. The machine sample is now taken at most once per 15 s instead of on every panel refresh.
+
 ## 2.23.1
 - **Effort label follows Claude Code.** Each row now shows the effort the session sends on its next request. A `CLAUDE_CODE_EFFORT_LEVEL` in the `env` block of the Claude Code user settings overrides every session's own `/effort` pick (`unset` and `auto` show as `auto`); without it the transcript's last effort wins, then `modelSettings.<model>.effortLevel`, then the top-level `effortLevel`. `maxEffortLevel` (per model, else top-level) caps the result. Before, an idle session kept showing its last turn's effort or the top-level `effortLevel`, so a settings change looked unapplied until the session's next turn.
 

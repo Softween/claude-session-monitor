@@ -129,6 +129,7 @@ vi.mock("vscode", () => {
     workspace: {
       getConfiguration: () => ({
         get: (key: string, def: any) => (rec.config.has(key) ? rec.config.get(key) : def),
+        inspect: () => undefined,
       }),
       workspaceFolders: undefined,
       openTextDocument: () => Promise.resolve({}),

@@ -3,6 +3,7 @@
  * snapshot pushed to `<url>/fleet/ingest`, its change hash, and the push /
  * backoff timing. Wire format: API contract v1 (`POST /fleet/ingest`).
  */
+import { spawnSync } from "child_process";
 import { createHash } from "crypto";
 import * as os from "os";
 import { parseResetToEpoch } from "./core";
@@ -35,6 +36,7 @@ export const MIN_PUSH_GAP_MS = 10_000;
 export const HEARTBEAT_MS = 120_000;
 export const BACKOFF_MIN_MS = 2_000;
 export const BACKOFF_MAX_MS = 60_000;
+export const MACHINE_SAMPLE_MS = 15_000;
 
 export interface FleetGauge { key: string; label: string; pct: number; resetMs: number | null }
 
@@ -223,16 +225,77 @@ export function shouldPush(o: { changed: boolean; lastPushTs: number; now: numbe
   return o.changed && since >= MIN_PUSH_GAP_MS;
 }
 
-/** Host-wide sample (no subprocess): 1-min load average as CPU %, free / total memory. */
-export function sampleMachine(pressure: string | null, sessions: number): FleetMachine {
+/**
+ * macOS available memory from `vm_stat` text: (free + inactive + speculative + purgeable)
+ * pages * page size in MB, clamped to [0, totalMb]; null when the text does not parse.
+ */
+export function availableMemoryMb(vmStatOutput: string, totalMb: number): number | null {
+  const pageSize = Number(/page size of (\d+) bytes/.exec(vmStatOutput)?.[1]);
+  if (!pageSize) return null;
+  let pages = 0;
+  for (const name of ["free", "inactive", "speculative", "purgeable"]) {
+    const m = new RegExp(`^Pages ${name}:\\s+(\\d+)`, "m").exec(vmStatOutput);
+    if (!m) return null;
+    pages += Number(m[1]);
+  }
+  return Math.max(0, Math.min(totalMb, Math.round((pages * pageSize) / 1048576)));
+}
+
+/** `memory_pressure` text -> its "System-wide memory free percentage" (0-100); null when missing or out of range. */
+export function freePctFromMemoryPressure(text: string): number | null {
+  const m = /System-wide memory free percentage:\s*(\d+)%/.exec(text);
+  const pct = m ? Number(m[1]) : NaN;
+  return pct >= 0 && pct <= 100 ? pct : null;
+}
+
+/** stdout of a short macOS tool run, or null when it fails or runs past 1 s. */
+function runTool(cmd: string): string | null {
+  const r = spawnSync(cmd, [], { encoding: "utf8", timeout: 1000 });
+  return !r.error && r.status === 0 ? r.stdout : null;
+}
+
+/**
+ * Free memory in MB. macOS `os.freemem()` counts only the kernel's free pages (near zero on
+ * a busy Mac), so darwin takes the system-wide free percentage from `memory_pressure`, then
+ * free + inactive + speculative + purgeable pages from `vm_stat`, then `os.freemem()`.
+ */
+function freeMemoryMb(totalMb: number): number {
+  if (process.platform === "darwin") {
+    const pct = freePctFromMemoryPressure(runTool("/usr/bin/memory_pressure") ?? "");
+    if (pct !== null) return Math.round((totalMb * pct) / 100);
+    const available = availableMemoryMb(runTool("vm_stat") ?? "", totalMb);
+    if (available !== null) return available;
+  }
+  return Math.round(os.freemem() / 1048576);
+}
+
+type MachineReading = Pick<FleetMachine, "cpuPct" | "memFreeMb" | "memTotalMb">;
+let machineCache: { at: number; value: MachineReading } | null = null;
+
+function measureMachine(): MachineReading {
   const cpus = Math.max(1, os.cpus().length);
+  const memTotalMb = Math.round(os.totalmem() / 1048576);
   return {
     cpuPct: Math.min(100, Math.round((os.loadavg()[0] / cpus) * 100)),
-    memFreeMb: Math.round(os.freemem() / 1048576),
-    memTotalMb: Math.round(os.totalmem() / 1048576),
-    pressure,
-    sessions,
+    memFreeMb: freeMemoryMb(memTotalMb),
+    memTotalMb,
   };
+}
+
+/**
+ * Host-wide sample: 1-min load average as CPU %, free / total memory. The bridge asks on every
+ * panel poll (~1.5 s), so a reading is reused for MACHINE_SAMPLE_MS (taken again if the clock
+ * moved back); `pressure` and `sessions` always pass through. `now` / `measure`: test seams.
+ */
+export function sampleMachine(
+  pressure: string | null,
+  sessions: number,
+  now = Date.now(),
+  measure: () => MachineReading = measureMachine,
+): FleetMachine {
+  let c = machineCache;
+  if (!c || now < c.at || now - c.at >= MACHINE_SAMPLE_MS) c = machineCache = { at: now, value: measure() };
+  return { ...c.value, pressure, sessions };
 }
 
 /** `sysctl kern.memorystatus_vm_pressure_level` value -> label (macOS: 1 normal, 2 warn, 4 critical). */

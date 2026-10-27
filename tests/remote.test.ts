@@ -3,12 +3,16 @@ import {
   BACKOFF_MAX_MS,
   BUCKET_MAP,
   LAST_TEXT_MAX_BYTES,
+  MACHINE_SAMPLE_MS,
+  availableMemoryMb,
   buildSnapshot,
   checkRemoteUrl,
   clipBytes,
+  freePctFromMemoryPressure,
   originMatches,
   parseStoredToken,
   nextBackoff,
+  sampleMachine,
   shouldPush,
   snapshotHash,
   type FleetMachine,
@@ -201,5 +205,121 @@ describe("remote url + token origin binding", () => {
     expect(parseStoredToken("plain-token")).toBeNull();
     expect(parseStoredToken(JSON.stringify({ token: "t" }))).toBeNull();
     expect(parseStoredToken(undefined)).toBeNull();
+  });
+});
+
+describe("availableMemoryMb", () => {
+  // Real-looking macOS vm_stat output (Apple silicon, 16 KB pages: 64 pages = 1 MB).
+  const sample = [
+    "Mach Virtual Memory Statistics: (page size of 16384 bytes)",
+    "Pages free:                                     8254.",
+    "Pages active:                                 268942.",
+    "Pages inactive:                               328168.",
+    "Pages speculative:                              1910.",
+    "Pages throttled:                                   0.",
+    "Pages wired down:                             324023.",
+    "Pages purgeable:                                 612.",
+    '"Translation faults":                    17106268484.',
+    "Pages copy-on-write:                       604271345.",
+    "Pages zero filled:                        7050836470.",
+    "Pages reactivated:                        5379542879.",
+    "Pages purged:                              392143476.",
+    "File-backed pages:                            178927.",
+    "Anonymous pages:                              357513.",
+    "Pages stored in compressor:                  1334778.",
+    "Pages occupied by compressor:                 665134.",
+    "Decompressions:                           6039347319.",
+    "Compressions:                             6735996240.",
+    "Pageins:                                   288630704.",
+    "Pageouts:                                     904060.",
+    "Swapins:                                    94126809.",
+    "Swapouts:                                  106389400.",
+    "",
+  ].join("\n");
+
+  it("sums free, inactive, speculative and purgeable pages at the reported page size", () => {
+    // (8254 + 328168 + 1910 + 612) = 338944 pages; "Pages purged" is not "Pages purgeable".
+    expect(availableMemoryMb(sample, 24576)).toBe(338944 / 64);
+    // Intel Macs report 4 KB pages: 256 pages = 1 MB.
+    expect(availableMemoryMb(sample.replace("page size of 16384 bytes", "page size of 4096 bytes"), 24576)).toBe(338944 / 256);
+  });
+
+  it("returns null when the text does not parse", () => {
+    expect(availableMemoryMb("", 24576)).toBeNull();
+    expect(availableMemoryMb("zsh: command not found: vm_stat", 24576)).toBeNull();
+    expect(availableMemoryMb(sample.replace("page size of 16384 bytes", "page size unknown"), 24576)).toBeNull();
+    expect(availableMemoryMb(sample.replace(/^Pages speculative:.*$/m, ""), 24576)).toBeNull();
+  });
+
+  it("clamps the result to [0, totalMb]", () => {
+    expect(availableMemoryMb(sample, 4096)).toBe(4096);
+    expect(availableMemoryMb(sample, 0)).toBe(0);
+  });
+});
+
+describe("freePctFromMemoryPressure", () => {
+  // Real-looking `/usr/bin/memory_pressure` output (no arguments: report only).
+  const sample = [
+    "The system has 25769803776 (1572864 pages with a page size of 16384).",
+    "",
+    "Stats: ",
+    "Pages free: 12626 ",
+    "Pages purgeable: 17878 ",
+    "Pages purged: 399906192 ",
+    "",
+    "Swap I/O:",
+    "Swapins: 94294909 ",
+    "Swapouts: 106762528 ",
+    "",
+    "Page Q counts:",
+    "Pages active: 327939 ",
+    "Pages inactive: 325612 ",
+    "Pages speculative: 645 ",
+    "Pages throttled: 0 ",
+    "Pages wired down: 294046 ",
+    "",
+    "Compressor Stats:",
+    "Pages used by compressor: 570810 ",
+    "Pages decompressed: 6086666627 ",
+    "Pages compressed: 6785198606 ",
+    "",
+    "File I/O:",
+    "Pageins: 289950751 ",
+    "Pageouts: 907013 ",
+    "",
+    "System-wide memory free percentage: 37%",
+    "",
+  ].join("\n");
+
+  it("reads the system-wide free percentage", () => {
+    expect(freePctFromMemoryPressure(sample)).toBe(37);
+    expect(freePctFromMemoryPressure(sample.replace("37%", "0%"))).toBe(0);
+    expect(freePctFromMemoryPressure(sample.replace("37%", "100%"))).toBe(100);
+  });
+
+  it("returns null when the line is missing", () => {
+    expect(freePctFromMemoryPressure("")).toBeNull();
+    expect(freePctFromMemoryPressure(sample.replace(/^System-wide memory free percentage.*$/m, ""))).toBeNull();
+  });
+
+  it("returns null for an out-of-range value", () => {
+    expect(freePctFromMemoryPressure(sample.replace("37%", "101%"))).toBeNull();
+    expect(freePctFromMemoryPressure(sample.replace("37%", "-5%"))).toBeNull();
+  });
+});
+
+describe("sampleMachine", () => {
+  it("measures at most once per 15 s and always passes pressure and sessions through", () => {
+    expect(MACHINE_SAMPLE_MS).toBe(15_000);
+    let calls = 0;
+    const measure = () => ({ cpuPct: 10, memFreeMb: 1000 + ++calls, memTotalMb: 24576 });
+    const t0 = 1_000_000_000_000;
+    expect(sampleMachine("normal", 1, t0, measure)).toEqual({ cpuPct: 10, memFreeMb: 1001, memTotalMb: 24576, pressure: "normal", sessions: 1 });
+    expect(sampleMachine("warn", 2, t0 + MACHINE_SAMPLE_MS - 1, measure)).toEqual({ cpuPct: 10, memFreeMb: 1001, memTotalMb: 24576, pressure: "warn", sessions: 2 });
+    expect(calls).toBe(1);
+    expect(sampleMachine(null, 0, t0 + MACHINE_SAMPLE_MS, measure).memFreeMb).toBe(1002);
+    // A clock that moved back takes a new reading instead of trusting one from the future.
+    expect(sampleMachine(null, 0, t0, measure).memFreeMb).toBe(1003);
+    expect(calls).toBe(3);
   });
 });

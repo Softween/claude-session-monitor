@@ -529,6 +529,29 @@ describe("extension activate()", () => {
     });
   });
 
+  it("resumes Claude by the absolute path `which claude` resolved at activation", async () => {
+    fs.mkdirSync(`${HOME}/bin`, { recursive: true });
+    fs.writeFileSync(`${HOME}/bin/claude`, "#!/bin/sh\n", { mode: 0o755 });
+    rec.execFileImpl = (args) => {
+      if (args[0] !== "which") return false;
+      args[args.length - 1](null, `${HOME}/bin/claude\n`, "");
+      return true;
+    };
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    await settleAsync();
+    rec.commands.get("claudeSessionMonitor.resumeSession")!({
+      key: "claude:abs",
+      provider: "claude",
+      sessionId: "abs-session",
+      title: "Claude session",
+      cwd: "/tmp/claude workspace",
+    });
+    expect(rec.terminals.at(-1)).toMatchObject({
+      options: { shellPath: `${HOME}/bin/claude`, shellArgs: ["--resume", "abs-session"] },
+    });
+  });
+
   it("deactivate() does not throw", () => {
     expect(() => ext.deactivate()).not.toThrow();
   });

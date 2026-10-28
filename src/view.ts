@@ -271,6 +271,45 @@ export function labelsMatch(tabLabel: string, title: string): boolean {
   return a === b || a.startsWith(b) || b.startsWith(a);
 }
 
+/** Longest session title the Claude Code extension shows untruncated in its tab. */
+export const TAB_TITLE_MAX = 25;
+
+/**
+ * The tab label the Claude Code extension gives a session title: a title over
+ * 25 characters (UTF-16 units) becomes its first 24 + "…", trailing spaces kept,
+ * nothing trimmed or collapsed (anthropic.claude-code 2.1.311 `VO1`; matches 29
+ * of 30 real tab labels, the 30th has no ai-title).
+ */
+export function truncatedLabel(title: string): string {
+  return title.length > TAB_TITLE_MAX ? title.substring(0, TAB_TITLE_MAX - 1) + "…" : title;
+}
+
+/**
+ * Label match for the remote paths (terminal write, keystrokes), after
+ * collapsing whitespace, trimming and lowercasing both sides:
+ *  - equal labels of 8+ characters match ("yap", "zsh" never do);
+ *  - a label ending in "…" matches a title that truncates to exactly that label
+ *    (truncatedLabel), so its stem (8+ characters) must be followed by more of
+ *    the title: a shorter title equal to the stem, or one Claude Code would show
+ *    in full, never matches;
+ *  - a label ending in "..." matches a longer title that starts with its stem
+ *    (8+ characters).
+ * The panel UI keeps the tolerant labelsMatch.
+ */
+export function labelsMatchStrict(label: string, title: string): boolean {
+  const norm = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
+  const a = norm(label);
+  const b = norm(title);
+  if (!a || !b) return false;
+  if (a === b) return a.length >= 8;
+  if (a.endsWith("…")) return a.length > 8 && norm(truncatedLabel(title)) === a;
+  if (a.endsWith("...")) {
+    const stem = a.slice(0, -3);
+    return stem.length >= 8 && b !== stem && b.startsWith(stem);
+  }
+  return false;
+}
+
 /**
  * Session rows ordered by token spend (descending); ties fall back to the most
  * recent activity. Stable, so group membership (which is decided per row) is

@@ -133,7 +133,13 @@ export function loadRecords(dir: string = DEFAULT_SESSIONS_DIR): SessionRecord[]
 export function resolveTarget(recs: SessionRecord[], pid?: number, sessionId?: string): SessionRecord | PeerSendErr {
   if (pid !== undefined) {
     const hit = recs.find((r) => r.pid === pid);
-    return hit ?? fail("target", `no session record ~/.claude/sessions/${pid}.json`);
+    if (!hit) return fail("target", `no session record ~/.claude/sessions/${pid}.json`);
+    // With both given the process must run that very session: a recycled pid or a
+    // new conversation in the same process never receives another session's text.
+    if (sessionId && hit.sessionId !== sessionId) {
+      return fail("target", `pid ${pid} runs session ${hit.sessionId ?? "(unknown)"}, not ${sessionId}`);
+    }
+    return hit;
   }
   const pref = sessionId ?? "";
   if (!pref) return fail("usage", "a pid or sessionId is required");

@@ -19,11 +19,14 @@ import * as os from "os";
 import * as path from "path";
 import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, headerGauges, switchInstalled, type CardHeader } from "./switchPanel";
 import { gaugeColumn } from "./compact";
-import { deliverText, registerRemoteBridge, type CommandOutcome, type FleetCommand, type RemoteBridge } from "./remoteBridge";
+import { TYPED_REASON, deliverText, registerRemoteBridge, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt, type RemoteBridge } from "./remoteBridge";
+import { runTool } from "./remote";
+import { sanitizeRemoteLine } from "./remoteInput";
+import { resolveClaudeBinary } from "./claudeBinary";
 import { sendToSession } from "./peerSend";
 import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, useStuck, type ActiveCandidate } from "./activeAccount";
-import { execFile, spawnSync } from "child_process";
-import { parseParentPid, pickSessionTerminal } from "./terminalMatch";
+import { execFile } from "child_process";
+import { parseParentPid, pickSessionTerminal, pickUniqueLabel } from "./terminalMatch";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import {
   KEYCHAIN_SERVICE,
@@ -2727,24 +2730,29 @@ export function activate(ctx: vscode.ExtensionContext): void {
   }
 
   type FocusedTypeResult =
-    | { ok: true; via?: "terminal" | "typed" }
+    | { ok: true }
     | { ok: false; reason: "aborted" | "not-frontmost" | "tab-mismatch" | "accessibility" | "keystroke"; detail: string };
 
   /**
-   * Type `text` + Enter into the session whose tab is already active: bring VS Code
-   * and the Claude input forward, re-verify right before the keystroke that the
-   * session's tab is active AND VS Code is frontmost, then type. `alive` aborts
-   * between steps. Shared by the typing sweep and the remote `send` fallback.
+   * Type `text` + Enter into the session whose tab is already active: (optionally
+   * bring VS Code forward,) focus the Claude input, re-verify right before the
+   * keystroke that this window is focused and the session's tab is active, then
+   * type; the osascript run that types first checks that VS Code is the frontmost
+   * app. `alive` aborts between steps. Shared by the typing sweep (activates VS
+   * Code, panel label match) and the remote keystroke path (no activation,
+   * strict match).
    */
   async function typeIntoFocusedSession(
-    v: SessionView,
     text: string,
     submitDelayMs: number | undefined,
     alive: () => boolean,
+    opts: { activate: boolean; tabActive: () => boolean },
   ): Promise<FocusedTypeResult> {
     const aborted: FocusedTypeResult = { ok: false, reason: "aborted", detail: "stopped" };
-    await activateEditorApp();
-    await sleep(150);
+    if (opts.activate) {
+      await activateEditorApp();
+      await sleep(150);
+    }
     try {
       await vscode.commands.executeCommand("claude-vscode.focus");
     } catch {
@@ -2752,53 +2760,87 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
     await sleep(220);
     if (!alive()) return aborted;
-    // Re-verify immediately before typing: correct tab active AND VS Code frontmost.
-    const a = activeTabLabel();
-    const front = await isEditorFrontmost();
-    if (!alive()) return aborted;
-    const matched = !!a && matchCandidates(v).some((c) => labelsMatch(a, c));
-    if (!front || !matched) {
-      return { ok: false, reason: front ? "tab-mismatch" : "not-frontmost", detail: `front=${front} activeMatched=${matched}` };
+    // Re-verify immediately before typing: this window focused AND the correct tab active.
+    const focused = windowFocused();
+    const matched = opts.tabActive();
+    if (!focused || !matched) {
+      return { ok: false, reason: focused ? "tab-mismatch" : "not-frontmost", detail: `focused=${focused} activeMatched=${matched}` };
     }
     const r = await typeAndSubmit(text, submitDelayMs);
     if (r.ok) return { ok: true };
-    const accessibility = /not allowed|assistive|accessibility|-1743|-25211|not permitted/i.test(r.err || "");
+    if (r.notFrontmost) return { ok: false, reason: "not-frontmost", detail: r.err };
+    const accessibility = /not allowed|assistive|accessibility|-1743|-25211|not permitted/i.test(r.err);
     return { ok: false, reason: accessibility ? "accessibility" : "keystroke", detail: r.err || "keystroke failed" };
   }
 
-  /** Remote `send` fallback: jump to that one session's tab and type the text + Enter, no confirmation dialog. */
-  async function typeIntoSession(v: SessionView, text: string): Promise<FocusedTypeResult> {
-    if (v.provider !== "claude" || !v.capabilities.bulkInput) {
-      return { ok: false, reason: "tab-mismatch", detail: "this session has no typable Claude input" };
+  /**
+   * Remote path (b): type `text` + Enter into the session's Claude Code tab. Only
+   * when typing is allowed (`remote.typeFallback`), the session's tab is this
+   * window's one tab matching its title (labelsMatchStrict, truncated labels
+   * included, no other listed session matching it), and this window is focused,
+   * i.e. VS Code is already frontmost (it is never activated). The tab is then made active and
+   * re-verified, and the typing osascript checks the frontmost app itself. Never
+   * prompts. `skip` = nothing was typed; only a failed keystroke is final.
+   */
+  async function typeIntoSession(v: SessionView, text: string): Promise<PathAttempt> {
+    const skip = (reason: string, detail?: string): PathAttempt => ({ ok: false, skip: true, reason, detail });
+    if (!remoteFlag("remote.typeFallback")) return skip("typing disabled (remote.typeFallback is off)");
+    if (process.platform !== "darwin") return skip("keystrokes need macOS");
+    if (v.provider !== "claude" || !v.capabilities.bulkInput) return skip("this session has no typable Claude input");
+    if (resumeActive) return skip("a typing sweep is running");
+    const rivals = rivalLabels(v);
+    const tab = findSessionTab(v, rivals);
+    if (!tab) return skip(NO_TAB_MESSAGE);
+    if (!windowFocused()) return skip(TYPED_REASON["not-frontmost"], "this VS Code window is not focused");
+    const s = sanitizeRemoteLine(text);
+    if (!s.ok) return { ok: false, skip: false, reason: s.reason };
+    if (!tab.active) {
+      await focusTab(tab.gi, tab.ti);
+      await sleep(500);
     }
-    if (resumeActive) return { ok: false, reason: "aborted", detail: "a typing sweep is running" };
-    // osascript `keystroke` submits on every newline: one remote message is one Return.
-    const line = text.replace(/[\r\n]+/g, " ").trim();
-    if (await sendToSessionTerminal(v, line)) return { ok: true, via: "terminal" };
-    await jumpToSession(v);
-    await sleep(500);
-    const r = await typeIntoFocusedSession(v, line, undefined, () => !disposed && !resumeActive);
-    return r.ok ? { ok: true, via: "typed" } : r;
+    const r = await typeIntoFocusedSession(s.line, undefined, () => !disposed && !resumeActive, {
+      activate: false,
+      tabActive: () => findSessionTab(v, rivals)?.active === true,
+    });
+    if (r.ok) return { ok: true };
+    // Every reason but a failed keystroke stopped before anything was typed.
+    return { ok: false, skip: r.reason !== "keystroke", reason: TYPED_REASON[r.reason] ?? r.reason, detail: r.detail };
+  }
+
+  /** Title candidates of every other listed session: a tab or terminal name they match too is ambiguous. */
+  function rivalLabels(v: SessionView): string[] {
+    return lastAllViews.filter((o) => o.sessionId !== v.sessionId).flatMap((o) => matchCandidates(o));
   }
 
   /**
-   * Write `line` + Return straight into the VS Code terminal that hosts the
-   * session (process-tree match first, unique tab label second). No `show()`,
-   * no focus change: the user keeps working where they are. False when no
-   * terminal can be identified or the write throws, so the keystroke path runs.
+   * Remote path (a): write `text` + Return straight into the VS Code terminal
+   * that hosts the session (process-tree match first, else the one terminal
+   * named exactly like the session). No `show()`, no focus change: the user
+   * keeps working where they are. `skip` when no terminal here is the session's;
+   * the text must pass sanitizeRemoteLine before it is written.
    */
-  async function sendToSessionTerminal(v: SessionView, line: string): Promise<boolean> {
+  async function sendToSessionTerminal(v: SessionView, text: string): Promise<PathAttempt> {
+    if (v.provider !== "claude" || !v.capabilities.bulkInput) {
+      return { ok: false, skip: true, reason: "this session has no typable Claude input" };
+    }
+    let term: vscode.Terminal | undefined;
     try {
       const terms = vscode.window.terminals;
       const pids = await Promise.all(terms.map((t) => Promise.resolve(t.processId).catch(() => undefined)));
       const candidates = terms.map((t, i) => ({ name: t.name, pid: pids[i] ?? undefined }));
-      const pidChain = v.pid ? [v.pid, ...ancestorPids(v.pid)] : [];
-      const i = pickSessionTerminal(candidates, matchCandidates(v), pidChain, labelsMatch);
-      if (i < 0) return false;
-      terms[i].sendText(line + "\r", false);
-      return true;
-    } catch {
-      return false;
+      const pidChain = v.pid ? [v.pid, ...(await ancestorPids(v.pid))] : [];
+      term = terms[pickSessionTerminal(candidates, matchCandidates(v), pidChain, rivalLabels(v))];
+    } catch (e) {
+      return { ok: false, skip: true, reason: "terminal lookup failed", detail: String(e) };
+    }
+    if (!term) return { ok: false, skip: true, reason: "no terminal for this session in this window" };
+    const s = sanitizeRemoteLine(text);
+    if (!s.ok) return { ok: false, skip: false, reason: s.reason };
+    try {
+      term.sendText(s.line + "\r", false);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, skip: false, reason: "terminal write failed", detail: String(e) };
     }
   }
 
@@ -2863,7 +2905,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
               if (x === "Stop") stopResume("Claude Sessions: resume sweep stopped.");
             });
         } else {
-          const t = await typeIntoFocusedSession(v, text, opts.submitDelayMs, () => resumeActive);
+          const t = await typeIntoFocusedSession(text, opts.submitDelayMs, () => resumeActive, {
+            activate: true,
+            tabActive: () => {
+              const a = activeTabLabel();
+              return !!a && matchCandidates(v).some((c) => labelsMatch(a, c));
+            },
+          });
           if (!t.ok && t.reason === "aborted") return;
           if (!t.ok && (t.reason === "not-frontmost" || t.reason === "tab-mismatch")) {
             skipped++;
@@ -3322,7 +3370,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
   );
 
   // --- Remote bridge (optional) -------------------------------------------
-  // Commands arriving from the relay run through the same actions as the panel.
+  // Commands arriving from the relay run through the same actions as the panel,
+  // minus every prompt: a session without a tab here fails instead of asking.
   // kill skips the modal: the remote request is the confirmation, the pid is still
   // re-verified. resumeAll keeps its own modal before any unattended typing.
   const remoteAccounts = () => {
@@ -3367,17 +3416,24 @@ export function activate(ctx: vscode.ExtensionContext): void {
         // An open session gets the word "resume" written into its own terminal
         // (no tab switch, no focus change). Only a session with no terminal is
         // reopened, in the background, so the user keeps working where they are.
-        if (v.provider === "claude" && v.capabilities.bulkInput && (await sendToSessionTerminal(v, "resume"))) {
-          return { ok: true, message: `"resume" written into the open session "${truncate(v.title, 40)}"` };
-        }
+        const written = await sendToSessionTerminal(v, "resume");
+        if (written.ok) return { ok: true, message: `"resume" written into the open session "${truncate(v.title, 40)}"` };
+        if (!written.skip) return { ok: false, message: `"resume" could not be written into the session's terminal: ${written.reason}` };
         if (v.pid && pidAlive(v.pid)) {
           // The session is running somewhere without a terminal we can address
           // (the Claude Code extension's own tab): a second `claude --resume`
-          // would duplicate it, so type into the tab instead.
+          // would duplicate it, so type into the tab, only under the keystroke rules.
           const typed = await typeIntoSession(v, "resume");
-          return typed.ok
-            ? { ok: true, message: `"resume" typed into the running session "${truncate(v.title, 40)}" (tab focused)` }
-            : { ok: false, message: `session is running but "resume" could not be delivered: ${typed.reason} (${typed.detail})` };
+          if (typed.ok) return { ok: true, message: `"resume" typed into the running session "${truncate(v.title, 40)}"` };
+          if (typed.reason === NO_TAB_MESSAGE) return { ok: false, message: NO_TAB_MESSAGE };
+          return {
+            ok: false,
+            message: `session is running but "resume" could not be delivered: ${typed.reason}${typed.detail ? ` (${typed.detail})` : ""}`,
+          };
+        }
+        // An exited session is reopened by the claude executable's absolute path only.
+        if (v.provider === "claude" && !(await claudeBinary)) {
+          return { ok: false, message: "claude executable not found on this Mac; remote resume refused" };
         }
         resumeInTerminal(v, { show: false });
         return { ok: true, message: `resume terminal opened in the background for "${truncate(v.title, 40)}"` };
@@ -3405,20 +3461,37 @@ export function activate(ctx: vscode.ExtensionContext): void {
       case "switchAccount":
         return cmd.account ? remoteSwitch(cmd.account) : { ok: false, message: "account is required" };
       case "send": {
-        if (!cmd.sessionId || !cmd.text) return { ok: false, message: "sessionId and text are required" };
+        if (!cmd.sessionId || typeof cmd.text !== "string" || !cmd.text) {
+          return { ok: false, message: "sessionId and text are required" };
+        }
+        // Only a session in the local list is a target; the inbox gets its pid too,
+        // so a session id prefix can never reach another session.
         const v = find();
-        if (v && v.provider !== "claude") return { ok: false, message: "send is supported for Claude sessions only" };
-        const sessionId = cmd.sessionId;
+        if (!v) return { ok: false, message: "session not found" };
+        if (v.provider !== "claude") return { ok: false, message: "send is supported for Claude sessions only" };
         const text = cmd.text;
         return deliverText({
-          uds: () => sendToSession({ sessionId, text, timeoutMs: 5000, waitTranscriptMs: 15_000 }),
-          typed: async () => (v ? typeIntoSession(v, text) : { ok: false, reason: "tab-mismatch", detail: "session is not in the panel" }),
+          terminal: () => sendToSessionTerminal(v, text),
+          typed: () => typeIntoSession(v, text),
+          uds: () => sendToSession({ pid: v.pid, sessionId: v.sessionId, text, timeoutMs: 5000, waitTranscriptMs: 15_000 }),
         });
       }
       default:
         return { ok: false, message: `unknown command type ${cmd.type}` };
     }
   }
+
+  // Resolved once per activation; the remote path never runs a bare `claude`.
+  claudeBinaryPath = undefined;
+  claudeBinary = resolveClaudeBinary({ which: () => runTool("which", ["claude"], 3000), home: os.homedir() }).then((p) => {
+    claudeBinaryPath = p;
+    if (!p) {
+      log(
+        "claude executable not found (which claude, ~/.claude/local/claude, /opt/homebrew/bin/claude, /usr/local/bin/claude): remote resume of exited sessions is refused",
+      );
+    }
+    return p;
+  });
 
   remoteBridge = registerRemoteBridge(ctx, { log, accounts: remoteAccounts, execute: executeRemote });
 
@@ -3777,17 +3850,58 @@ function matchCandidates(v: SessionView): string[] {
 }
 
 /** Parent chain of `pid` (nearest first), at most 8 levels, stopping at launchd. */
-function ancestorPids(pid: number | undefined): number[] {
+async function ancestorPids(pid: number | undefined): Promise<number[]> {
   const out: number[] = [];
   let cur = pid;
   for (let depth = 0; cur && cur > 1 && depth < 8; depth++) {
-    const r = spawnSync("ps", ["-o", "ppid=", "-p", String(cur)], { encoding: "utf8", timeout: 1000 });
-    const parent = r.status === 0 ? parseParentPid(r.stdout) : null;
+    const stdout = await runTool("ps", ["-o", "ppid=", "-p", String(cur)]);
+    const parent = stdout === null ? null : parseParentPid(stdout);
     if (!parent || parent <= 1) break;
     out.push(parent);
     cur = parent;
   }
   return out;
+}
+
+/** Answer of a remote command whose session has no tab (or several same-titled ones) in this window. */
+const NO_TAB_MESSAGE = "no tab for this session in this window";
+
+interface TabHit {
+  gi: number;
+  ti: number;
+  active: boolean; // the active tab of the active group
+}
+
+/**
+ * The session's tab in this window for the remote paths: the one tab whose label
+ * strictly matches a title candidate, its truncated form included
+ * (labelsMatchStrict via pickUniqueLabel), or null when none matches, several
+ * do, or the label matches one of the `rivals` (other sessions' titles) too.
+ */
+function findSessionTab(v: SessionView, rivals: string[]): TabHit | null {
+  const tabs: Array<TabHit & { label: string }> = [];
+  vscode.window.tabGroups.all.forEach((g, gi) =>
+    g.tabs.forEach((t, ti) => tabs.push({ gi, ti, label: t.label, active: g.isActive && t.isActive })),
+  );
+  const k = pickUniqueLabel(tabs.map((t) => t.label), matchCandidates(v), rivals);
+  return k >= 0 ? tabs[k] : null;
+}
+
+/** Make tab `ti` of editor group `gi` the active editor; returns the action taken (tabs-debug.json). */
+async function focusTab(gi: number, ti: number): Promise<string> {
+  if (gi < FOCUS_GROUP_CMDS.length) {
+    await vscode.commands.executeCommand(FOCUS_GROUP_CMDS[gi]);
+  }
+  if (ti < 9) {
+    await vscode.commands.executeCommand(`workbench.action.openEditorAtIndex${ti + 1}`);
+    return "openEditorAtIndex" + (ti + 1);
+  }
+  // beyond index 9 there is no direct command: jump to the first tab and step.
+  await vscode.commands.executeCommand("workbench.action.openEditorAtIndex1");
+  for (let k = 0; k < ti; k++) {
+    await vscode.commands.executeCommand("workbench.action.nextEditorInGroup");
+  }
+  return "step-to-" + ti;
 }
 
 async function jumpToSession(v: SessionView): Promise<void> {
@@ -3821,20 +3935,7 @@ async function jumpToSession(v: SessionView): Promise<void> {
       const ti = tabs.findIndex((t) => t.label && candidates.some((c) => labelsMatch(t.label, c)));
       if (ti >= 0) {
         dbg.matched = { groupIndex: gi, tabIndex: ti, label: tabs[ti].label };
-        if (gi < FOCUS_GROUP_CMDS.length) {
-          await vscode.commands.executeCommand(FOCUS_GROUP_CMDS[gi]);
-        }
-        if (ti < 9) {
-          await vscode.commands.executeCommand(`workbench.action.openEditorAtIndex${ti + 1}`);
-          dbg.action = "openEditorAtIndex" + (ti + 1);
-        } else {
-          // beyond index 9 there is no direct command: jump to the first tab and step.
-          await vscode.commands.executeCommand("workbench.action.openEditorAtIndex1");
-          for (let k = 0; k < ti; k++) {
-            await vscode.commands.executeCommand("workbench.action.nextEditorInGroup");
-          }
-          dbg.action = "step-to-" + ti;
-        }
+        dbg.action = await focusTab(gi, ti);
         writeTabDebug(dbg);
         return;
       }
@@ -3907,6 +4008,11 @@ function asView(arg?: SessionView): SessionView | undefined {
   };
 }
 
+// Absolute path of the claude CLI, resolved at activation (claudeBinary.ts);
+// the remote path awaits `claudeBinary` and refuses to resume without it.
+let claudeBinaryPath: string | undefined;
+let claudeBinary: Promise<string | undefined> | undefined;
+
 function resumeInTerminal(arg: SessionView, opts: { show?: boolean } = {}): void {
   const v = asView(arg);
   if (!v || !v.capabilities.resume) {
@@ -3924,7 +4030,7 @@ function resumeInTerminal(arg: SessionView, opts: { show?: boolean } = {}): void
   const term = vscode.window.createTerminal({
     name: `${providerLabel(v.provider)} · ${truncate(v.title, 32)}`,
     cwd: v.cwd,
-    shellPath: v.provider === "codex" ? codexExecutable : "claude",
+    shellPath: v.provider === "codex" ? codexExecutable : claudeBinaryPath ?? "claude",
     shellArgs:
       v.provider === "codex"
         ? ["resume", v.sessionId]
@@ -3986,45 +4092,55 @@ function activateEditorApp(): Promise<void> {
   });
 }
 
-/** True if VS Code (Electron) is the frontmost app, so keystrokes will land in it. */
-function isEditorFrontmost(): Promise<boolean> {
-  if (process.platform !== "darwin") return Promise.resolve(true);
-  return new Promise((res) => {
-    execFile(
-      "osascript",
-      ["-e", 'tell application "System Events" to name of first process whose frontmost is true'],
-      { timeout: 4000 },
-      (err, stdout) => {
-        if (err) {
-          res(false);
-          return;
-        }
-        const n = String(stdout).trim().toLowerCase();
-        res(n.includes("code") || n.includes("electron") || n.includes("visual studio"));
-      },
-    );
-  });
+/** True when this VS Code window has OS focus: VS Code is the frontmost app and this is its focused window. */
+function windowFocused(): boolean {
+  return vscode.window.state?.focused === true;
 }
+
+/** Bundle identifiers keystrokes may land in (the typing osascript checks the frontmost app against them). */
+const VSCODE_BUNDLE_IDS = ["com.microsoft.VSCode", "com.microsoft.VSCodeInsiders"];
 
 function appleStr(s: string): string {
   return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 }
 
 /**
- * Types `text` into the focused element and presses Return, via System Events.
- * `submitDelayMs` (default 150) is the pause between the keystroke and Return —
- * slash commands (e.g. "/model ...") pop an autocomplete widget, so callers
- * that type one should pass a longer delay (500ms) to let it settle first.
+ * Types `text` into the focused element and presses Return, via System Events,
+ * in one osascript run that first checks the frontmost app's bundle identifier:
+ * anything but VS Code (or Insiders) aborts before the first keystroke
+ * (`notFrontmost`). `submitDelayMs` (default 150) is the pause between the
+ * keystroke and Return — slash commands (e.g. "/model ...") pop an autocomplete
+ * widget, so callers that type one should pass a longer delay (500ms).
  */
-function typeAndSubmit(text: string, submitDelayMs = 150): Promise<{ ok: boolean; err?: string }> {
+function typeAndSubmit(
+  text: string,
+  submitDelayMs = 150,
+): Promise<{ ok: true } | { ok: false; notFrontmost: boolean; err: string }> {
   return new Promise((res) => {
     const delaySec = (Math.max(0, submitDelayMs) / 1000).toString();
-    const lines = ['tell application "System Events"', `keystroke ${appleStr(text)}`, `delay ${delaySec}`, "key code 36", "end tell"];
+    const lines = [
+      'tell application "System Events"',
+      "try",
+      "set b to bundle identifier of first process whose frontmost is true",
+      "on error",
+      'set b to ""',
+      "end try",
+      `if b is not in {${VSCODE_BUNDLE_IDS.map(appleStr).join(", ")}} then return "not-frontmost"`,
+      `keystroke ${appleStr(text)}`,
+      `delay ${delaySec}`,
+      "key code 36",
+      "end tell",
+      'return "typed"',
+    ];
     const args: string[] = [];
     for (const l of lines) args.push("-e", l);
-    execFile("osascript", args, { timeout: 8000 }, (err, _o, stderr) => {
-      if (err) res({ ok: false, err: String(stderr || err) });
-      else res({ ok: true });
+    // A long text takes a while to type; never cut it off halfway.
+    const timeout = Math.max(8000, 4000 + text.length * 15);
+    execFile("osascript", args, { timeout }, (err, stdout, stderr) => {
+      const out = String(stdout ?? "").trim();
+      if (err) res({ ok: false, notFrontmost: false, err: String(stderr || err) });
+      else if (out === "typed") res({ ok: true });
+      else res({ ok: false, notFrontmost: true, err: `frontmost app is not VS Code (${out || "no answer"})` });
     });
   });
 }

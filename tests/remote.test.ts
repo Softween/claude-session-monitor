@@ -1,20 +1,28 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BACKOFF_MAX_MS,
   BUCKET_MAP,
+  COMMAND_MAX_AGE_MS,
+  COMMAND_TIMEOUT_MS,
   LAST_TEXT_MAX_BYTES,
   MACHINE_SAMPLE_MS,
+  MAX_COMMANDS_PER_POLL,
+  MAX_RESPONSE_BYTES,
   availableMemoryMb,
   buildSnapshot,
   checkRemoteUrl,
   clipBytes,
+  commandRefusal,
   freePctFromMemoryPressure,
   originMatches,
   parseStoredToken,
   nextBackoff,
+  readCappedBody,
+  redactSecrets,
   sampleMachine,
   shouldPush,
   snapshotHash,
+  withTimeout,
   type FleetMachine,
   type SnapshotAccountInput,
 } from "../src/remote";
@@ -309,17 +317,143 @@ describe("freePctFromMemoryPressure", () => {
 });
 
 describe("sampleMachine", () => {
-  it("measures at most once per 15 s and always passes pressure and sessions through", () => {
+  it("measures at most once per 15 s and always passes pressure and sessions through", async () => {
     expect(MACHINE_SAMPLE_MS).toBe(15_000);
     let calls = 0;
     const measure = () => ({ cpuPct: 10, memFreeMb: 1000 + ++calls, memTotalMb: 24576 });
     const t0 = 1_000_000_000_000;
-    expect(sampleMachine("normal", 1, t0, measure)).toEqual({ cpuPct: 10, memFreeMb: 1001, memTotalMb: 24576, pressure: "normal", sessions: 1 });
-    expect(sampleMachine("warn", 2, t0 + MACHINE_SAMPLE_MS - 1, measure)).toEqual({ cpuPct: 10, memFreeMb: 1001, memTotalMb: 24576, pressure: "warn", sessions: 2 });
+    expect(await sampleMachine("normal", 1, t0, measure)).toEqual({ cpuPct: 10, memFreeMb: 1001, memTotalMb: 24576, pressure: "normal", sessions: 1 });
+    expect(await sampleMachine("warn", 2, t0 + MACHINE_SAMPLE_MS - 1, measure)).toEqual({ cpuPct: 10, memFreeMb: 1001, memTotalMb: 24576, pressure: "warn", sessions: 2 });
     expect(calls).toBe(1);
-    expect(sampleMachine(null, 0, t0 + MACHINE_SAMPLE_MS, measure).memFreeMb).toBe(1002);
+    expect((await sampleMachine(null, 0, t0 + MACHINE_SAMPLE_MS, measure)).memFreeMb).toBe(1002);
     // A clock that moved back takes a new reading instead of trusting one from the future.
-    expect(sampleMachine(null, 0, t0, measure).memFreeMb).toBe(1003);
+    expect((await sampleMachine(null, 0, t0, measure)).memFreeMb).toBe(1003);
     expect(calls).toBe(3);
+  });
+
+  it("awaits an async measurement", async () => {
+    const t0 = 2_000_000_000_000;
+    const measure = async () => ({ cpuPct: 20, memFreeMb: 2048, memTotalMb: 8192 });
+    expect(await sampleMachine("normal", 3, t0, measure)).toEqual({ cpuPct: 20, memFreeMb: 2048, memTotalMb: 8192, pressure: "normal", sessions: 3 });
+  });
+});
+
+// Built at runtime so no token-shaped literal sits in the repository.
+const fake = {
+  anthropic: "sk-ant-" + "api03-" + "Ab1".repeat(10),
+  github: "ghp_" + "Zx9".repeat(12),
+  slack: "xoxb-" + "1234-5678-" + "abcdEFGH".repeat(2),
+  aws: "AKIA" + "Q7".repeat(8),
+  keyHeader: "-----BEGIN " + "RSA PRIVATE KEY" + "-----",
+  hex: "0123456789abcdef".repeat(3),
+  base64: "Qm9" + "aGVsbG8gd29ybGQK".repeat(3) + "==",
+};
+
+describe("redactSecrets", () => {
+  it("replaces keys, tokens and private-key headers", () => {
+    expect(redactSecrets(`key ${fake.anthropic} end`)).toBe("key [redacted] end");
+    expect(redactSecrets(`token=${fake.github}`)).toBe("token=[redacted]");
+    expect(redactSecrets(`slack ${fake.slack}`)).toBe("slack [redacted]");
+    expect(redactSecrets(`aws ${fake.aws}.`)).toBe("aws [redacted].");
+    expect(redactSecrets(`${fake.keyHeader} body`)).toBe("[redacted] body");
+  });
+
+  it("replaces 40+ character hex runs and mixed base64 runs", () => {
+    expect(redactSecrets(`sha ${fake.hex}`)).toBe("sha [redacted]");
+    expect(redactSecrets("a".repeat(40))).toBe("[redacted]"); // any 40+ hex run, even a dull one
+    expect(redactSecrets(`blob ${fake.base64} tail`)).toBe("blob [redacted] tail");
+  });
+
+  it("leaves ordinary text, short ids and digit-free paths alone", () => {
+    for (const ok of [
+      "fix the login bug in src/auth/login.ts",
+      "commit 3f2a9c1 and issue #12",
+      "/Users/bilalsengul/Developer/REPOS/tools/claude-session-monitor",
+      "x".repeat(60),
+      "0123456789abcdef".repeat(2),
+    ]) {
+      expect(redactSecrets(ok)).toBe(ok);
+    }
+  });
+});
+
+describe("buildSnapshot redaction", () => {
+  it("redacts the title, the last text and the closing text before they are uploaded", () => {
+    const b = buildSnapshot({
+      host: "mac",
+      rows: [row({ title: `use ${fake.github} here`, notifMessage: `paste ${fake.anthropic}`, closing: { kind: "done", text: `done ${fake.aws}` } })],
+      accounts,
+      machine,
+      now: 1,
+    });
+    expect(b.sessions[0].title).toBe("use [redacted] here");
+    expect(b.sessions[0].lastText).toBe("paste [redacted]");
+    expect(b.sessions[0].closing).toEqual({ kind: "done", text: "done [redacted]" });
+    expect(JSON.stringify(b)).not.toContain(fake.github);
+  });
+});
+
+describe("commandRefusal", () => {
+  const now = 1_800_000_000_000;
+  it("answers every command when commands are off, before the expiry check", () => {
+    expect(commandRefusal(now, now, false)).toBe("remote commands disabled on this Mac");
+    expect(commandRefusal(undefined, now, false)).toBe("remote commands disabled on this Mac");
+  });
+  it("lets a command younger than 2 minutes run and expires an older or undated one", () => {
+    expect(COMMAND_MAX_AGE_MS).toBe(120_000);
+    expect(commandRefusal(now, now, true)).toBeNull();
+    expect(commandRefusal(now - 120_000, now, true)).toBeNull();
+    expect(commandRefusal(now - 120_001, now, true)).toBe("expired");
+    for (const bad of [undefined, null, "1800000000000", Number.NaN, Number.NEGATIVE_INFINITY]) {
+      expect(commandRefusal(bad, now, true)).toBe("expired");
+    }
+  });
+});
+
+describe("withTimeout", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+  it("passes a prompt answer through", async () => {
+    expect(await withTimeout(Promise.resolve("done"), 50, "late")).toBe("done");
+  });
+  it("answers the fallback once the time is up", async () => {
+    vi.useFakeTimers();
+    expect(COMMAND_TIMEOUT_MS).toBe(60_000);
+    const p = withTimeout(new Promise<string>(() => undefined), COMMAND_TIMEOUT_MS, "timed out");
+    await vi.advanceTimersByTimeAsync(COMMAND_TIMEOUT_MS);
+    expect(await p).toBe("timed out");
+  });
+  it("passes a rejection through", async () => {
+    await expect(withTimeout(Promise.reject(new Error("boom")), 50, "late")).rejects.toThrow("boom");
+  });
+});
+
+describe("readCappedBody", () => {
+  const res = (body: string, contentLength: string | null) => {
+    let read = false;
+    return {
+      headers: { get: (n: string) => (n.toLowerCase() === "content-length" ? contentLength : null) },
+      text: async () => {
+        read = true;
+        return body;
+      },
+      wasRead: () => read,
+    };
+  };
+  it("returns a body within the cap", async () => {
+    expect(MAX_RESPONSE_BYTES).toBe(256 * 1024);
+    expect(MAX_COMMANDS_PER_POLL).toBe(20);
+    expect(await readCappedBody(res('{"success":true}', "16"))).toBe('{"success":true}');
+    expect(await readCappedBody(res("x".repeat(MAX_RESPONSE_BYTES), null))).toHaveLength(MAX_RESPONSE_BYTES);
+  });
+  it("refuses a declared length over 256 KB without reading the body", async () => {
+    const r = res("{}", String(MAX_RESPONSE_BYTES + 1));
+    await expect(readCappedBody(r)).rejects.toThrow("too large");
+    expect(r.wasRead()).toBe(false);
+  });
+  it("refuses a body over 256 KB that did not declare it (bytes, not characters)", async () => {
+    await expect(readCappedBody(res("x".repeat(MAX_RESPONSE_BYTES + 1), null))).rejects.toThrow("too large");
+    await expect(readCappedBody(res("ş".repeat(MAX_RESPONSE_BYTES / 2 + 1), "garbage"))).rejects.toThrow("too large");
   });
 });

@@ -3,7 +3,7 @@
  * snapshot pushed to `<url>/fleet/ingest`, its change hash, and the push /
  * backoff timing. Wire format: API contract v1 (`POST /fleet/ingest`).
  */
-import { spawnSync } from "child_process";
+import { execFile } from "child_process";
 import { createHash } from "crypto";
 import * as os from "os";
 import { parseResetToEpoch } from "./core";
@@ -37,6 +37,10 @@ export const HEARTBEAT_MS = 120_000;
 export const BACKOFF_MIN_MS = 2_000;
 export const BACKOFF_MAX_MS = 60_000;
 export const MACHINE_SAMPLE_MS = 15_000;
+export const COMMAND_MAX_AGE_MS = 120_000;
+export const COMMAND_TIMEOUT_MS = 60_000;
+export const MAX_COMMANDS_PER_POLL = 20;
+export const MAX_RESPONSE_BYTES = 256 * 1024;
 
 export interface FleetGauge { key: string; label: string; pct: number; resetMs: number | null }
 
@@ -118,6 +122,29 @@ export function clipBytes(s: string, maxBytes: number): string {
   return out + "…";
 }
 
+// Secret-looking substrings never leave the machine in uploaded text.
+const SECRET_PATTERNS: RegExp[] = [
+  /sk-ant-[A-Za-z0-9_-]{8,}/g,
+  /ghp_[A-Za-z0-9]{20,}/g,
+  /xox[bpa]-[A-Za-z0-9-]{10,}/g,
+  /AKIA[A-Z0-9]{12,}/g,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/g,
+  /\b[A-Fa-f0-9]{40,}\b/g,
+];
+const BASE64_RUN = /[A-Za-z0-9+\/_-]{40,}={0,2}/g;
+
+/**
+ * Replace API keys, tokens, private-key headers, 40+ character hex runs and
+ * 40+ character base64 runs with `[redacted]`. A base64 run counts only when it
+ * mixes digits with lower- and upper-case letters, so long plain words and
+ * paths without digits stay readable.
+ */
+export function redactSecrets(s: string): string {
+  let out = s;
+  for (const re of SECRET_PATTERNS) out = out.replace(re, "[redacted]");
+  return out.replace(BASE64_RUN, (m) => (/\d/.test(m) && /[a-z]/.test(m) && /[A-Z]/.test(m) ? "[redacted]" : m));
+}
+
 function sessionOf(v: SessionView, nowSec: number, activeEmail: string | null): FleetSession {
   const bucket = BUCKET_MAP[groupOf(v)];
   // The row keeps no assistant reply text; the most recent human-readable line it has
@@ -127,7 +154,7 @@ function sessionOf(v: SessionView, nowSec: number, activeEmail: string | null): 
   return {
     id: v.sessionId,
     provider: v.provider,
-    title: clipBytes(v.title, 512),
+    title: clipBytes(redactSecrets(v.title), 512),
     bucket,
     model: v.model ?? null,
     effort: v.effort ?? null,
@@ -135,8 +162,8 @@ function sessionOf(v: SessionView, nowSec: number, activeEmail: string | null): 
     project: v.cwdLabel ?? (v.cwd ? v.cwd.split(/[\\/]/).filter(Boolean).pop() ?? null : null),
     pid: typeof v.pid === "number" ? v.pid : null,
     lastActivityTs: v.lastActivityMs ? Math.floor(v.lastActivityMs / 1000) : null,
-    lastText: text ? clipBytes(text, LAST_TEXT_MAX_BYTES) : null,
-    closing: v.closing ? { kind: v.closing.kind, text: clipBytes(v.closing.text, 512) } : null,
+    lastText: text ? clipBytes(redactSecrets(text), LAST_TEXT_MAX_BYTES) : null,
+    closing: v.closing ? { kind: v.closing.kind, text: clipBytes(redactSecrets(v.closing.text), 512) } : null,
     limit: bucket === "limited" ? { resetText: v.resetText ?? null, resetTs } : null,
     canResume: !!v.capabilities?.resume,
     tokens: typeof v.tokens === "number" ? { ctxPct: null, total: v.tokens } : null,
@@ -248,10 +275,11 @@ export function freePctFromMemoryPressure(text: string): number | null {
   return pct >= 0 && pct <= 100 ? pct : null;
 }
 
-/** stdout of a short macOS tool run, or null when it fails or runs past 1 s. */
-function runTool(cmd: string): string | null {
-  const r = spawnSync(cmd, [], { encoding: "utf8", timeout: 1000 });
-  return !r.error && r.status === 0 ? r.stdout : null;
+/** stdout of a short tool run (async execFile), or null when it fails or runs past `timeoutMs`. */
+export function runTool(cmd: string, args: string[] = [], timeoutMs = 1000): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { encoding: "utf8", timeout: timeoutMs }, (err, stdout) => resolve(err ? null : String(stdout)));
+  });
 }
 
 /**
@@ -259,11 +287,11 @@ function runTool(cmd: string): string | null {
  * a busy Mac), so darwin takes the system-wide free percentage from `memory_pressure`, then
  * free + inactive + speculative + purgeable pages from `vm_stat`, then `os.freemem()`.
  */
-function freeMemoryMb(totalMb: number): number {
+async function freeMemoryMb(totalMb: number): Promise<number> {
   if (process.platform === "darwin") {
-    const pct = freePctFromMemoryPressure(runTool("/usr/bin/memory_pressure") ?? "");
+    const pct = freePctFromMemoryPressure((await runTool("/usr/bin/memory_pressure")) ?? "");
     if (pct !== null) return Math.round((totalMb * pct) / 100);
-    const available = availableMemoryMb(runTool("vm_stat") ?? "", totalMb);
+    const available = availableMemoryMb((await runTool("vm_stat")) ?? "", totalMb);
     if (available !== null) return available;
   }
   return Math.round(os.freemem() / 1048576);
@@ -272,12 +300,12 @@ function freeMemoryMb(totalMb: number): number {
 type MachineReading = Pick<FleetMachine, "cpuPct" | "memFreeMb" | "memTotalMb">;
 let machineCache: { at: number; value: MachineReading } | null = null;
 
-function measureMachine(): MachineReading {
+async function measureMachine(): Promise<MachineReading> {
   const cpus = Math.max(1, os.cpus().length);
   const memTotalMb = Math.round(os.totalmem() / 1048576);
   return {
     cpuPct: Math.min(100, Math.round((os.loadavg()[0] / cpus) * 100)),
-    memFreeMb: freeMemoryMb(memTotalMb),
+    memFreeMb: await freeMemoryMb(memTotalMb),
     memTotalMb,
   };
 }
@@ -287,15 +315,47 @@ function measureMachine(): MachineReading {
  * panel poll (~1.5 s), so a reading is reused for MACHINE_SAMPLE_MS (taken again if the clock
  * moved back); `pressure` and `sessions` always pass through. `now` / `measure`: test seams.
  */
-export function sampleMachine(
+export async function sampleMachine(
   pressure: string | null,
   sessions: number,
   now = Date.now(),
-  measure: () => MachineReading = measureMachine,
-): FleetMachine {
+  measure: () => MachineReading | Promise<MachineReading> = measureMachine,
+): Promise<FleetMachine> {
   let c = machineCache;
-  if (!c || now < c.at || now - c.at >= MACHINE_SAMPLE_MS) c = machineCache = { at: now, value: measure() };
+  if (!c || now < c.at || now - c.at >= MACHINE_SAMPLE_MS) c = machineCache = { at: now, value: await measure() };
   return { ...c.value, pressure, sessions };
+}
+
+/**
+ * Why a relay command must not run, or null to run it: commands are switched off
+ * on this Mac (`remote.acceptCommands`), or the command is older than 2 min. A
+ * command without a numeric `createdAt` counts as expired.
+ */
+export function commandRefusal(createdAt: unknown, now: number, acceptCommands: boolean): string | null {
+  if (!acceptCommands) return "remote commands disabled on this Mac";
+  const age = typeof createdAt === "number" && Number.isFinite(createdAt) ? now - createdAt : NaN;
+  return age <= COMMAND_MAX_AGE_MS ? null : "expired";
+}
+
+/** `p`, or `fallback` once `ms` pass without an answer. The work itself is not cancelled. */
+export function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(fallback), ms);
+  });
+  return Promise.race([p, late]).finally(() => clearTimeout(timer));
+}
+
+/** A relay response's body text, refused above `max` bytes by its content-length header or by its size. */
+export async function readCappedBody(
+  res: { headers: { get(name: string): string | null }; text(): Promise<string> },
+  max = MAX_RESPONSE_BYTES,
+): Promise<string> {
+  const declared = Number(res.headers.get("content-length"));
+  if (declared > max) throw new Error(`relay response too large (${declared} bytes)`);
+  const text = await res.text();
+  if (Buffer.byteLength(text, "utf8") > max) throw new Error("relay response too large");
+  return text;
 }
 
 /** `sysctl kern.memorystatus_vm_pressure_level` value -> label (macOS: 1 normal, 2 warn, 4 critical). */

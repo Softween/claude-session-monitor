@@ -53,6 +53,12 @@ describe("resolveTarget", () => {
     expect(resolveTarget(recs, undefined, "abc")).toMatchObject({ ok: false, code: "target" });
     expect(resolveTarget(recs, 9)).toMatchObject({ ok: false, code: "target" });
   });
+  it("with a pid and a session id, accepts only the record running that exact session", () => {
+    expect(resolveTarget(recs, 2, "abc222")).toEqual(recs[1]);
+    expect(resolveTarget(recs, 2, "abc111")).toMatchObject({ ok: false, code: "target" });
+    expect(resolveTarget(recs, 2, "abc2")).toMatchObject({ ok: false, code: "target" }); // no prefix through the pid either
+    expect(resolveTarget([{ pid: 3 }], 3, "abc333")).toMatchObject({ ok: false, code: "target" });
+  });
 });
 
 describe("sendToSession over a real Unix socket", () => {

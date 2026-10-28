@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.23.5",
+  "version": "2.24.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -27,7 +27,8 @@
         "claudeSessionMonitor.autoResumeAfterReset",
         "claudeSessionMonitor.trackAllAccounts",
         "claudeSessionMonitor.remote.url",
-        "claudeSessionMonitor.remote.host"
+        "claudeSessionMonitor.remote.host",
+        "claudeSessionMonitor.remote.typeFallback"
       ]
     }
   },
@@ -456,6 +457,18 @@
           "scope": "application",
           "default": "",
           "markdownDescription": "Name this machine reports to the remote bridge. Empty uses the OS host name."
+        },
+        "claudeSessionMonitor.remote.acceptCommands": {
+          "type": "boolean",
+          "scope": "application",
+          "default": true,
+          "markdownDescription": "Run the commands the remote bridge receives (`resume`, `send`, `kill`, `resumeAll`, `switchAccount`). Off is a kill switch: the session snapshot is still uploaded, but every command is answered with `remote commands disabled on this Mac` and nothing runs."
+        },
+        "claudeSessionMonitor.remote.typeFallback": {
+          "type": "boolean",
+          "scope": "application",
+          "default": true,
+          "markdownDescription": "Let a remote `send` or `resume` switch to a session's Claude Code tab and type into it (macOS keystrokes) when the session has no VS Code terminal here. Only when this VS Code window is focused (VS Code is never brought to the front), the tab is the window's one tab matching the session title (Claude Code's truncated labels included, never one another session's title matches too) and VS Code is still the frontmost app at the keystroke; otherwise `send` goes to the session's inbox. Off never types."
         }
       }
     },

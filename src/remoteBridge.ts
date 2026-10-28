@@ -12,15 +12,20 @@ import * as vscode from "vscode";
 import type { PeerSendResult } from "./peerSend";
 import type { SessionView } from "./providers/types";
 import {
+  COMMAND_TIMEOUT_MS,
+  MAX_COMMANDS_PER_POLL,
   buildSnapshot,
   checkRemoteUrl,
+  commandRefusal,
   originMatches,
   parseStoredToken,
   nextBackoff,
   pressureLabel,
+  readCappedBody,
   sampleMachine,
   shouldPush,
   snapshotHash,
+  withTimeout,
   type SnapshotAccountInput,
 } from "./remote";
 
@@ -42,9 +47,14 @@ export interface FleetCommand {
 
 export interface CommandOutcome { ok: boolean; message: string }
 
-export type TypedResult = { ok: true; via?: "terminal" | "typed" } | { ok: false; reason: string; detail: string };
+/**
+ * One remote delivery path's answer. `skip`: the path does not apply here and
+ * nothing was written or typed, so the next path may run. Any other failure is
+ * final: the command stops there and never reaches a second path.
+ */
+export type PathAttempt = { ok: true } | { ok: false; skip: boolean; reason: string; detail?: string };
 
-const TYPED_REASON: Record<string, string> = {
+export const TYPED_REASON: Record<string, string> = {
   "not-frontmost": "VS Code not frontmost (Mac locked or another app in front)",
   "tab-mismatch": "the session's tab could not be made active",
   accessibility: "macOS Accessibility permission missing for VS Code",
@@ -53,32 +63,41 @@ const TYPED_REASON: Record<string, string> = {
 };
 
 /**
- * Remote `send`: the uds-messaging inbox first (works without focus), then, when
- * that is not confirmed in the transcript (any failed result, `unconfirmed`
- * included, or a throw), type the text into that session's tab. The result names
- * the path that delivered it ("uds" / "typed") or why both failed.
+ * Remote `send`: exactly one delivery path, tried in this order: (a) the VS Code
+ * terminal that hosts the session, (b) keystrokes into the session's Claude tab
+ * (only when VS Code is frontmost and that tab is active), (c) the session's
+ * uds-messaging inbox. The first path that applies ends the command, whatever
+ * its result (a rejected input included). The inbox is last, so nothing is ever
+ * typed after it accepted a frame; `unconfirmed` is an accepted frame that the
+ * session has not shown yet, reported as pending.
  */
 export async function deliverText(o: {
+  terminal: () => Promise<PathAttempt>;
+  typed: () => Promise<PathAttempt>;
   uds: () => Promise<PeerSendResult>;
-  typed: () => Promise<TypedResult>;
 }): Promise<CommandOutcome> {
-  let udsWhy: string;
-  try {
-    const r = await o.uds();
-    if (r.ok) return { ok: true, message: `delivered via uds (${r.confirmed}, msg_id ${r.msgId})` };
-    udsWhy = `${r.code}: ${r.error}`;
-  } catch (e) {
-    udsWhy = `error: ${String(e)}`;
+  const skipped: string[] = [];
+  for (const [via, run] of [["terminal", o.terminal], ["typed", o.typed]] as const) {
+    let r: PathAttempt;
+    try {
+      r = await run();
+    } catch (e) {
+      r = { ok: false, skip: false, reason: "error", detail: String(e) };
+    }
+    if (r.ok) return { ok: true, message: `delivered via ${via}` };
+    const why = r.detail ? `${r.reason} (${r.detail})` : r.reason;
+    if (!r.skip) return { ok: false, message: `not delivered via ${via}: ${why}` };
+    skipped.push(`${via}: ${why}`);
   }
-  let typed: TypedResult;
+  let r: PeerSendResult;
   try {
-    typed = await o.typed();
+    r = await o.uds();
   } catch (e) {
-    typed = { ok: false, reason: "keystroke", detail: String(e) };
+    return { ok: false, message: `not delivered: ${skipped.join("; ")}; inbox error: ${String(e)}` };
   }
-  if (typed.ok) return { ok: true, message: `delivered via ${typed.via ?? "typed"} (uds ${udsWhy})` };
-  const why = TYPED_REASON[typed.reason] ?? typed.reason;
-  return { ok: false, message: `not delivered: uds ${udsWhy}; typed failed: ${why} (${typed.detail})` };
+  if (r.ok) return { ok: true, message: `delivered via inbox (${r.confirmed}, msg_id ${r.msgId})` };
+  if (r.code === "unconfirmed") return { ok: true, message: "delivered via inbox (pending in the session)" };
+  return { ok: false, message: `not delivered: ${skipped.join("; ")}; inbox ${r.code}: ${r.error}` };
 }
 
 export interface RemoteBridgeDeps {
@@ -171,6 +190,14 @@ export class RemoteBridge implements vscode.Disposable {
     if (!cfg || this.pushInflight) return;
     const now = Date.now();
     if (now < this.pushRetryAt) return;
+    // One snapshot at a time: the machine sample is async, then the push.
+    this.pushInflight = true;
+    void this.push(cfg, rows, now).finally(() => {
+      this.pushInflight = false;
+    });
+  }
+
+  private async push(cfg: BridgeCfg, rows: SessionView[], now: number): Promise<void> {
     this.samplePressure(now);
     let body;
     try {
@@ -180,34 +207,29 @@ export class RemoteBridge implements vscode.Disposable {
         rows,
         accounts,
         bestAccountId: bestId,
-        machine: sampleMachine(this.pressure, rows.length),
+        machine: await sampleMachine(this.pressure, rows.length),
         now,
       });
     } catch (e) {
       this.fail("snapshot failed: " + String(e));
       return;
     }
+    if (this.cfg !== cfg) return;
     const hash = snapshotHash(body);
     if (!shouldPush({ changed: hash !== this.lastHash, lastPushTs: this.lastPushTs, now })) return;
-    this.pushInflight = true;
-    const signal = this.stop?.signal;
-    this.request(cfg, "POST", "/fleet/ingest", body, REQUEST_TIMEOUT_MS, signal)
-      .then(() => {
-        if (this.cfg !== cfg) return;
-        this.lastHash = hash;
-        this.lastPushTs = Date.now();
-        this.pushBackoff = 0;
-        this.pushRetryAt = 0;
-      })
-      .catch((e) => {
-        if (this.cfg !== cfg) return;
-        this.pushBackoff = nextBackoff(this.pushBackoff);
-        this.pushRetryAt = Date.now() + this.pushBackoff;
-        this.fail(`push failed (retry in ${this.pushBackoff / 1000}s): ${String(e)}`);
-      })
-      .finally(() => {
-        this.pushInflight = false;
-      });
+    try {
+      await this.request(cfg, "POST", "/fleet/ingest", body, REQUEST_TIMEOUT_MS, this.stop?.signal);
+      if (this.cfg !== cfg) return;
+      this.lastHash = hash;
+      this.lastPushTs = Date.now();
+      this.pushBackoff = 0;
+      this.pushRetryAt = 0;
+    } catch (e) {
+      if (this.cfg !== cfg) return;
+      this.pushBackoff = nextBackoff(this.pushBackoff);
+      this.pushRetryAt = Date.now() + this.pushBackoff;
+      this.fail(`push failed (retry in ${this.pushBackoff / 1000}s): ${String(e)}`);
+    }
   }
 
   status(): string {
@@ -271,7 +293,7 @@ export class RemoteBridge implements vscode.Disposable {
         if (signal.aborted) return;
         this.lastPollTs = Date.now();
         backoff = 0;
-        const commands = Array.isArray(data?.commands) ? data!.commands : [];
+        const commands = Array.isArray(data?.commands) ? data!.commands.slice(0, MAX_COMMANDS_PER_POLL) : [];
         for (const cmd of commands) {
           if (signal.aborted) return;
           await this.runCommand(cfg, cmd, signal);
@@ -289,11 +311,18 @@ export class RemoteBridge implements vscode.Disposable {
 
   private async runCommand(cfg: BridgeCfg, cmd: FleetCommand, signal: AbortSignal): Promise<void> {
     if (!cmd || typeof cmd.id !== "string" || !cmd.id) return;
+    // The kill switch and the 2 min expiry answer before any action runs; a command
+    // that runs gets 60 s, then its result says "timed out" and the loop moves on.
+    const refusal = commandRefusal(cmd.createdAt, Date.now(), remoteFlag("remote.acceptCommands"));
     let out: CommandOutcome;
-    try {
-      out = await this.deps.execute(cmd);
-    } catch (e) {
-      out = { ok: false, message: String(e) };
+    if (refusal) {
+      out = { ok: false, message: refusal };
+    } else {
+      try {
+        out = await withTimeout(this.deps.execute(cmd), COMMAND_TIMEOUT_MS, { ok: false, message: "timed out" });
+      } catch (e) {
+        out = { ok: false, message: String(e) };
+      }
     }
     this.deps.log(`remote: command ${cmd.type} ${cmd.id.slice(0, 8)} -> ${out.ok ? "ok" : "failed"}: ${out.message}`);
     try {
@@ -310,7 +339,10 @@ export class RemoteBridge implements vscode.Disposable {
     }
   }
 
-  /** One JSON request with a timeout; resolves the envelope's `data`, throws on HTTP or envelope errors. */
+  /**
+   * One JSON request with a timeout; resolves the envelope's `data`, throws on HTTP
+   * or envelope errors, on any redirect and on a body over 256 KB.
+   */
   private async request(
     cfg: BridgeCfg,
     method: "GET" | "POST",
@@ -333,8 +365,15 @@ export class RemoteBridge implements vscode.Disposable {
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: ac.signal,
+        redirect: "error",
       });
-      const text = await res.text();
+      let text: string;
+      try {
+        text = await readCappedBody(res);
+      } catch (e) {
+        ac.abort(); // drop the rest of an oversized body
+        throw e;
+      }
       if (!res.ok) throw new HttpError(res.status, text);
       let json: { success?: boolean; data?: unknown; error?: { message?: string } };
       try {
@@ -358,6 +397,12 @@ export class RemoteBridge implements vscode.Disposable {
 export function remoteSetting(key: "remote.url" | "remote.host"): string {
   const v = vscode.workspace.getConfiguration("claudeSessionMonitor").inspect<string>(key)?.globalValue;
   return typeof v === "string" ? v.trim() : "";
+}
+
+/** A boolean remote setting, user (global) value only like remote.url; unset means on. */
+export function remoteFlag(key: "remote.acceptCommands" | "remote.typeFallback"): boolean {
+  const v = vscode.workspace.getConfiguration("claudeSessionMonitor").inspect<boolean>(key)?.globalValue;
+  return typeof v === "boolean" ? v : true;
 }
 
 /** Register the bridge, its two commands and its lifecycle hooks; returns the bridge for the poll cycle. */
@@ -397,7 +442,10 @@ export function registerRemoteBridge(ctx: vscode.ExtensionContext, deps: RemoteB
       if (e.key === REMOTE_TOKEN_KEY) void bridge.restart();
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("claudeSessionMonitor.remote")) void bridge.restart();
+      // acceptCommands / typeFallback are read per command and need no restart.
+      if (e.affectsConfiguration("claudeSessionMonitor.remote.url") || e.affectsConfiguration("claudeSessionMonitor.remote.host")) {
+        void bridge.restart();
+      }
     }),
   );
   void bridge.restart();

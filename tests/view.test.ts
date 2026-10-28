@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, parsePsOutput, subtreeTotals, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec, accountPillLabels, filterHistoryForAccount, topSessionRows, sortByTokens, claudePlanLabel, claudePlanTier, codexPlanLabel } from "../src/view";
+import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, labelsMatchStrict, truncatedLabel, TAB_TITLE_MAX, parsePsOutput, subtreeTotals, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec, accountPillLabels, filterHistoryForAccount, topSessionRows, sortByTokens, claudePlanLabel, claudePlanTier, codexPlanLabel } from "../src/view";
 import type { SessionView } from "../src/core";
 
 const v = (bucket: SessionView["bucket"], sub: string): SessionView =>
@@ -79,6 +79,59 @@ describe("normLabel / labelsMatch", () => {
     const candidates = ["<task-notification>ignored</task-notification>", "kontrol et detaylı rapor", "resume"];
     expect(candidates.some((c) => labelsMatch("kontrol et detaylı rapor…", c))).toBe(true);
     expect(candidates.some((c) => labelsMatch("totally unrelated tab", c))).toBe(false);
+  });
+});
+
+// Real tab labels from ~/.claude/session-monitor/tabs-debug.json and the ai-titles of their sessions.
+const REAL_TABS: Array<[title: string, label: string]> = [
+  ["Getfund.space affiliate modeli", "Getfund.space affiliate …"], // the space before the ellipsis stays
+  ["Meeting transcription software open source release", "Meeting transcription so…"],
+  ["Getfund.space veri seti", "Getfund.space veri seti"], // 25 characters or fewer: shown in full
+];
+
+describe("truncatedLabel", () => {
+  it("reproduces the Claude Code tab labels of real sessions", () => {
+    expect(TAB_TITLE_MAX).toBe(25);
+    for (const [title, label] of REAL_TABS) expect(truncatedLabel(title)).toBe(label);
+  });
+  it("shows 25 characters in full and cuts 26 to 24 plus the ellipsis", () => {
+    const t25 = "abcdefghij".repeat(2) + "klmno";
+    expect(truncatedLabel(t25)).toBe(t25);
+    expect(truncatedLabel(t25 + "p")).toBe("abcdefghij".repeat(2) + "klmn…");
+  });
+});
+
+describe("labelsMatchStrict", () => {
+  it("matches equal labels, ignoring case and whitespace runs only", () => {
+    expect(labelsMatchStrict("Glossgo başvuru takibi", "glossgo  başvuru\ntakibi ")).toBe(true);
+    expect(labelsMatchStrict("Kalan iş", "kalan iş")).toBe(true); // exactly 8 characters
+  });
+  it("matches a real truncated tab label to the title it was cut from", () => {
+    for (const [title, label] of REAL_TABS) expect(labelsMatchStrict(label, title)).toBe(true);
+    expect(labelsMatchStrict("Instagram hesap adı getf…", "Instagram hesap adı getfund.space")).toBe(true);
+  });
+  it("keeps the prefix hole closed", () => {
+    // a shorter title equal to the stem, and a 25-character one Claude Code would show in full
+    expect(labelsMatchStrict("Getfund.space affiliate …", "Getfund.space affiliate")).toBe(false);
+    expect(labelsMatchStrict("Getfund.space affiliate …", "Getfund.space affiliate m")).toBe(false);
+    // the stem ends with a space, so a title that goes on without one is a different cut
+    expect(labelsMatchStrict("Getfund.space affiliate …", "Getfund.space affiliatemodeli")).toBe(false);
+    // no prefix match without an ellipsis, either way
+    expect(labelsMatchStrict("Beauty service marketplace mekan", "Beauty service marketplace")).toBe(false);
+    expect(labelsMatchStrict("Beauty service marketplace", "Beauty service marketplace mekan")).toBe(false);
+    expect(labelsMatch("Getfund.space affiliate …", "Getfund.space affiliate")).toBe(true); // the panel stays loose
+  });
+  it("accepts a three-dot ellipsis as a longer title's prefix", () => {
+    expect(labelsMatchStrict("Fix the login bug...", "Fix the login bug in auth")).toBe(true);
+    expect(labelsMatchStrict("Fix the login bug...", "Fix the login bug")).toBe(false);
+    expect(labelsMatchStrict("Fix the login bug...", "Fix the signup bug in auth")).toBe(false);
+  });
+  it("needs a stem of 8+ characters and 8+ characters for an exact match", () => {
+    expect(labelsMatchStrict("Fix bug…", "Fix bug in the login flow of the app")).toBe(false);
+    expect(labelsMatchStrict("Fix bug...", "Fix bug in the login flow")).toBe(false);
+    expect(labelsMatchStrict("yap", "yap")).toBe(false);
+    expect(labelsMatchStrict("resume", "resume")).toBe(false);
+    expect(labelsMatchStrict("", "")).toBe(false);
   });
 });
 

@@ -66,6 +66,15 @@ def find_session_pid(provider):
         if provider == "claude":
             if "anthropic.claude-code" in low and "resources" in low:
                 return cur
+            # A claude started from a terminal: the executable itself (any path)
+            # or node running a script named claude. Exact and case-sensitive, so
+            # the desktop app's "Claude", claude-switch and other claude-* never match.
+            tokens = cmd.split(None, 2)
+            exe = os.path.basename(tokens[0]) if tokens else ""
+            if exe == "claude" or (
+                exe.startswith("node") and len(tokens) > 1 and os.path.basename(tokens[1]) == "claude"
+            ):
+                return cur
         elif provider == "codex":
             if "app-server" in low:
                 return None

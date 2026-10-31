@@ -792,6 +792,20 @@ describe("resolve / collectSessions branch coverage", () => {
     ], NOW - 7200);
     expect(collect([{ session_id: "mx", state: "idle", ts: NOW - 7200, cwd: "/repo", transcript_path: old }], { maxAgeSec: 3600 }).find((x) => x.sessionId === "mx")).toBeUndefined();
   });
+
+  it("a session this window resumed in a terminal takes that terminal's pid when its hook record has none", () => {
+    const p = writeTranscript("rs.jsonl", [
+      { type: "assistant", entrypoint: "cli", cwd: "/repo", message: { content: [{ type: "text", text: "bye" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 60) },
+    ]);
+    const ended: HookStatus = { session_id: "rs", state: "ended", ts: NOW - 50, cwd: "/repo", transcript_path: p };
+    const resumePids = new Map([["rs", 4242]]);
+    expect(collect([ended]).find((x) => x.sessionId === "rs")).toBeUndefined(); // ended: hidden by default
+    const v = collect([ended], { resumePids }).find((x) => x.sessionId === "rs");
+    expect(v).toMatchObject({ bucket: "attention", sub: "your turn", pid: 4242 });
+    expect(v?.capabilities.kill).toBe(true);
+    // A pid of the hook's own wins over the terminal's.
+    expect(collect([{ ...ended, state: "idle", pid: 777 }], { resumePids }).find((x) => x.sessionId === "rs")?.pid).toBe(777);
+  });
 });
 
 describe("parseClosingStatus", () => {

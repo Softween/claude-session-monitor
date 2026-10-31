@@ -27,6 +27,7 @@ import { sendToSession } from "./peerSend";
 import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, useStuck, type ActiveCandidate } from "./activeAccount";
 import { execFile } from "child_process";
 import { parseParentPid, pickSessionTerminal, pickUniqueLabel } from "./terminalMatch";
+import { ResumeRegistry, isClaudeCliCommand, isClaudeResumeCommand } from "./resumeRegistry";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import {
   KEYCHAIN_SERVICE,
@@ -2640,6 +2641,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           workspaceCwd: wsOnly ? workspaceCwd() : undefined,
           showEnded: c.get<boolean>("showEnded", false),
           closingMarkers: c.get<boolean>("closingStatusMarkers", false),
+          resumePids: resumeTerminals.livePids(),
         });
       } catch {
         claudeViews = [];
@@ -2815,9 +2817,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
   /**
    * Remote path (a): write `text` + Return straight into the VS Code terminal
    * that hosts the session (process-tree match first, else the one terminal
-   * named exactly like the session). No `show()`, no focus change: the user
-   * keeps working where they are. `skip` when no terminal here is the session's;
-   * the text must pass sanitizeRemoteLine before it is written.
+   * named exactly like the session, else the live terminal this window resumed
+   * it in, whose hook record may have no pid). No `show()`, no focus change: the
+   * user keeps working where they are. `skip` when no terminal here is the
+   * session's; the text must pass sanitizeRemoteLine before it is written.
    */
   async function sendToSessionTerminal(v: SessionView, text: string): Promise<PathAttempt> {
     if (v.provider !== "claude" || !v.capabilities.bulkInput) {
@@ -2833,6 +2836,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     } catch (e) {
       return { ok: false, skip: true, reason: "terminal lookup failed", detail: String(e) };
     }
+    if (!term) term = resumeTerminals.liveTerminalFor(v.sessionId);
     if (!term) return { ok: false, skip: true, reason: "no terminal for this session in this window" };
     const s = sanitizeRemoteLine(text);
     if (!s.ok) return { ok: false, skip: false, reason: s.reason };
@@ -3414,8 +3418,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
         if (!v) return { ok: false, message: `unknown session ${cmd.sessionId}` };
         if (!v.capabilities.resume) return { ok: false, message: "this provider cannot resume the session" };
         // An open session gets the word "resume" written into its own terminal
-        // (no tab switch, no focus change). Only a session with no terminal is
-        // reopened, in the background, so the user keeps working where they are.
+        // (no tab switch, no focus change), the live terminal this window resumed
+        // it in included. Only a session with no terminal is reopened, in the
+        // background, so the user keeps working where they are.
         const written = await sendToSessionTerminal(v, "resume");
         if (written.ok) return { ok: true, message: `"resume" written into the open session "${truncate(v.title, 40)}"` };
         if (!written.skip) return { ok: false, message: `"resume" could not be written into the session's terminal: ${written.reason}` };
@@ -3440,15 +3445,22 @@ export function activate(ctx: vscode.ExtensionContext): void {
       }
       case "kill": {
         const v = find();
-        if (!v?.pid || !v.capabilities.kill) return { ok: false, message: "no process id known for this session" };
-        if (!(await verifyKillTarget(v))) return { ok: false, message: "the recorded process has exited or no longer matches" };
+        // No hook pid: the live terminal this window resumed the session in runs claude itself.
+        const term = v && !v.pid && v.provider === "claude" ? resumeTerminals.liveTerminalFor(v.sessionId) : undefined;
+        const pid = term
+          ? await Promise.resolve(term.processId).then(undefined, () => undefined)
+          : v?.capabilities.kill
+            ? v.pid
+            : undefined;
+        if (!v || !pid) return { ok: false, message: "no process id known for this session" };
+        if (!(await verifyKillTarget(v, pid))) return { ok: false, message: "the recorded process has exited or no longer matches" };
         try {
-          process.kill(v.pid, "SIGTERM");
+          process.kill(pid, "SIGTERM");
         } catch (e) {
           return { ok: false, message: "kill failed: " + String(e) };
         }
         refresh();
-        return { ok: true, message: `sent SIGTERM to pid ${v.pid}` };
+        return { ok: true, message: `sent SIGTERM to pid ${pid}` };
       }
       case "resumeAll":
         await vscode.commands.executeCommand("claudeSessionMonitor.resumeAll");
@@ -3493,6 +3505,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
     return p;
   });
 
+  // A closed resume terminal is no longer the session's.
+  ctx.subscriptions.push(vscode.window.onDidCloseTerminal((t) => resumeTerminals.forget(t)));
+
   remoteBridge = registerRemoteBridge(ctx, { log, accounts: remoteAccounts, execute: executeRemote });
 
   refresh();
@@ -3528,19 +3543,27 @@ function sampleResources(pids: number[], cache: Map<number, ResStat>, done: () =
   });
 }
 
-function verifyKillTarget(view: SessionView): Promise<boolean> {
-  if (!view.pid || !view.capabilities.kill) return Promise.resolve(false);
+/**
+ * True when `pid` still runs this session's provider: Codex (never a shared
+ * app-server), the Claude Code extension's binary or a `claude` CLI. The pid of
+ * the session's live resume terminal needs no hook record but must be exactly
+ * `claude --resume <session id>`.
+ */
+function verifyKillTarget(view: SessionView, pid = view.pid): Promise<boolean> {
+  const resumed = !!pid && view.provider === "claude" && resumeTerminals.livePids().get(view.sessionId) === pid;
+  if (!pid || (!resumed && !view.capabilities.kill)) return Promise.resolve(false);
   return new Promise((resolve) => {
     execFile(
       "ps",
-      ["-p", String(view.pid), "-o", "command="],
+      ["-p", String(pid), "-o", "command="],
       { timeout: 3000 },
       (error, stdout) => {
         if (error || !stdout) {
           resolve(false);
           return;
         }
-        const command = String(stdout).trim().toLowerCase();
+        const raw = String(stdout).trim();
+        const command = raw.toLowerCase();
         if (view.provider === "codex") {
           resolve(
             /(?:^|[/\s])codex(?:\s|$)/.test(command) &&
@@ -3548,7 +3571,11 @@ function verifyKillTarget(view: SessionView): Promise<boolean> {
           );
           return;
         }
-        resolve(command.includes("anthropic.claude-code") && command.includes("resources"));
+        if (resumed) {
+          resolve(isClaudeResumeCommand(raw, view.sessionId));
+          return;
+        }
+        resolve((command.includes("anthropic.claude-code") && command.includes("resources")) || isClaudeCliCommand(raw));
       },
     );
   });
@@ -4013,6 +4040,9 @@ function asView(arg?: SessionView): SessionView | undefined {
 let claudeBinaryPath: string | undefined;
 let claudeBinary: Promise<string | undefined> | undefined;
 
+// The terminals resumeInTerminal opened, by session id (resumeRegistry.ts).
+const resumeTerminals = new ResumeRegistry<vscode.Terminal>();
+
 function resumeInTerminal(arg: SessionView, opts: { show?: boolean } = {}): void {
   const v = asView(arg);
   if (!v || !v.capabilities.resume) {
@@ -4027,15 +4057,18 @@ function resumeInTerminal(arg: SessionView, opts: { show?: boolean } = {}): void
   // Launch the provider directly instead of composing text for the user's
   // configured terminal shell. This is safe for paths/ids containing quoting
   // characters and works consistently across POSIX shells, PowerShell and cmd.
-  const term = vscode.window.createTerminal({
-    name: `${providerLabel(v.provider)} · ${truncate(v.title, 32)}`,
-    cwd: v.cwd,
-    shellPath: v.provider === "codex" ? codexExecutable : claudeBinaryPath ?? "claude",
-    shellArgs:
-      v.provider === "codex"
-        ? ["resume", v.sessionId]
-        : ["--resume", v.sessionId],
-  });
+  // A session this window already resumed keeps its live terminal: never a second process.
+  const { terminal: term } = resumeTerminals.openOrReuse(v.sessionId, () =>
+    vscode.window.createTerminal({
+      name: `${providerLabel(v.provider)} · ${truncate(v.title, 32)}`,
+      cwd: v.cwd,
+      shellPath: v.provider === "codex" ? codexExecutable : claudeBinaryPath ?? "claude",
+      shellArgs:
+        v.provider === "codex"
+          ? ["resume", v.sessionId]
+          : ["--resume", v.sessionId],
+    }),
+  );
   if (opts.show !== false) term.show();
 }
 

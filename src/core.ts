@@ -766,6 +766,7 @@ export interface CollectOpts {
   closingMarkers?: boolean; // default false: no closing status line (claudeSessionMonitor.closingStatusMarkers)
   phantomGraceSec?: number; // default 600
   pidAlive?: (pid?: number) => boolean | undefined; // injectable for tests
+  resumePids?: Map<string, number>; // session id -> pid of the live terminal this window resumed it in
 }
 
 /** true: alive, false: dead, undefined: unknown (no/invalid pid). */
@@ -838,7 +839,14 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
     const cwd = hook?.cwd || tx?.cwd;
     if (cwd && dirExcluded(cwd)) continue;
 
-    const view = resolve(sid, hook, tx, { now, txPath, effort, closingMarkers: opts.closingMarkers });
+    // A session this window resumed in a terminal runs there even when its hook
+    // record has no pid and still says "ended" (no hook event since the resume).
+    const resumedPid = opts.resumePids?.get(sid);
+    const status =
+      hook && hook.pid === undefined && resumedPid
+        ? { ...hook, pid: resumedPid, state: hook.state === "ended" ? "idle" : hook.state }
+        : hook;
+    const view = resolve(sid, status, tx, { now, txPath, effort, closingMarkers: opts.closingMarkers });
     views.push(view);
   }
 

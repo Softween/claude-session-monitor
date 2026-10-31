@@ -15,6 +15,8 @@ const rec = vi.hoisted(() => ({
   statusBars: [] as any[],
   spawns: [] as any[],
   terminals: [] as any[],
+  closeListeners: [] as Array<(terminal: any) => void>,
+  bridgeDeps: null as any, // the remote bridge's deps, captured by the pass-through mock below
   execFileImpl: null as null | ((args: any[]) => boolean), // returns true when it handled the call
 }));
 
@@ -108,13 +110,28 @@ vi.mock("vscode", () => {
       createTerminal: (options: any) => {
         const terminal = {
           options,
+          name: options.name,
           shown: false,
+          exitStatus: undefined as unknown,
+          // Above the macOS pid range, so no real process can carry it.
+          processId: Promise.resolve(990001 + rec.terminals.length),
+          sent: [] as string[],
           show() {
             terminal.shown = true;
+          },
+          sendText(text: string) {
+            terminal.sent.push(text);
           },
         };
         rec.terminals.push(terminal);
         return terminal;
+      },
+      get terminals() {
+        return rec.terminals;
+      },
+      onDidCloseTerminal: (listener: (terminal: any) => void) => {
+        rec.closeListeners.push(listener);
+        return { dispose() {} };
       },
       showInformationMessage: () => Promise.resolve(undefined),
       showWarningMessage: (...args: any[]) => {
@@ -152,6 +169,18 @@ vi.mock("vscode", () => {
         rec.executeCalls.push({ id, args });
         return Promise.resolve(undefined);
       },
+    },
+  };
+});
+
+// Pass-through: records the bridge's deps so a test can run a remote command.
+vi.mock("../src/remoteBridge", async (orig) => {
+  const real = await orig<typeof import("../src/remoteBridge")>();
+  return {
+    ...real,
+    registerRemoteBridge: (ctx: any, deps: any) => {
+      rec.bridgeDeps = deps;
+      return real.registerRemoteBridge(ctx, deps);
     },
   };
 });
@@ -230,6 +259,10 @@ afterEach(() => {
   rec.webviews.length = 0;
   rec.statusBars.length = 0;
   rec.spawns.length = 0;
+  // Close every terminal, so the module-level resume registry forgets them.
+  for (const terminal of rec.terminals) for (const listener of rec.closeListeners) listener(terminal);
+  rec.closeListeners.length = 0;
+  rec.bridgeDeps = null;
   rec.terminals.length = 0;
   rec.execFileImpl = null;
   keeperWaiting.clear(); // module-level: one test's claude-switch keeper state must not leak into the next
@@ -933,5 +966,125 @@ describe("closingStatusMarkers setting", () => {
     expect(row.closing).toBe("done");
     expect(row.closingText).toBe("All tests pass");
     expect(row.tip).toContain("closing: ✅ All tests pass");
+  });
+});
+
+describe("resume terminals: reuse, and remote resume / send / kill without a hook pid", () => {
+  const SID = "resumed-session";
+  const TITLE = "fix the flaky test";
+  let psCommand = "";
+
+  // A your-turn terminal session whose hook record has no pid, plus a `claude`
+  // that `which` resolves, so a remote resume may open a terminal.
+  function activateWithSession(): (cmd: any) => Promise<{ ok: boolean; message: string }> {
+    const now = Date.now() / 1000;
+    const iso = (s: number) => new Date(s * 1000).toISOString();
+    const dir = `${HOME}/.claude/projects/-repo`;
+    const mon = `${HOME}/.claude/session-monitor`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(mon, { recursive: true });
+    fs.mkdirSync(`${HOME}/bin`, { recursive: true });
+    fs.writeFileSync(`${HOME}/bin/claude`, "#!/bin/sh\n", { mode: 0o755 });
+    const tx = `${dir}/${SID}.jsonl`;
+    const lines = [
+      { type: "ai-title", aiTitle: TITLE },
+      { type: "user", entrypoint: "cli", cwd: "/repo", message: { content: [{ type: "text", text: TITLE }] }, timestamp: iso(now - 40) },
+      { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "Fixed." }], stop_reason: "end_turn" }, timestamp: iso(now - 30) },
+    ];
+    fs.writeFileSync(tx, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    fs.writeFileSync(`${mon}/${SID}.json`, JSON.stringify({ session_id: SID, provider: "claude", state: "idle", ts: now - 35, cwd: "/repo", transcript_path: tx }));
+    rec.execFileImpl = (args) => {
+      const cb = args[args.length - 1];
+      if (args[0] === "which") cb(null, `${HOME}/bin/claude\n`, "");
+      else if (args[0] === "ps" && args[1]?.[0] === "-p") cb(null, `${psCommand}\n`, "");
+      else return false;
+      return true;
+    };
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    return rec.bridgeDeps.execute;
+  }
+  const refresh = () => rec.commands.get("claudeSessionMonitor.refresh")!();
+
+  it("Resume in Terminal reuses and shows the live terminal it opened; a closed or exited one is replaced", () => {
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    const resume = rec.commands.get("claudeSessionMonitor.resumeSession")!;
+    const view = { key: "claude:reuse", provider: "claude", sessionId: "reuse", title: "Reuse me", cwd: "/tmp" };
+    resume(view);
+    rec.terminals[0].shown = false;
+    resume(view);
+    expect(rec.terminals).toHaveLength(1);
+    expect(rec.terminals[0].shown).toBe(true);
+
+    for (const listener of rec.closeListeners) listener(rec.terminals[0]);
+    resume(view);
+    expect(rec.terminals).toHaveLength(2);
+
+    rec.terminals[1].exitStatus = { code: 0, reason: 0 };
+    resume(view);
+    expect(rec.terminals).toHaveLength(3);
+  });
+
+  it("a second remote resume writes into the terminal the first one opened; once it exits a new one opens", async () => {
+    const execute = activateWithSession();
+    expect(await execute({ id: "r1", type: "resume", sessionId: SID })).toEqual({
+      ok: true,
+      message: `resume terminal opened in the background for "${TITLE}"`,
+    });
+    expect(rec.terminals).toHaveLength(1);
+    expect(rec.terminals[0]).toMatchObject({ shown: false, options: { shellPath: `${HOME}/bin/claude`, shellArgs: ["--resume", SID] } });
+
+    expect(await execute({ id: "r2", type: "resume", sessionId: SID })).toEqual({
+      ok: true,
+      message: `"resume" written into the open session "${TITLE}"`,
+    });
+    expect(rec.terminals).toHaveLength(1);
+    expect(rec.terminals[0].sent).toEqual(["resume\r"]);
+
+    rec.terminals[0].exitStatus = { code: 0, reason: 0 };
+    refresh();
+    expect((await execute({ id: "r3", type: "resume", sessionId: SID })).message).toBe(
+      `resume terminal opened in the background for "${TITLE}"`,
+    );
+    expect(rec.terminals).toHaveLength(2);
+  });
+
+  it("remote send reaches the resume terminal of a session without a hook pid; a ! line is rejected there", async () => {
+    const execute = activateWithSession();
+    await execute({ id: "r1", type: "resume", sessionId: SID });
+    expect(await execute({ id: "s1", type: "send", sessionId: SID, text: "run the tests" })).toEqual({
+      ok: true,
+      message: "delivered via terminal",
+    });
+    expect(await execute({ id: "s2", type: "send", sessionId: SID, text: "!ls ~" })).toEqual({
+      ok: false,
+      message: "not delivered via terminal: rejected input",
+    });
+    expect(rec.terminals[0].sent).toEqual(["run the tests\r"]);
+  });
+
+  it("remote kill without a hook pid signals the resume terminal's process only when ps shows claude --resume <id>", async () => {
+    const execute = activateWithSession();
+    expect(await execute({ id: "k0", type: "kill", sessionId: SID })).toEqual({
+      ok: false,
+      message: "no process id known for this session",
+    });
+    await execute({ id: "r1", type: "resume", sessionId: SID });
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      psCommand = `${HOME}/bin/claude --resume another-session`;
+      expect(await execute({ id: "k1", type: "kill", sessionId: SID })).toEqual({
+        ok: false,
+        message: "the recorded process has exited or no longer matches",
+      });
+      expect(kill).not.toHaveBeenCalledWith(990001, "SIGTERM");
+
+      psCommand = `${HOME}/bin/claude --resume ${SID}`;
+      expect(await execute({ id: "k2", type: "kill", sessionId: SID })).toEqual({ ok: true, message: "sent SIGTERM to pid 990001" });
+      expect(kill).toHaveBeenCalledWith(990001, "SIGTERM");
+    } finally {
+      kill.mockRestore();
+    }
   });
 });

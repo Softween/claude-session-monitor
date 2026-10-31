@@ -178,6 +178,32 @@ describe("scripts/hook.py provider routing", () => {
     expect(read("codex", "fast-session-end")).not.toHaveProperty("pid");
   });
 
+  // A fake `ps`: the hook itself (the script's $PPID is the python process) under
+  // `parent`, under a login shell.
+  function fakePs(parent: string): void {
+    const ps = path.join(tmp, "bin", "ps");
+    fs.writeFileSync(ps, `#!/bin/sh\necho "$PPID 4242 python3 hook.py"\necho "4242 4241 ${parent}"\necho "4241 1 -zsh"\n`);
+    fs.chmodSync(ps, 0o755);
+  }
+
+  it("records the pid of a claude started from a terminal: the executable at any path, or node running it", () => {
+    const parents = ["/Users/u/.local/bin/claude --resume s0", "node /Users/u/.npm-global/bin/claude --resume s1", "claude"];
+    parents.forEach((parent, i) => {
+      fakePs(parent);
+      run({ session_id: `terminal-${i}`, cwd: "/workspace", transcript_path: `${tmp}/.claude/projects/t.jsonl`, source: "resume" }, "SessionStart");
+      expect(read("claude", `terminal-${i}`)).toMatchObject({ state: "idle", source: "resume", pid: 4242 });
+    });
+  });
+
+  it("never takes claude-switch, other claude-* names or the desktop app for the Claude session process", () => {
+    const parents = ["/Users/u/.claude/bin/claude-switch run", "node /Users/u/bin/claude-mem worker", "/Applications/Claude.app/Contents/MacOS/Claude"];
+    parents.forEach((parent, i) => {
+      fakePs(parent);
+      run({ session_id: `other-${i}`, cwd: "/workspace", transcript_path: `${tmp}/.claude/projects/o.jsonl` }, "Stop");
+      expect(read("claude", `other-${i}`)).not.toHaveProperty("pid");
+    });
+  });
+
   it(
     "keeps concurrent writes to one session valid and leaves no temporary files",
     async () => {

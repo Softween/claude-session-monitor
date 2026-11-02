@@ -1301,3 +1301,43 @@ describe("phantom hook records", () => {
     expect(fs.existsSync(path.join(tmp, "withtx.json"))).toBe(true);
   });
 });
+
+describe("metadata-only transcript rewrites do not count as activity", () => {
+  const collect = (hooks: HookStatus[], extra: RecentTranscript[], maxAgeSec = 6 * 3600) => {
+    const m = new Map<string, HookStatus>();
+    for (const h of hooks) m.set(h.session_id, h);
+    return collectSessions({ now: NOW, hookStatuses: m, extraTranscripts: extra, maxAgeSec, hideEndedOlderThanSec: 24 * 3600 });
+  };
+  const rt = (sessionId: string, p: string): RecentTranscript => ({ sessionId, path: p, mtimeMs: fs.statSync(p).mtimeMs });
+
+  it("hides a hook-less transcript whose last timestamped line is days old even when its mtime is fresh", () => {
+    const old = NOW - 3 * 86400;
+    const p = writeTranscript("mt-old.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(old - 10) },
+      { type: "assistant", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(old) },
+      { type: "cost-state" },
+      { type: "last-prompt", lastPrompt: "q" },
+    ]);
+    fs.utimesSync(p, NOW, NOW); // Claude Code rewrote metadata lines just now
+    expect(collect([], [rt("mt-old", p)]).find((v) => v.sessionId === "mt-old")).toBeUndefined();
+  });
+
+  it("reports the newest timestamped line, not the file mtime, as last activity", () => {
+    const p = writeTranscript("mt-hook.jsonl", [
+      { type: "assistant", entrypoint: "claude-vscode", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 7200) },
+      { type: "cost-state" },
+    ]);
+    fs.utimesSync(p, NOW, NOW);
+    const v = collect([{ session_id: "mt-hook", state: "idle", ts: NOW - 7200, cwd: "/repo", transcript_path: p }], []).find((x) => x.sessionId === "mt-hook");
+    expect(v?.sub).toBe("your turn");
+    expect(v?.lastActivityMs).toBe((NOW - 7200) * 1000);
+    expect(v?.detail).toContain("2h");
+  });
+
+  it("falls back to the file mtime only when nothing carries a timestamp", () => {
+    const p = writeTranscript("mt-meta.jsonl", [{ type: "ai-title", aiTitle: "Fresh tab" }]);
+    fs.utimesSync(p, NOW - 30, NOW - 30);
+    const v = collect([], [rt("mt-meta", p)]).find((x) => x.sessionId === "mt-meta");
+    expect(v?.lastActivityMs).toBe((NOW - 30) * 1000);
+  });
+});

@@ -499,8 +499,13 @@ function resolve(
   const now = opts.now;
   const hookTs = hook?.ts ?? 0;
   const convTs = tx?.convTs ?? 0;
-  const mtimeS = tx ? tx.mtimeMs / 1000 : 0;
-  const lastActivity = Math.max(hookTs, convTs, tx?.activityTs ?? 0, mtimeS);
+  // Newest timestamped evidence: hook event, conversational line, any other
+  // timestamped line. The file mtime is only a fallback for a transcript with
+  // no timestamped line yet: Claude Code rewrites metadata lines (cost-state,
+  // last-prompt, ...) in long-closed transcripts when it starts, so a fresh
+  // mtime alone never proves activity.
+  const stamped = Math.max(hookTs, convTs, tx?.activityTs ?? 0);
+  const lastActivity = stamped > 0 ? stamped : tx ? tx.mtimeMs / 1000 : 0;
 
   const title =
     cleanTitle(tx?.title) ||

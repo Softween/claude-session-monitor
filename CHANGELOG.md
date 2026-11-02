@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.25.1
+- **A rewritten transcript is not an active session.** When Claude Code starts (for example after the editor restarts its extensions) it rewrites metadata lines (`cost-state`, `last-prompt`, ...) in transcripts of sessions that ended days ago, which only moves the file's modification time. The panel took that time as the session's last activity, so up to 120 long-closed sessions came back as "your turn · 6m" with no open tab. Last activity now comes from the newest timestamped line or hook event; the file time counts only for a transcript that has no timestamped line yet.
+
 ## 2.25.0
 - **A resumed session runs once.** Resume in Terminal and a remote `resume` remember the terminal they opened for a session in this VS Code window. While that terminal's process runs, Resume in Terminal shows it again instead of starting a second `claude --resume`, and a remote `resume` writes `resume` into it (`"resume" written into the open session "<title>"`). A closed or exited terminal is forgotten, and the next resume opens a new one.
 - **Remote `send` and `kill` reach a resumed session that has no recorded process id.** When no terminal matches the session by process tree or name, `send` writes into the terminal this window resumed it in, under the same input rules (a line starting with `!` answers `not delivered via terminal: rejected input`). `kill` signals that terminal's process only when `ps` shows exactly `claude --resume <session id>` for it, and answers `sent SIGTERM to pid <pid>`. Until a newer hook event arrives, the session's row takes that process id (CPU / RAM, Kill) and shows "your turn" instead of "ended".

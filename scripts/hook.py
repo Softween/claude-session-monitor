@@ -31,17 +31,17 @@ except ImportError:  # Windows: unique temp files still prevent corrupt JSON.
     fcntl = None
 
 
-def find_session_pid(provider):
-    """Find a dedicated session process. Shared Codex app-server processes are
-    intentionally excluded because attributing their CPU/RAM to every thread
-    would multiply the totals."""
+def find_session_process(provider):
+    """Find a dedicated session process: (pid, command line), or (None, None).
+    Shared Codex app-server processes are intentionally excluded because
+    attributing their CPU/RAM to every thread would multiply the totals."""
     try:
         out = subprocess.run(
             ["ps", "-Ao", "pid=,ppid=,command="],
             capture_output=True, text=True, timeout=2,
         ).stdout
     except Exception:
-        return None
+        return None, None
     info = {}
     for line in out.splitlines():
         line = line.strip()
@@ -65,7 +65,7 @@ def find_session_pid(provider):
         low = cmd.lower()
         if provider == "claude":
             if "anthropic.claude-code" in low and "resources" in low:
-                return cur
+                return cur, cmd
             # A claude started from a terminal: the executable itself (any path)
             # or node running a script named claude. Exact and case-sensitive, so
             # the desktop app's "Claude", claude-switch and other claude-* never match.
@@ -74,17 +74,28 @@ def find_session_pid(provider):
             if exe == "claude" or (
                 exe.startswith("node") and len(tokens) > 1 and os.path.basename(tokens[1]) == "claude"
             ):
-                return cur
+                return cur, cmd
         elif provider == "codex":
             if "app-server" in low:
-                return None
+                return None, None
             first = low.split(None, 1)[0] if low else ""
             if os.path.basename(first) == "codex":
-                return cur
+                return cur, cmd
         if ppid <= 1 or ppid == cur:
             break
         cur = ppid
-    return None
+    return None, None
+
+
+def is_auth_status_probe(command):
+    """`claude auth status [options]` (any path, or node running it): the account
+    check the Claude Code extension runs once per open tab after an account
+    switch. It runs the session hooks but never takes a prompt. Only options may
+    follow, because ps joins argv: `claude "auth status is broken"` stays a session."""
+    tokens = (command or "").split()
+    start = 2 if tokens and os.path.basename(tokens[0]).startswith("node") else 1
+    rest = tokens[start:]
+    return rest[:2] == ["auth", "status"] and all(t.startswith("-") for t in rest[2:])
 
 # Map hook event -> coarse session state.
 #   working : actively processing a turn
@@ -149,11 +160,7 @@ def main() -> None:
         return
 
     mon_dir = os.path.join(os.path.expanduser("~"), "." + provider, "session-monitor")
-    try:
-        os.makedirs(mon_dir, mode=0o700, exist_ok=True)
-        os.chmod(mon_dir, 0o700)
-    except Exception:
-        return
+    final = os.path.join(mon_dir, "{0}.json".format(session_id))
 
     now = time.time()
     record = {
@@ -194,12 +201,23 @@ def main() -> None:
 
     # SessionEnd has no actionable process left (ended rows cannot be killed)
     # and is the most important state to persist before the runner's short
-    # timeout. Avoid the up-to-2s process-tree scan on this path.
-    pid = None if event == "SessionEnd" else find_session_pid(provider)
-    if pid:
+    # timeout. Avoid the up-to-2s process-tree scan on this path, except for a
+    # Claude session with no record yet: only that one can be the auth probe.
+    pid = command = None
+    if event != "SessionEnd" or (provider == "claude" and not os.path.exists(final)):
+        pid, command = find_session_process(provider)
+    # The probe is not a session: write and touch nothing for it, on any event.
+    if provider == "claude" and is_auth_status_probe(command):
+        return
+    if pid and event != "SessionEnd":
         record["pid"] = pid
 
-    final = os.path.join(mon_dir, "{0}.json".format(session_id))
+    try:
+        os.makedirs(mon_dir, mode=0o700, exist_ok=True)
+        os.chmod(mon_dir, 0o700)
+    except Exception:
+        return
+
     tmp = None
     try:
         # mkstemp is unique and 0600, so concurrent hook invocations cannot

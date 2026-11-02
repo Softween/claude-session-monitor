@@ -205,6 +205,51 @@ describe("scripts/hook.py provider routing", () => {
   });
 
   it(
+    "records nothing for the `claude auth status` probe on any event, and still records a claude session with its pid",
+    () => {
+      const probes = [
+        "/path/native-binary/claude auth status --json",
+        "/Users/u/.vscode/extensions/anthropic.claude-code-2.1.314-darwin-arm64/resources/native-binary/claude auth status --json",
+        "node /Users/u/.npm-global/bin/claude auth status",
+      ];
+      probes.forEach((parent, i) => {
+        fakePs(parent);
+        for (const event of ["SessionStart", "SessionEnd"]) {
+          run({ session_id: `probe-${i}`, cwd: "/workspace", transcript_path: `${tmp}/.claude/projects/p.jsonl`, source: "startup" }, event);
+        }
+      });
+      expect(fs.existsSync(path.join(tmp, ".claude", "session-monitor"))).toBe(false);
+
+      // Only options may follow `auth status`: a prompt starting with those words is a session.
+      const sessions = ["/path/native-binary/claude --output-format stream-json --verbose --input-format stream-json", "claude", "claude auth status page is blank"];
+      sessions.forEach((parent, i) => {
+        fakePs(parent);
+        run({ session_id: `session-${i}`, cwd: "/workspace", transcript_path: `${tmp}/.claude/projects/s.jsonl`, source: "startup" }, "SessionStart");
+        expect(read("claude", `session-${i}`)).toMatchObject({ event: "SessionStart", source: "startup", pid: 4242 });
+      });
+    },
+    15_000,
+  );
+
+  it("scans on a Claude SessionEnd only when the session has no record yet, and never records a pid there", () => {
+    fakePs("claude");
+    run({ session_id: "unrecorded", cwd: "/workspace", reason: "other" }, "SessionEnd");
+    expect(read("claude", "unrecorded")).toMatchObject({ event: "SessionEnd", state: "ended" });
+    expect(read("claude", "unrecorded")).not.toHaveProperty("pid");
+
+    run({ session_id: "recorded", cwd: "/workspace" }, "SessionStart");
+    expect(read("claude", "recorded")).toMatchObject({ pid: 4242 });
+    const ps = path.join(tmp, "bin", "ps");
+    fs.writeFileSync(ps, "#!/bin/sh\nsleep 3\nexit 0\n");
+    fs.chmodSync(ps, 0o755);
+    const started = Date.now();
+    run({ session_id: "recorded", cwd: "/workspace", reason: "other" }, "SessionEnd");
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(read("claude", "recorded")).toMatchObject({ event: "SessionEnd", state: "ended", reason: "other" });
+    expect(read("claude", "recorded")).not.toHaveProperty("pid");
+  });
+
+  it(
     "keeps concurrent writes to one session valid and leaves no temporary files",
     async () => {
       const dir = path.join(tmp, ".codex", "session-monitor");

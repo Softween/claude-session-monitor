@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.25.3
+- **Probe detection holds up on a busy machine.** `hook.py` no longer lists every process to find the session's `claude`; it walks its own ancestors with one small `ps` call per hop, within 4 s at session start (the hook's own timeout is 5 s) and 2 s on other events. During an account switch the full listing took longer than its 2 s limit, the `claude auth status` probe went unrecognized and was recorded after all. Run `bash scripts/install.sh` from a source checkout again to update the installed hook.
+
 ## 2.25.2
 - **Short-lived Claude Code probes no longer show up as sessions.** When the Claude Code extension re-checks the signed-in account (for example after an account switch) it starts a short-lived `claude` process per open tab, mostly `claude auth status --json`; it runs the session hooks and exits within seconds without a prompt. `hook.py` now records nothing for the `auth status` probe, also when it ends, and the panel shows a just-started session without a transcript only after its process has run for a minute, so these rows no longer flash in the list. A new tab without a prompt yet appears after that minute. Run `bash scripts/install.sh` from a source checkout again to update the installed hook.
 

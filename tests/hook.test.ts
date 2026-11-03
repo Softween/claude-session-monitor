@@ -178,11 +178,22 @@ describe("scripts/hook.py provider routing", () => {
     expect(read("codex", "fast-session-end")).not.toHaveProperty("pid");
   });
 
-  // A fake `ps`: the hook itself (the script's $PPID is the python process) under
-  // `parent`, under a login shell.
-  function fakePs(parent: string): void {
+  // A fake `ps` answering `ps -o ppid=,command= -p <pid>` with "<ppid> <command>": the
+  // hook's parent (this test process, which spawns python3) under `parent` (4242), under
+  // a login shell. Any other pid prints nothing. Every query first sleeps `delayS`.
+  function fakePs(parent: string, delayS = 0): void {
     const ps = path.join(tmp, "bin", "ps");
-    fs.writeFileSync(ps, `#!/bin/sh\necho "$PPID 4242 python3 hook.py"\necho "4242 4241 ${parent}"\necho "4241 1 -zsh"\n`);
+    const script = [
+      "#!/bin/sh",
+      ...(delayS ? [`sleep ${delayS}`] : []),
+      'while [ $# -gt 0 ]; do [ "$1" = "-p" ] && pid="$2"; shift; done',
+      'case "$pid" in',
+      `  ${process.pid}) echo "4242 /bin/sh -c python3 hook.py" ;;`,
+      `  4242) echo "4241 ${parent}" ;;`,
+      '  4241) echo "1 -zsh" ;;',
+      "esac",
+    ];
+    fs.writeFileSync(ps, `${script.join("\n")}\n`);
     fs.chmodSync(ps, 0o755);
   }
 
@@ -227,6 +238,23 @@ describe("scripts/hook.py provider routing", () => {
         run({ session_id: `session-${i}`, cwd: "/workspace", transcript_path: `${tmp}/.claude/projects/s.jsonl`, source: "startup" }, "SessionStart");
         expect(read("claude", `session-${i}`)).toMatchObject({ event: "SessionStart", source: "startup", pid: 4242 });
       });
+    },
+    15_000,
+  );
+
+  it(
+    "gives the process scan 4 s at session start and 2 s on other events when every ps call is slow",
+    () => {
+      // Each query takes 1 s and the claude process is two hops up.
+      fakePs("claude", 1);
+      run({ session_id: "slow-start", cwd: "/workspace", transcript_path: `${tmp}/.claude/projects/w.jsonl`, source: "startup" }, "SessionStart");
+      expect(read("claude", "slow-start")).toMatchObject({ event: "SessionStart", pid: 4242 });
+
+      const started = Date.now();
+      run({ session_id: "slow-prompt", cwd: "/workspace", transcript_path: `${tmp}/.claude/projects/w.jsonl`, prompt: "hi" }, "UserPromptSubmit");
+      expect(Date.now() - started).toBeLessThan(4000);
+      expect(read("claude", "slow-prompt")).toMatchObject({ event: "UserPromptSubmit", state: "working" });
+      expect(read("claude", "slow-prompt")).not.toHaveProperty("pid");
     },
     15_000,
   );

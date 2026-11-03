@@ -31,37 +31,34 @@ except ImportError:  # Windows: unique temp files still prevent corrupt JSON.
     fcntl = None
 
 
-def find_session_process(provider):
+def find_session_process(provider, budget_s):
     """Find a dedicated session process: (pid, command line), or (None, None).
     Shared Codex app-server processes are intentionally excluded because
-    attributing their CPU/RAM to every thread would multiply the totals."""
-    try:
-        out = subprocess.run(
-            ["ps", "-Ao", "pid=,ppid=,command="],
-            capture_output=True, text=True, timeout=2,
-        ).stdout
-    except Exception:
-        return None, None
-    info = {}
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(None, 2)
-        if len(parts) < 2:
-            continue
-        try:
-            pid = int(parts[0])
-            ppid = int(parts[1])
-        except Exception:
-            continue
-        info[pid] = (ppid, parts[2] if len(parts) > 2 else "")
-    cur = os.getpid()
+    attributing their CPU/RAM to every thread would multiply the totals.
+    Walks the hook's ancestors with one small `ps` per hop (listing every
+    process can take seconds on a busy machine); all hops together get
+    budget_s, and a failed or late `ps` gives (None, None)."""
+    deadline = time.monotonic() + budget_s
+    cur = os.getppid()
     for _ in range(12):
-        entry = info.get(cur)
-        if not entry:
+        remaining = deadline - time.monotonic()
+        if cur <= 1 or remaining <= 0:
             break
-        ppid, cmd = entry
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "ppid=,command=", "-p", str(cur)],
+                capture_output=True, text=True, timeout=min(2.0, remaining),
+            ).stdout
+        except Exception:
+            return None, None
+        parts = out.strip().split(None, 1)
+        if not parts:
+            break
+        try:
+            ppid = int(parts[0])
+        except Exception:
+            break
+        cmd = parts[1] if len(parts) > 1 else ""
         low = cmd.lower()
         if provider == "claude":
             if "anthropic.claude-code" in low and "resources" in low:
@@ -211,7 +208,8 @@ def main() -> None:
         if provider == "claude" and not os.path.exists(final) and not has_transcript:
             return
     else:
-        pid, command = find_session_process(provider)
+        # The auth probe must be recognized at session start, so that scan gets more time.
+        pid, command = find_session_process(provider, 4.0 if event == "SessionStart" else 2.0)
         # The probe is not a session: write and touch nothing for it.
         if provider == "claude" and is_auth_status_probe(command):
             return

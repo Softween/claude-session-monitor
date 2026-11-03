@@ -805,6 +805,24 @@ export function isPhantom(
   return hook.state === "ended" || alive(hook.pid) === false || now - hook.ts > graceSec;
 }
 
+/**
+ * A session that has only just started (a fresh `startup`) and has no
+ * transcript yet is shown once its process has run for a minute. The Claude
+ * Code extension starts short-lived CLI processes when it re-reads the account
+ * (one per open tab after an account switch); they run the session hooks and
+ * exit within seconds without a prompt. A real tab without a prompt yet shows
+ * up after that minute. Display only: cleanup keeps such records (isPhantom).
+ */
+export function isUnsettledStart(
+  hook: HookStatus,
+  now: number,
+  opts: { minAgeSec?: number; alive?: (pid?: number) => boolean | undefined } = {},
+): boolean {
+  if (hook.event !== "SessionStart" || hook.source !== "startup") return false;
+  const alive = opts.alive ?? pidAlive;
+  return alive(hook.pid) !== true || now - hook.ts < (opts.minAgeSec ?? 60);
+}
+
 function entrypointAllowed(ep: string | undefined, allowed: string[]): boolean {
   if (allowed.length === 0) return true; // explicit "allow all"
   if (!ep) return true; // unknown -> show (benefit of the doubt)
@@ -834,10 +852,13 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
       txCache.set(txPath, tx);
     }
     const hook = hooks.get(sid);
+    const hasTranscript = !!(txPath && fs.existsSync(txPath));
 
     // Drop phantom hook records (account-switch tab bursts that never got a transcript).
-    if (hook && !(txPath && fs.existsSync(txPath)) && isPhantom(hook, now, { graceSec: opts.phantomGraceSec, alive: opts.pidAlive }))
+    if (hook && !hasTranscript && isPhantom(hook, now, { graceSec: opts.phantomGraceSec, alive: opts.pidAlive }))
       continue;
+    // Hold back a just-started session without a transcript (see isUnsettledStart).
+    if (hook && !hasTranscript && isUnsettledStart(hook, now, { alive: opts.pidAlive })) continue;
 
     // Filter out observer / SDK-subagent sessions.
     if (!entrypointAllowed(tx?.entrypoint, allowed)) continue;

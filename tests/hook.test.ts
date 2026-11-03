@@ -231,24 +231,39 @@ describe("scripts/hook.py provider routing", () => {
     15_000,
   );
 
-  it("scans on a Claude SessionEnd only when the session has no record yet, and never records a pid there", () => {
-    fakePs("claude");
-    run({ session_id: "unrecorded", cwd: "/workspace", reason: "other" }, "SessionEnd");
-    expect(read("claude", "unrecorded")).toMatchObject({ event: "SessionEnd", state: "ended" });
-    expect(read("claude", "unrecorded")).not.toHaveProperty("pid");
+  it("never scans on a Claude SessionEnd, and writes nothing for a session with neither a record nor a transcript", () => {
+    const ps = path.join(tmp, "bin", "ps");
+    const slowPs = () => {
+      fs.writeFileSync(ps, "#!/bin/sh\nsleep 3\nexit 0\n");
+      fs.chmodSync(ps, 0o755);
+    };
+    const end = (payload: Record<string, unknown>) => {
+      const started = Date.now();
+      run(payload, "SessionEnd");
+      expect(Date.now() - started).toBeLessThan(1500);
+    };
 
+    // The probe's end: its SessionStart wrote nothing and it never had a prompt.
+    slowPs();
+    end({ session_id: "unrecorded", cwd: "/workspace", transcript_path: path.join(tmp, "none.jsonl"), reason: "other" });
+    expect(fs.existsSync(path.join(tmp, ".claude", "session-monitor"))).toBe(false);
+
+    // A transcript without a record still records the end, without a pid.
+    const transcript = path.join(tmp, "t.jsonl");
+    fs.writeFileSync(transcript, "{}\n");
+    end({ session_id: "with-transcript", cwd: "/workspace", transcript_path: transcript, reason: "other" });
+    expect(read("claude", "with-transcript")).toMatchObject({ event: "SessionEnd", state: "ended" });
+    expect(read("claude", "with-transcript")).not.toHaveProperty("pid");
+
+    // A recorded session records its end, without a pid.
+    fakePs("claude");
     run({ session_id: "recorded", cwd: "/workspace" }, "SessionStart");
     expect(read("claude", "recorded")).toMatchObject({ pid: 4242 });
-    const ps = path.join(tmp, "bin", "ps");
-    fs.writeFileSync(ps, "#!/bin/sh\nsleep 3\nexit 0\n");
-    fs.chmodSync(ps, 0o755);
-    const started = Date.now();
-    run({ session_id: "recorded", cwd: "/workspace", reason: "other" }, "SessionEnd");
-    expect(Date.now() - started).toBeLessThan(1500);
+    slowPs();
+    end({ session_id: "recorded", cwd: "/workspace", reason: "other" });
     expect(read("claude", "recorded")).toMatchObject({ event: "SessionEnd", state: "ended", reason: "other" });
     expect(read("claude", "recorded")).not.toHaveProperty("pid");
   });
-
   it(
     "keeps concurrent writes to one session valid and leaves no temporary files",
     async () => {

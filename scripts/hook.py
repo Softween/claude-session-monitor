@@ -201,16 +201,22 @@ def main() -> None:
 
     # SessionEnd has no actionable process left (ended rows cannot be killed)
     # and is the most important state to persist before the runner's short
-    # timeout. Avoid the up-to-2s process-tree scan on this path, except for a
-    # Claude session with no record yet: only that one can be the auth probe.
-    pid = command = None
-    if event != "SessionEnd" or (provider == "claude" and not os.path.exists(final)):
+    # timeout. Avoid the up-to-2s process-tree scan on this path.
+    if event == "SessionEnd":
+        # A Claude session that ends with neither a record nor a transcript never
+        # had a prompt (the auth probe, whose SessionStart wrote nothing). Its
+        # ended record would only be hidden, so write and touch nothing.
+        transcript = data.get("transcript_path")
+        has_transcript = isinstance(transcript, str) and bool(transcript) and os.path.exists(transcript)
+        if provider == "claude" and not os.path.exists(final) and not has_transcript:
+            return
+    else:
         pid, command = find_session_process(provider)
-    # The probe is not a session: write and touch nothing for it, on any event.
-    if provider == "claude" and is_auth_status_probe(command):
-        return
-    if pid and event != "SessionEnd":
-        record["pid"] = pid
+        # The probe is not a session: write and touch nothing for it.
+        if provider == "claude" and is_auth_status_probe(command):
+            return
+        if pid:
+            record["pid"] = pid
 
     try:
         os.makedirs(mon_dir, mode=0o700, exist_ok=True)

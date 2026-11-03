@@ -1271,6 +1271,15 @@ describe("phantom hook records", () => {
   it("shows idle record with alive pid, 30s old, no transcript", () => {
     expect(collect(mk({ pid: 1, transcript_path: path.join(tmp, "nope.jsonl") }), true)).toHaveLength(1);
   });
+  it("holds back a fresh startup record without a transcript for a minute, and without a live pid", () => {
+    const none = path.join(tmp, "nope.jsonl");
+    const start = (over: Partial<HookStatus>) => mk({ source: "startup", transcript_path: none, ...over });
+    expect(collect(start({ pid: 1 }), true)).toHaveLength(0); // 30 s old: an account probe would still run
+    expect(collect(start({ pid: 1, ts: NOW_S - 61 }), true)).toHaveLength(1);
+    expect(collect(start({ ts: NOW_S - 61 }), undefined)).toHaveLength(0); // no known live process
+    expect(collect(start({ pid: 1, source: "clear" }), true)).toHaveLength(1); // after /clear: at once
+    expect(collect(start({ pid: 1, event: "Notification" }), true)).toHaveLength(1); // past its start
+  });
   it("shows record whose transcript exists even if pid is dead", () => {
     const t = path.join(tmp, "t.jsonl");
     fs.writeFileSync(t, JSON.stringify({ type: "user", message: { role: "user", content: "hi" }, timestamp: new Date(NOW_S * 1000).toISOString() }) + "\n");

@@ -259,7 +259,7 @@ describe("scripts/hook.py provider routing", () => {
     15_000,
   );
 
-  it("never scans on a Claude SessionEnd, and writes nothing for a session with neither a record nor a transcript", () => {
+  it("never scans on a Claude SessionEnd, and a session that ends without a transcript leaves no record", () => {
     const ps = path.join(tmp, "bin", "ps");
     const slowPs = () => {
       fs.writeFileSync(ps, "#!/bin/sh\nsleep 3\nexit 0\n");
@@ -270,11 +270,12 @@ describe("scripts/hook.py provider routing", () => {
       run(payload, "SessionEnd");
       expect(Date.now() - started).toBeLessThan(1500);
     };
+    const dir = path.join(tmp, ".claude", "session-monitor");
 
     // The probe's end: its SessionStart wrote nothing and it never had a prompt.
     slowPs();
     end({ session_id: "unrecorded", cwd: "/workspace", transcript_path: path.join(tmp, "none.jsonl"), reason: "other" });
-    expect(fs.existsSync(path.join(tmp, ".claude", "session-monitor"))).toBe(false);
+    expect(fs.existsSync(dir)).toBe(false);
 
     // A transcript without a record still records the end, without a pid.
     const transcript = path.join(tmp, "t.jsonl");
@@ -283,14 +284,23 @@ describe("scripts/hook.py provider routing", () => {
     expect(read("claude", "with-transcript")).toMatchObject({ event: "SessionEnd", state: "ended" });
     expect(read("claude", "with-transcript")).not.toHaveProperty("pid");
 
-    // A recorded session records its end, without a pid.
+    // A recorded session with a transcript records its end, without a pid.
     fakePs("claude");
-    run({ session_id: "recorded", cwd: "/workspace" }, "SessionStart");
+    run({ session_id: "recorded", cwd: "/workspace", transcript_path: transcript }, "SessionStart");
     expect(read("claude", "recorded")).toMatchObject({ pid: 4242 });
     slowPs();
-    end({ session_id: "recorded", cwd: "/workspace", reason: "other" });
+    end({ session_id: "recorded", cwd: "/workspace", transcript_path: transcript, reason: "other" });
     expect(read("claude", "recorded")).toMatchObject({ event: "SessionEnd", state: "ended", reason: "other" });
     expect(read("claude", "recorded")).not.toHaveProperty("pid");
+
+    // A recorded session that ends before its first prompt (no transcript): the record is removed.
+    fakePs("claude");
+    run({ session_id: "no-prompt", cwd: "/workspace", transcript_path: path.join(tmp, "never.jsonl") }, "SessionStart");
+    expect(read("claude", "no-prompt")).toMatchObject({ event: "SessionStart", pid: 4242 });
+    slowPs();
+    end({ session_id: "no-prompt", cwd: "/workspace", transcript_path: path.join(tmp, "never.jsonl"), reason: "other" });
+    expect(fs.existsSync(path.join(dir, "no-prompt.json"))).toBe(false);
+    expect(fs.readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
   it(
     "keeps concurrent writes to one session valid and leaves no temporary files",

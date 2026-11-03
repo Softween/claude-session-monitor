@@ -200,12 +200,18 @@ def main() -> None:
     # and is the most important state to persist before the runner's short
     # timeout. Avoid the up-to-2s process-tree scan on this path.
     if event == "SessionEnd":
-        # A Claude session that ends with neither a record nor a transcript never
-        # had a prompt (the auth probe, whose SessionStart wrote nothing). Its
-        # ended record would only be hidden, so write and touch nothing.
+        # A Claude session that ends without a transcript never had a prompt:
+        # the short-lived processes the Claude Code extension starts per open
+        # tab when it re-reads the account start like a session, run the hooks
+        # and exit within seconds. Nothing is left to show or resume, so its
+        # record goes away instead of becoming an ended row.
         transcript = data.get("transcript_path")
         has_transcript = isinstance(transcript, str) and bool(transcript) and os.path.exists(transcript)
-        if provider == "claude" and not os.path.exists(final) and not has_transcript:
+        if provider == "claude" and not has_transcript:
+            try:
+                os.unlink(final)
+            except OSError:
+                pass
             return
     else:
         # The auth probe must be recognized at session start, so that scan gets more time.

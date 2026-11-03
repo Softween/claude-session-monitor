@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.25.4
+- **A Claude session that ends without a transcript leaves no record.** The short-lived `claude` processes the Claude Code extension starts per open tab when it re-reads the account (after an account switch) are not only `auth status` probes: most start like a full session, run the hooks and connect MCP servers, and end 10-50 seconds later without a prompt. `hook.py` now removes such a session's record at its SessionEnd instead of writing an ended row, so an account switch leaves nothing behind; the panel's one-minute hold from 2.25.2 covers them while they run. A tab closed before its first prompt is treated the same way. Run `bash scripts/install.sh` from a source checkout again to update the installed hook.
+
 ## 2.25.3
 - **Probe detection holds up on a busy machine.** `hook.py` no longer lists every process to find the session's `claude`; it walks its own ancestors with one small `ps` call per hop, within 4 s at session start (the hook's own timeout is 5 s) and 2 s on other events. During an account switch the full listing took longer than its 2 s limit, the `claude auth status` probe went unrecognized and was recorded after all. Run `bash scripts/install.sh` from a source checkout again to update the installed hook.
 

@@ -1,5 +1,5 @@
 /**
- * remoteNewSession.ts — the remote `newSession` command: a new `claude` (its
+ * remoteNewSession.ts: the remote `newSession` command: a new `claude` (its
  * absolute path, `--session-id <new uuid>`) in a background VS Code terminal in
  * an allowed folder (remoteCwds.ts), registered like a resumed session so later
  * send / kill reach it, and its optional first message written into that

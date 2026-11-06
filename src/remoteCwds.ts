@@ -1,5 +1,5 @@
 /**
- * remoteCwds.ts — the folders a remote `newSession` may start Claude in (the
+ * remoteCwds.ts: the folders a remote `newSession` may start Claude in (the
  * snapshot's `allowedCwds`) and the command's checks. Pure (no vscode import),
  * so vitest can load it.
  *
@@ -21,7 +21,7 @@ export const FIRST_MESSAGE_MAX_BYTES = 4096; // the relay's cap for `send` text
 /** Folder path -> when it was last seen (epoch ms). */
 export type SeenFolders = Record<string, number>;
 
-const CONTROL = /[\u0000-\u001f\u007f-\u009f  ]/;
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 /**
  * An absolute, normalized POSIX path (no `.` / `..` segments, no trailing

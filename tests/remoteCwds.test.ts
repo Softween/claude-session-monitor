@@ -32,7 +32,7 @@ describe("isUsablePath", () => {
       "/Users/u/./repo",
       "/Users//u",
       "/Users/u/re\npo",
-      "/Users/u/re po",
+      "/Users/u/re\u2028po",
       "/" + "a".repeat(512),
       "",
       42,

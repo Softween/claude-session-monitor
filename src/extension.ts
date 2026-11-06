@@ -3438,10 +3438,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
     cwdsCache = { at: now, list };
     return list;
   }
-  ctx.subscriptions.push(
-    vscode.workspace.onDidGrantWorkspaceTrust(() => (lastFolderRecord = 0)),
-    vscode.workspace.onDidChangeWorkspaceFolders(() => (lastFolderRecord = 0)),
-  );
 
   async function remoteSwitch(account: string): Promise<CommandOutcome> {
     if (switchInflight) return { ok: false, message: "an account switch is already running" };

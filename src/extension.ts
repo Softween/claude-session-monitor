@@ -27,7 +27,9 @@ import { sendToSession } from "./peerSend";
 import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, useStuck, type ActiveCandidate } from "./activeAccount";
 import { execFile } from "child_process";
 import { parseParentPid, pickSessionTerminal, pickUniqueLabel } from "./terminalMatch";
-import { ResumeRegistry, isClaudeCliCommand, isClaudeResumeCommand } from "./resumeRegistry";
+import { ResumeRegistry, isClaudeCliCommand, isClaudeSessionCommand } from "./resumeRegistry";
+import { allowedCwds, mergeSeen, withoutPaths } from "./remoteCwds";
+import { startNewSession } from "./remoteNewSession";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import {
   KEYCHAIN_SERVICE,
@@ -3394,6 +3396,53 @@ export function activate(ctx: vscode.ExtensionContext): void {
     return { accounts: [one], bestId: null };
   };
 
+  // Folders a remote newSession may use (remoteCwds.ts). While the bridge runs,
+  // every window adds its workspace folders while it trusts them (and drops them
+  // while it does not) and the cwds of the sessions it lists, in globalState
+  // shared by all windows, so each window offers and accepts the same list.
+  const TRUSTED_FOLDERS_KEY = "remote.trustedFolders";
+  const SESSION_CWDS_KEY = "remote.sessionCwds";
+  let lastFolderRecord = 0;
+  let cwdsCache: { at: number; list: string[] } | undefined;
+  const ownFolders = () =>
+    (vscode.workspace.workspaceFolders ?? []).filter((f) => f.uri.scheme === "file").map((f) => f.uri.fsPath);
+  const isRealDirectory = (p: string): boolean => {
+    try {
+      return fs.statSync(p).isDirectory() && fs.realpathSync(p) === p;
+    } catch {
+      return false;
+    }
+  };
+  function recordRemoteFolders(now: number): void {
+    if (now - lastFolderRecord < 60_000) return;
+    lastFolderRecord = now;
+    const own = ownFolders();
+    const known = mergeSeen(ctx.globalState.get(TRUSTED_FOLDERS_KEY), [], now);
+    const trusted = vscode.workspace.isTrusted ? mergeSeen(known, own.map((p) => [p, now] as const), now) : withoutPaths(known, own);
+    const cwds = lastAllViews.filter((v) => v.cwd).map((v) => [v.cwd as string, v.lastActivityMs] as const);
+    void ctx.globalState.update(TRUSTED_FOLDERS_KEY, trusted);
+    void ctx.globalState.update(SESSION_CWDS_KEY, mergeSeen(ctx.globalState.get(SESSION_CWDS_KEY), cwds, now));
+    cwdsCache = undefined;
+  }
+  /** The snapshot's allowedCwds, recomputed at most every 30 s unless `fresh` (a newSession check). */
+  function remoteCwds(fresh = false): string[] {
+    const now = Date.now();
+    recordRemoteFolders(now);
+    if (!fresh && cwdsCache && now - cwdsCache.at < 30_000) return cwdsCache.list;
+    const list = allowedCwds({
+      trusted: mergeSeen(ctx.globalState.get(TRUSTED_FOLDERS_KEY), [], now),
+      sessions: mergeSeen(ctx.globalState.get(SESSION_CWDS_KEY), [], now),
+      now,
+      exists: isRealDirectory,
+    });
+    cwdsCache = { at: now, list };
+    return list;
+  }
+  ctx.subscriptions.push(
+    vscode.workspace.onDidGrantWorkspaceTrust(() => (lastFolderRecord = 0)),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => (lastFolderRecord = 0)),
+  );
+
   async function remoteSwitch(account: string): Promise<CommandOutcome> {
     if (switchInflight) return { ok: false, message: "an account switch is already running" };
     const views = currentAccountCtx().accounts;
@@ -3472,6 +3521,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
         };
       case "switchAccount":
         return cmd.account ? remoteSwitch(cmd.account) : { ok: false, message: "account is required" };
+      case "newSession":
+        // A new claude in a background terminal of this window, registered like a resume.
+        return startNewSession(cmd, {
+          allowed: () => remoteCwds(true),
+          claudeBinary: () => claudeBinary ?? Promise.resolve(undefined),
+          open: (spec) => vscode.window.createTerminal(spec),
+          register: (id, term) => resumeTerminals.register(id, term),
+          monitorDir: MONITOR_DIR,
+          sleep,
+        });
       case "send": {
         if (!cmd.sessionId || typeof cmd.text !== "string" || !cmd.text) {
           return { ok: false, message: "sessionId and text are required" };
@@ -3508,7 +3567,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // A closed resume terminal is no longer the session's.
   ctx.subscriptions.push(vscode.window.onDidCloseTerminal((t) => resumeTerminals.forget(t)));
 
-  remoteBridge = registerRemoteBridge(ctx, { log, accounts: remoteAccounts, execute: executeRemote });
+  remoteBridge = registerRemoteBridge(ctx, { log, accounts: remoteAccounts, execute: executeRemote, allowedCwds: () => remoteCwds() });
 
   refresh();
 }
@@ -3572,7 +3631,7 @@ function verifyKillTarget(view: SessionView, pid = view.pid): Promise<boolean> {
           return;
         }
         if (resumed) {
-          resolve(isClaudeResumeCommand(raw, view.sessionId));
+          resolve(isClaudeSessionCommand(raw, view.sessionId));
           return;
         }
         resolve((command.includes("anthropic.claude-code") && command.includes("resources")) || isClaudeCliCommand(raw));

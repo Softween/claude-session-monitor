@@ -35,6 +35,7 @@ const POLL_TIMEOUT_MS = (POLL_WAIT_SEC + 10) * 1000;
 const REQUEST_TIMEOUT_MS = 10_000;
 const MIN_POLL_CYCLE_MS = 20_000; // an early empty answer never turns the long-poll into a busy loop
 const PRESSURE_SAMPLE_MS = 30_000;
+const FLUSH_WAIT_MS = 5_000; // how long a finished newSession waits for the snapshot that lists it
 
 export interface FleetCommand {
   id: string;
@@ -42,6 +43,7 @@ export interface FleetCommand {
   sessionId?: string | null;
   text?: string | null;
   account?: string | null;
+  cwd?: string | null;
   createdAt?: number;
 }
 
@@ -104,6 +106,8 @@ export interface RemoteBridgeDeps {
   log: (msg: string) => void;
   accounts: () => { accounts: SnapshotAccountInput[]; bestId: string | null };
   execute: (cmd: FleetCommand) => Promise<CommandOutcome>;
+  /** folders a remote newSession may use (remoteCwds.ts), sent with every snapshot */
+  allowedCwds?: () => string[];
 }
 
 interface BridgeCfg { url: string; host: string; token: string }
@@ -132,6 +136,8 @@ export class RemoteBridge implements vscode.Disposable {
   private pushRetryAt = 0;
   private pushBackoff = 0;
   private pushInflight = false;
+  private forceAfter = 0; // a snapshot built at or after this time goes out without the 10 s gap
+  private lastPushBuiltAt = 0; // when the last snapshot that reached the relay was built
   private lastPollTs = 0;
   private lastError = "";
   private lastErrorTs = 0;
@@ -208,6 +214,7 @@ export class RemoteBridge implements vscode.Disposable {
         accounts,
         bestAccountId: bestId,
         machine: await sampleMachine(this.pressure, rows.length),
+        allowedCwds: this.deps.allowedCwds?.(),
         now,
       });
     } catch (e) {
@@ -216,12 +223,15 @@ export class RemoteBridge implements vscode.Disposable {
     }
     if (this.cfg !== cfg) return;
     const hash = snapshotHash(body);
-    if (!shouldPush({ changed: hash !== this.lastHash, lastPushTs: this.lastPushTs, now })) return;
+    const forced = this.forceAfter > 0 && now >= this.forceAfter;
+    if (!forced && !shouldPush({ changed: hash !== this.lastHash, lastPushTs: this.lastPushTs, now })) return;
     try {
       await this.request(cfg, "POST", "/fleet/ingest", body, REQUEST_TIMEOUT_MS, this.stop?.signal);
       if (this.cfg !== cfg) return;
       this.lastHash = hash;
       this.lastPushTs = Date.now();
+      this.lastPushBuiltAt = now;
+      if (forced) this.forceAfter = 0;
       this.pushBackoff = 0;
       this.pushRetryAt = 0;
     } catch (e) {
@@ -260,6 +270,7 @@ export class RemoteBridge implements vscode.Disposable {
     this.lastPushTs = 0;
     this.pushRetryAt = 0;
     this.pushBackoff = 0;
+    this.forceAfter = 0;
   }
 
   private fail(msg: string): void {
@@ -325,6 +336,7 @@ export class RemoteBridge implements vscode.Disposable {
       }
     }
     this.deps.log(`remote: command ${cmd.type} ${cmd.id.slice(0, 8)} -> ${out.ok ? "ok" : "failed"}: ${out.message}`);
+    if (cmd.type === "newSession" && out.ok) await this.flushSnapshot(signal);
     try {
       await this.request(
         cfg,
@@ -337,6 +349,17 @@ export class RemoteBridge implements vscode.Disposable {
     } catch (e) {
       if (!signal.aborted) this.fail(`result post for ${cmd.id} failed: ${String(e)}`);
     }
+  }
+
+  /**
+   * Send the next snapshot without the 10 s gap and wait (up to 5 s) until one
+   * built after this call reached the relay, so a phone that reads the result
+   * finds the new session in its next state read.
+   */
+  private async flushSnapshot(signal: AbortSignal): Promise<void> {
+    const after = Date.now();
+    this.forceAfter = after;
+    while (!signal.aborted && this.lastPushBuiltAt < after && Date.now() - after < FLUSH_WAIT_MS) await sleep(250, signal);
   }
 
   /**

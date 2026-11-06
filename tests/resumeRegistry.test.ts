@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { ResumeRegistry, isClaudeCliCommand, isClaudeResumeCommand } from "../src/resumeRegistry";
+import { ResumeRegistry, isClaudeCliCommand, isClaudeResumeCommand, isClaudeSessionCommand } from "../src/resumeRegistry";
 
 const terminal = (pid?: number) => ({ processId: Promise.resolve(pid), exitStatus: undefined as unknown });
 type FakeTerminal = ReturnType<typeof terminal>;
@@ -85,5 +85,21 @@ describe("isClaudeResumeCommand", () => {
     expect(isClaudeResumeCommand("/Users/u/.local/bin/claude --resume", "abc-1")).toBe(false);
     expect(isClaudeResumeCommand("claude", "abc-1")).toBe(false);
     expect(isClaudeResumeCommand("/x/claude-switch --resume abc-1", "abc-1")).toBe(false);
+  });
+});
+
+describe("isClaudeSessionCommand", () => {
+  it("accepts the claude CLI resuming or starting exactly the session id", () => {
+    expect(isClaudeSessionCommand("/Users/u/.local/bin/claude --resume abc-1", "abc-1")).toBe(true);
+    expect(isClaudeSessionCommand("/Users/u/.local/bin/claude --session-id abc-1", "abc-1")).toBe(true);
+    expect(isClaudeSessionCommand("node /x/claude --session-id abc-1 --verbose", "abc-1")).toBe(true);
+  });
+
+  it("rejects another id, a missing id, other programs and a bare claude", () => {
+    expect(isClaudeSessionCommand("/Users/u/.local/bin/claude --session-id abc-12", "abc-1")).toBe(false);
+    expect(isClaudeSessionCommand("/Users/u/.local/bin/claude --session-id", "abc-1")).toBe(false);
+    expect(isClaudeSessionCommand("/x/claude-switch --session-id abc-1", "abc-1")).toBe(false);
+    expect(isClaudeSessionCommand("python3 claude --session-id abc-1", "abc-1")).toBe(false);
+    expect(isClaudeSessionCommand("claude", "abc-1")).toBe(false);
   });
 });

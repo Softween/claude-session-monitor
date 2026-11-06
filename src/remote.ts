@@ -8,6 +8,7 @@ import { createHash } from "crypto";
 import * as os from "os";
 import { parseResetToEpoch } from "./core";
 import type { SessionView } from "./providers/types";
+import { ALLOWED_CWDS_MAX } from "./remoteCwds";
 import { groupOf, type GroupKey } from "./view";
 
 export type FleetBucket = "waiting" | "yourTurn" | "working" | "idle" | "limited" | "ended";
@@ -88,6 +89,8 @@ export interface IngestBody {
   sessions: FleetSession[];
   accounts: FleetAccount[];
   machine: FleetMachine;
+  /** folders a remote `newSession` may start Claude in (remoteCwds.ts), newest first */
+  allowedCwds?: string[];
 }
 
 /** Account input: the panel's AccountView shape plus which one rotation would pick. */
@@ -105,6 +108,7 @@ export interface SnapshotInput {
   accounts: SnapshotAccountInput[];
   bestAccountId?: string | null;
   machine: FleetMachine;
+  allowedCwds?: string[];
   now?: number; // epoch ms
 }
 
@@ -211,6 +215,7 @@ export function buildSnapshot(input: SnapshotInput): IngestBody {
     sessions: input.rows.slice(0, MAX_SESSIONS).map((v) => sessionOf(v, now / 1000, activeEmail)),
     accounts: input.accounts.map((a) => accountOf(a, input.bestAccountId ?? null)),
     machine: coarseMachine({ ...input.machine, sessions: input.rows.length }),
+    ...(input.allowedCwds ? { allowedCwds: input.allowedCwds.slice(0, ALLOWED_CWDS_MAX) } : {}),
   };
 }
 

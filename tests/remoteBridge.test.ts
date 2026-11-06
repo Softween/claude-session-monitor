@@ -217,6 +217,31 @@ describe("RemoteBridge command loop", () => {
     bridge.dispose();
   });
 
+  it("after a newSession that started, pushes a snapshot inside the 10 s gap before it posts the result", async () => {
+    const r = relay([{ id: "n1", type: "newSession", cwd: "/r/app", createdAt: Date.now() }]);
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const bridge = startBridge(async () => {
+      await gate;
+      return { ok: true, message: "new session s1 started in app" };
+    });
+    await bridge.restart();
+    const ingests = () => r.calls.filter((c) => c.url.endsWith("/fleet/ingest")).length;
+    bridge.onRows([]);
+    await vi.waitFor(() => expect(ingests()).toBe(1), { timeout: 5000 });
+    release();
+    const tick = setInterval(() => bridge.onRows([]), 50); // the panel's poll cycle
+    await vi.waitFor(() => expect(r.results).toHaveLength(1), { timeout: 5000 });
+    clearInterval(tick);
+    bridge.dispose();
+
+    const order = r.calls
+      .map((c) => (c.url.endsWith("/fleet/ingest") ? "ingest" : c.url.endsWith("/result") ? "result" : "poll"))
+      .filter((x) => x !== "poll");
+    expect(order.slice(0, 3)).toEqual(["ingest", "ingest", "result"]);
+    expect(r.results[0].body).toEqual({ ok: true, message: "new session s1 started in app" });
+  });
+
   it("refuses a relay answer over 256 KB and runs nothing from it", async () => {
     relay([{ id: "x1", type: "kill", sessionId: "s1", createdAt: Date.now() }], String(256 * 1024 + 1));
     const execute = vi.fn(async () => ({ ok: true, message: "ran" }));

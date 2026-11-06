@@ -140,6 +140,13 @@ describe("buildSnapshot", () => {
     expect(b.accounts).toEqual([]);
   });
 
+  it("carries allowedCwds when given, at most 30, and leaves the field out otherwise", () => {
+    const cwds = Array.from({ length: 35 }, (_, i) => `/r/p${i}`);
+    expect(buildSnapshot({ host: "mac", rows: [], accounts: [], machine, allowedCwds: cwds, now: 1 }).allowedCwds).toEqual(cwds.slice(0, 30));
+    expect(buildSnapshot({ host: "mac", rows: [], accounts: [], machine, allowedCwds: [], now: 1 }).allowedCwds).toEqual([]);
+    expect("allowedCwds" in buildSnapshot({ host: "mac", rows: [], accounts: [], machine, now: 1 })).toBe(false);
+  });
+
   it("clipBytes leaves short strings alone", () => {
     expect(clipBytes("abc", 10)).toBe("abc");
     expect(Buffer.byteLength(clipBytes("a".repeat(100), 10))).toBeLessThanOrEqual(10);

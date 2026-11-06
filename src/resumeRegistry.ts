@@ -87,3 +87,15 @@ export function isClaudeResumeCommand(command: string, sessionId: string): boole
   const at = tokens.indexOf("--resume");
   return isClaudeCliCommand(command) && at >= 0 && tokens[at + 1] === sessionId;
 }
+
+/**
+ * The claude CLI this window runs for exactly `sessionId`: resumed
+ * (`claude --resume <id>`) or started as a remote new session
+ * (`claude --session-id <id>`).
+ */
+export function isClaudeSessionCommand(command: string, sessionId: string): boolean {
+  if (isClaudeResumeCommand(command, sessionId)) return true;
+  const tokens = command.trim().split(/\s+/);
+  const at = tokens.indexOf("--session-id");
+  return isClaudeCliCommand(command) && at >= 0 && tokens[at + 1] === sessionId;
+}

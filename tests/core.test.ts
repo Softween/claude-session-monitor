@@ -1280,6 +1280,18 @@ describe("phantom hook records", () => {
     expect(collect(start({ pid: 1, source: "clear" }), true)).toHaveLength(1); // after /clear: at once
     expect(collect(start({ pid: 1, event: "Notification" }), true)).toHaveLength(1); // past its start
   });
+  it("shows a fresh startup record at once when this window started its terminal (a remote new session)", () => {
+    const h = mk({ source: "startup", pid: 1, transcript_path: path.join(tmp, "nope.jsonl") });
+    const views = collectSessions({
+      now: NOW_S,
+      hookStatuses: new Map([[h.session_id, h]]),
+      extraTranscripts: [],
+      effortSettings: { level: "high" },
+      pidAlive: () => true,
+      resumePids: new Map([["s1", 1]]),
+    });
+    expect(views.map((v) => v.sessionId)).toEqual(["s1"]);
+  });
   it("shows record whose transcript exists even if pid is dead", () => {
     const t = path.join(tmp, "t.jsonl");
     fs.writeFileSync(t, JSON.stringify({ type: "user", message: { role: "user", content: "hi" }, timestamp: new Date(NOW_S * 1000).toISOString() }) + "\n");

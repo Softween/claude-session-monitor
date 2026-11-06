@@ -857,8 +857,9 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
     // Drop phantom hook records (account-switch tab bursts that never got a transcript).
     if (hook && !hasTranscript && isPhantom(hook, now, { graceSec: opts.phantomGraceSec, alive: opts.pidAlive }))
       continue;
-    // Hold back a just-started session without a transcript (see isUnsettledStart).
-    if (hook && !hasTranscript && isUnsettledStart(hook, now, { alive: opts.pidAlive })) continue;
+    // Hold back a just-started session without a transcript (see isUnsettledStart),
+    // except one this window started itself (a remote new session): it is no probe.
+    if (hook && !hasTranscript && !opts.resumePids?.has(sid) && isUnsettledStart(hook, now, { alive: opts.pidAlive })) continue;
 
     // Filter out observer / SDK-subagent sessions.
     if (!entrypointAllowed(tx?.entrypoint, allowed)) continue;

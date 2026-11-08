@@ -11,7 +11,6 @@ import {
   useOutcome,
   useStartMs,
   USE_STUCK_MS,
-  useStuck,
   type ActiveCandidate,
 } from "../src/activeAccount";
 import type { AccountsFile } from "../src/core";
@@ -160,27 +159,27 @@ describe("useStartMs", () => {
   });
 });
 
-describe("useStuck", () => {
-  it("gives a use up only after 90 s, past the CLI's 60 s timeout", () => {
+describe("USE_STUCK_MS", () => {
+  it("the UI waits 90 s for a use, as the webview's own fallback does", () => {
     expect(USE_STUCK_MS).toBe(90_000);
-    expect(useStuck(NOW, NOW + 60_000)).toBe(false);
-    expect(useStuck(NOW, NOW + 90_000)).toBe(false);
-    expect(useStuck(NOW, NOW + 90_001)).toBe(true);
   });
 });
 
 describe("useOutcome", () => {
+  const run = (code: number | null, stdout = "", stderr = "", signal: NodeJS.Signals | null = null) => ({ code, signal, stdout, stderr });
   it("success reports the last stdout line", () => {
-    expect(useOutcome(null, "warming up\nactive: b@x.com (Max)\n", "warning: capture failed: x\n")).toEqual({ ok: true, text: "active: b@x.com (Max)" });
-    expect(useOutcome(null, "", "")).toEqual({ ok: true, text: "done" });
+    expect(useOutcome(run(0, "warming up\nactive: b@x.com (Max)\n", "warning: capture failed: x\n"))).toEqual({ ok: true, text: "active: b@x.com (Max)" });
+    expect(useOutcome(run(0))).toEqual({ ok: true, text: "done" });
   });
-  it("failure reports the CLI's error line, stderr first, capped at 200 characters", () => {
-    expect(useOutcome({ message: "Command failed: claude-switch use b@x.com" }, "", "claude-switch: vault for b@x.com has no oauthAccount; log in once with that account\n")).toEqual({
+  it("failure reports the CLI's error line, stderr first, cleaned and capped at 200 characters, else how it ended", () => {
+    expect(useOutcome(run(2, "", "claude-switch: vault for b@x.com has no oauthAccount; log in once with that account\n"))).toEqual({
       ok: false,
       text: "claude-switch: vault for b@x.com has no oauthAccount; log in once with that account",
     });
-    expect(useOutcome({ message: "Command failed: x\nspawn claude-switch ENOENT" }, "", "").text).toBe("spawn claude-switch ENOENT");
-    expect(useOutcome({ message: "x" }, "", "e".repeat(300)).text).toHaveLength(200);
-    expect(useOutcome({ message: "x", killed: true }, "", "")).toEqual({ ok: false, text: "claude-switch use timed out" });
+    expect(useOutcome(run(1, "trying b@x.com\n")).text).toBe("trying b@x.com");
+    expect(useOutcome(run(1, "", "e".repeat(300))).text).toHaveLength(200);
+    expect(useOutcome(run(1, "", "\x1b[31mclaude-switch: boom\x1b[0m\r\n")).text).toBe("claude-switch: boom");
+    expect(useOutcome(run(3))).toEqual({ ok: false, text: "claude-switch use exited with code 3" });
+    expect(useOutcome(run(null, "", "", "SIGKILL"))).toEqual({ ok: false, text: "claude-switch use ended by SIGKILL" });
   });
 });

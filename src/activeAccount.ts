@@ -3,6 +3,7 @@
 // helpers (no vscode import) so they are unit-tested.
 import type { AccountsFile } from "./core";
 import { displayNames, panelFresh, type SwitchPanel } from "./switchPanel";
+import { exitText, lastLine, type SwitchResult } from "./switchRunner";
 
 /** One observation of the active login, stamped with the time its source was written. */
 export interface ActiveCandidate {
@@ -88,28 +89,16 @@ export function useStartMs(clickedAt: unknown, receivedMs: number): number {
   return typeof clickedAt === "number" && clickedAt <= receivedMs && receivedMs - clickedAt < 60_000 ? clickedAt : receivedMs;
 }
 
-/** How long a `claude-switch use` may stay unanswered before the host gives it up (the CLI timeout is 60 s; the webview's own fallback is also 90 s). */
+/** How long the panel shows "Switching…" for a `claude-switch use` before it says the run goes on (UI only: the CLI is never signaled; the webview's own fallback is also 90 s). */
 export const USE_STUCK_MS = 90_000;
-
-/** True when a `use` started at `startedMs` is still unanswered after USE_STUCK_MS. */
-export function useStuck(startedMs: number, nowMs: number): boolean {
-  return nowMs - startedMs > USE_STUCK_MS;
-}
 
 export interface UseOutcome {
   ok: boolean;
   text: string;
 }
 
-/** What `claude-switch use` reported: its last non-empty output line (stderr first on failure), at most 200 characters. */
-export function useOutcome(err: { message?: string; killed?: boolean } | null, stdout: string, stderr: string): UseOutcome {
-  const lastLine = (s: string): string =>
-    s
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .pop() ?? "";
-  if (!err) return { ok: true, text: (lastLine(stdout) || "done").slice(0, 200) };
-  if (err.killed) return { ok: false, text: "claude-switch use timed out" };
-  return { ok: false, text: (lastLine(stderr) || lastLine(stdout) || lastLine(err.message ?? "") || "claude-switch use failed").slice(0, 200) };
+/** What `claude-switch use` reported: its last non-empty output line (stderr first on failure), cleaned, at most 200 characters. */
+export function useOutcome(res: SwitchResult): UseOutcome {
+  if (res.code === 0) return { ok: true, text: lastLine(res.stdout) || "done" };
+  return { ok: false, text: lastLine(res.stderr) || lastLine(res.stdout) || exitText(res, "use") };
 }

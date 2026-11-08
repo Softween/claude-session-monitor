@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterAll, afterEach } from "vitest";
+import { EventEmitter } from "events";
 import * as fs from "fs";
 
 // Isolate the extension from the real home: core derives its dirs from os.homedir().
@@ -18,6 +19,8 @@ const rec = vi.hoisted(() => ({
   closeListeners: [] as Array<(terminal: any) => void>,
   bridgeDeps: null as any, // the remote bridge's deps, captured by the pass-through mock below
   execFileImpl: null as null | ((args: any[]) => boolean), // returns true when it handled the call
+  spawnImpl: null as null | ((args: any[]) => any), // returns the child when it handled the call
+  statusMessages: [] as string[],
 }));
 
 vi.mock("os", async (orig) => {
@@ -38,11 +41,14 @@ vi.mock("child_process", async () => {
     },
     spawn: (...args: any[]) => {
       rec.spawns.push(args);
+      const custom = rec.spawnImpl?.(args);
+      if (custom) return custom;
       const proc: any = new EventEmitter();
       proc.stdin = new PassThrough();
       proc.stdout = new PassThrough();
       proc.stderr = new PassThrough();
       proc.kill = vi.fn();
+      proc.unref = vi.fn();
       queueMicrotask(() => {
         const error: NodeJS.ErrnoException = new Error(`spawn ${String(args[0])} ENOENT`);
         error.code = "ENOENT";
@@ -139,7 +145,10 @@ vi.mock("vscode", () => {
         return Promise.resolve(undefined);
       },
       showErrorMessage: () => Promise.resolve(undefined),
-      setStatusBarMessage: () => ({ dispose() {} }),
+      setStatusBarMessage: (text: string) => {
+        rec.statusMessages.push(text);
+        return { dispose() {} };
+      },
       showTextDocument: () => Promise.resolve(undefined),
       tabGroups: { all: [], activeTabGroup: { activeTab: undefined } },
     },
@@ -265,6 +274,8 @@ afterEach(() => {
   rec.bridgeDeps = null;
   rec.terminals.length = 0;
   rec.execFileImpl = null;
+  rec.spawnImpl = null;
+  rec.statusMessages.length = 0;
   keeperWaiting.clear(); // module-level: one test's claude-switch keeper state must not leak into the next
   lastCtx = undefined;
   vi.useRealTimers();
@@ -613,6 +624,25 @@ describe("active login and Use this account", () => {
     fs.mkdirSync(`${HOME}/.claude/bin`, { recursive: true });
     fs.writeFileSync(`${HOME}/.claude/bin/claude-switch`, "#!/bin/sh\n", { mode: 0o755 });
   }
+  // A fake claude-switch child per run: it ends only when the test calls exit(),
+  // which writes its output into the files the runner handed to it.
+  function fakeSwitch(): { calls: string[][]; children: any[]; exit(i: number, code: number, stdout?: string, stderr?: string): void } {
+    const calls: string[][] = [];
+    const children: any[] = [];
+    rec.spawnImpl = (args) => {
+      if (!String(args[0]).endsWith("/.claude/bin/claude-switch")) return undefined;
+      calls.push(args[1]);
+      const child: any = Object.assign(new EventEmitter(), { kill: vi.fn(), unref: vi.fn(), stdio: args[2].stdio });
+      children.push(child);
+      return child;
+    };
+    const exit = (i: number, code: number, stdout = "", stderr = ""): void => {
+      fs.writeSync(children[i].stdio[1], stdout);
+      fs.writeSync(children[i].stdio[2], stderr);
+      children[i].emit("close", code, null);
+    };
+    return { calls, children, exit };
+  }
   // Registry still on A (the state the 2.20 panel was stuck in); the shared live
   // snapshot holds A's gauges without an acct tag, as an older build wrote it.
   function seedRegistryOnA(): void {
@@ -670,23 +700,18 @@ describe("active login and Use this account", () => {
     seedRegistryOnA();
     writeLogin(UA, "a@x.com");
     writePanel(UA, "a@x.com");
-    const calls: string[][] = [];
-    rec.execFileImpl = (args) => {
-      if (!String(args[0]).endsWith("/.claude/bin/claude-switch")) return false;
-      calls.push(args[1]);
-      setTimeout(() => {
-        writeLogin(UB, "b@x.com");
-        writePanel(UB, "b@x.com");
-        args[args.length - 1](null, "active: b@x.com (Max)\n", "");
-      }, 30);
-      return true;
-    };
+    const sw = fakeSwitch();
     const { posted, send } = activateWithLimitsView();
     await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
     const at = Date.now();
     send({ type: "useAccount", email: "b@x.com", at });
-    expect(calls).toEqual([["use", "b@x.com"]]);
+    expect(sw.calls).toEqual([["use", "b@x.com"]]);
     expect(posted[posted.length - 1].usePending).toBe("b@x.com");
+    setTimeout(() => {
+      writeLogin(UB, "b@x.com");
+      writePanel(UB, "b@x.com");
+      sw.exit(0, 0, "active: b@x.com (Max)\n");
+    }, 30);
     await vi.waitFor(() => expect(posted[posted.length - 1].useResult).toEqual({ email: "b@x.com", at, ok: true, text: "active: b@x.com (Max)" }));
     const last = posted[posted.length - 1];
     expect(last.usePending).toBeUndefined();
@@ -702,15 +727,11 @@ describe("active login and Use this account", () => {
     seedRegistryOnA();
     writeLogin(UA, "a@x.com");
     writePanel(UA, "a@x.com");
-    rec.execFileImpl = (args) => {
-      if (!String(args[0]).endsWith("/.claude/bin/claude-switch")) return false;
-      const err = Object.assign(new Error("Command failed: claude-switch use b@x.com"), { code: 2 });
-      setTimeout(() => args[args.length - 1](err, "", "claude-switch: vault for b@x.com has no oauthAccount; log in once with that account\n"), 10);
-      return true;
-    };
+    const sw = fakeSwitch();
     const { posted, send } = activateWithLimitsView();
     await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
     send({ type: "useAccount", email: "b@x.com", at: Date.now() });
+    sw.exit(0, 2, "", "claude-switch: vault for b@x.com has no oauthAccount; log in once with that account\n");
     await vi.waitFor(() => expect(posted[posted.length - 1].useResult?.ok).toBe(false));
     const last = posted[posted.length - 1];
     expect(last.useResult.text).toBe("claude-switch: vault for b@x.com has no oauthAccount; log in once with that account");
@@ -762,8 +783,8 @@ describe("active login and Use this account", () => {
     writeLogin(UA, "a@x.com");
     writePanel(UA, "a@x.com");
     let calls = 0;
-    rec.execFileImpl = (args) => {
-      if (!String(args[0]).endsWith("/.claude/bin/claude-switch")) return false;
+    rec.spawnImpl = (args) => {
+      if (!String(args[0]).endsWith("/.claude/bin/claude-switch")) return undefined;
       calls++;
       throw Object.assign(new Error("spawn E2BIG"), { code: "E2BIG", syscall: "spawn" });
     };
@@ -771,26 +792,20 @@ describe("active login and Use this account", () => {
     await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
     const at = Date.now();
     expect(() => send({ type: "useAccount", email: "b@x.com", at })).not.toThrow();
-    const last = posted[posted.length - 1];
-    expect(last.usePending).toBeUndefined();
-    expect(last.useResult).toEqual({ email: "b@x.com", at, ok: false, text: "could not start claude-switch: spawn E2BIG" });
+    await vi.waitFor(() => expect(posted[posted.length - 1].useResult).toEqual({ email: "b@x.com", at, ok: false, text: "could not start claude-switch: spawn E2BIG" }));
+    expect(posted[posted.length - 1].usePending).toBeUndefined();
     send({ type: "useAccount", email: "b@x.com", at: Date.now() });
     expect(calls).toBe(2); // not refused as "already switching"
     expect(debugLog()).toContain("use: b@x.com");
   });
 
-  it("the host gives up a claude-switch use that never exits after 90 s, and its late exit does not clear a newer switch", async () => {
+  it("after 90 s the panel stops showing Switching… but claude-switch use runs on: never signaled, nothing new starts, and its late exit still switches the login", async () => {
     fakeClock();
     installSwitchCli();
     seedRegistryOnA();
     writeLogin(UA, "a@x.com");
     writePanel(UA, "a@x.com");
-    const exits: Array<(err: unknown, stdout: string, stderr: string) => void> = [];
-    rec.execFileImpl = (args) => {
-      if (!String(args[0]).endsWith("/.claude/bin/claude-switch")) return false;
-      exits.push(args[args.length - 1]); // a hung child: no exit yet
-      return true;
-    };
+    const sw = fakeSwitch();
     const { posted, send } = activateWithLimitsView();
     await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
     const at = Date.now();
@@ -800,14 +815,74 @@ describe("active login and Use this account", () => {
     expect(posted[posted.length - 1].usePending).toBe("b@x.com");
     vi.advanceTimersByTime(4_000);
     expect(posted[posted.length - 1].usePending).toBeUndefined();
-    expect(posted[posted.length - 1].useResult).toEqual({ email: "b@x.com", at, ok: false, text: "claude-switch use did not exit within 90 s" });
+    expect(posted[posted.length - 1].useResult).toEqual({
+      email: "b@x.com",
+      at,
+      ok: false,
+      running: true,
+      text: "claude-switch use has been running for 90 s; the panel will update from panel.json when it finishes",
+    });
+    expect(debugLog()).toContain("still running: claude-switch use has been running for 90 s");
 
-    send({ type: "useAccount", email: "b@x.com", at: Date.now() }); // the buttons are back
-    expect(exits).toHaveLength(2);
-    expect(posted[posted.length - 1].usePending).toBe("b@x.com");
-    exits[0](null, "active: b@x.com (Max)\n", ""); // the first child exits late
-    await vi.waitFor(() => expect(debugLog()).toContain("exited without error but the active login is a@x.com"));
-    expect(posted[posted.length - 1].usePending).toBe("b@x.com"); // still the second switch
+    const again = Date.now();
+    send({ type: "useAccount", email: "b@x.com", at: again }); // the buttons are back, but the run goes on: nothing new starts
+    expect(sw.calls).toEqual([["use", "b@x.com"]]);
+    expect(posted[posted.length - 1].useResult).toEqual({ email: "b@x.com", at: again, ok: false, text: "claude-switch use b@x.com is still running (started 92 s ago)" });
+
+    vi.advanceTimersByTime(150_000); // minutes past any old timeout
+    expect(sw.children[0].kill).not.toHaveBeenCalled();
+    writeLogin(UB, "b@x.com");
+    writePanel(UB, "b@x.com");
+    sw.exit(0, 0, "active: b@x.com (Max)\n"); // the run finishes late
+    await vi.waitFor(() => expect(posted[posted.length - 1].useResult).toEqual({ email: "b@x.com", at, ok: true, text: "active: b@x.com (Max)" }));
+    expect(card(posted[posted.length - 1], UB).active).toBe(true);
+    expect(registry().activeId).toBe(UB);
+    expect(debugLog()).toMatch(/use: b@x\.com \d+ms \(cli \d+ms, ok: active: b@x\.com \(Max\)\)/);
+    expect(sw.children[0].kill).not.toHaveBeenCalled();
+  });
+
+  it("one claude-switch run at a time: Refresh Usage while use runs starts no tick, and Use while the tick runs starts nothing", async () => {
+    installSwitchCli();
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    writePanel(UA, "a@x.com");
+    const sw = fakeSwitch();
+    const { posted, send } = activateWithLimitsView();
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
+    send({ type: "useAccount", email: "b@x.com", at: Date.now() });
+    await rec.commands.get("claudeSessionMonitor.refreshUsage")!();
+    expect(sw.calls).toEqual([["use", "b@x.com"]]);
+    expect(rec.statusMessages).toContainEqual(expect.stringMatching(/^claude-switch use b@x\.com is still running \(started \d+ s ago\)$/));
+    sw.exit(0, 1, "", "claude-switch: boom\n");
+    await vi.waitFor(() => expect(posted[posted.length - 1].useResult).toMatchObject({ email: "b@x.com", ok: false, text: "claude-switch: boom" }));
+
+    await rec.commands.get("claudeSessionMonitor.refreshUsage")!();
+    expect(sw.calls).toEqual([["use", "b@x.com"], ["tick", "--fresh"]]);
+    const at = Date.now();
+    send({ type: "useAccount", email: "b@x.com", at });
+    expect(sw.calls).toHaveLength(2);
+    expect(posted[posted.length - 1].usePending).toBeUndefined();
+    expect(posted[posted.length - 1].useResult).toMatchObject({ email: "b@x.com", at, ok: false });
+    expect(posted[posted.length - 1].useResult.text).toMatch(/^claude-switch tick --fresh is still running \(started \d+ s ago\)$/);
+    sw.exit(1, 0, "no switch needed\n");
+    await vi.waitFor(() => expect(rec.statusMessages).toContain("claude-switch: no switch needed"));
+    for (const child of sw.children) expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it("a claude-switch that cannot be started (ENOENT) is named in the panel and the status bar, and the buttons come back", async () => {
+    installSwitchCli(); // present for the gate; the mocked spawn answers ENOENT, as a missing interpreter on its #! line would
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    writePanel(UA, "a@x.com");
+    const { posted, send } = activateWithLimitsView();
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
+    const at = Date.now();
+    send({ type: "useAccount", email: "b@x.com", at });
+    const text = "could not start claude-switch: ~/.claude/bin/claude-switch or the interpreter on its #! line was not found (ENOENT)";
+    await vi.waitFor(() => expect(posted[posted.length - 1].useResult).toEqual({ email: "b@x.com", at, ok: false, text }));
+    expect(posted[posted.length - 1].usePending).toBeUndefined();
+    await rec.commands.get("claudeSessionMonitor.refreshUsage")!();
+    await vi.waitFor(() => expect(rec.statusMessages).toContain(text));
   });
 
   it("an untagged snapshot of the previous login never shows on the new active card when another window moved the registry", async () => {
@@ -894,6 +969,7 @@ describe("active login and Use this account", () => {
     send({ type: "useAccount", email: "a@x.com", at: Date.now() });
     await rec.commands.get("claudeSessionMonitor.refreshUsage")!();
     expect(calls).toEqual([]);
+    expect(rec.spawns.filter((a) => String(a[0]).endsWith("/.claude/bin/claude-switch"))).toEqual([]);
   });
 
   it("without the claude-switch CLI a passive account keeps the extension's own token refresh and no claude-switch directory is created", async () => {

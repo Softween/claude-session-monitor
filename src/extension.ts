@@ -24,7 +24,8 @@ import { runTool } from "./remote";
 import { sanitizeRemoteLine } from "./remoteInput";
 import { resolveClaudeBinary } from "./claudeBinary";
 import { sendToSession } from "./peerSend";
-import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, useStuck, type ActiveCandidate } from "./activeAccount";
+import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, type ActiveCandidate } from "./activeAccount";
+import { SwitchRunner, busyText, exitText, lastLine, spawnFailureText } from "./switchRunner";
 import { execFile } from "child_process";
 import { parseParentPid, pickSessionTerminal, pickUniqueLabel } from "./terminalMatch";
 import { ResumeRegistry, isClaudeCliCommand, isClaudeSessionCommand } from "./resumeRegistry";
@@ -569,8 +570,8 @@ interface LimitsPayload {
   panelFresh?: boolean; // claude-switch owns switching: simplified cards, no Rotate
   ui?: { switchActivityOpen: boolean; expandedAccounts: Record<string, boolean> }; // persisted in workspaceState
   useEmails?: string[]; // non-active accounts the panel can switch to
-  usePending?: string; // email `claude-switch use` is switching to right now
-  useResult?: { email: string; at: number; ok: boolean; text: string }; // last finished `use` (at = its click time), shown for a few seconds
+  usePending?: string; // email `claude-switch use` is switching to right now (until it exits or the 90 s UI timeout)
+  useResult?: { email: string; at: number; ok: boolean; text: string; running?: boolean }; // last finished `use` (at = its click time), shown for a few seconds; running: past the UI timeout, until it exits
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,8 +1208,8 @@ function useButton(email){
 function useResultLine(){
   const r = last.useResult;
   if(!r) return '';
-  return '<div class="useres'+(r.ok?'':' err')+'" role="status" data-testid="csm-use-result">'
-    + (r.ok ? 'Switched to '+esc(r.email) : 'Could not switch to '+esc(r.email)+': '+esc(r.text)) + '</div>';
+  return '<div class="useres'+(r.ok||r.running?'':' err')+'" role="status" data-testid="csm-use-result">'
+    + (r.ok ? 'Switched to '+esc(r.email) : (r.running ? 'Still switching to ' : 'Could not switch to ')+esc(r.email)+': '+esc(r.text)) + '</div>';
 }
 function switchBlock(){
   let h = last.switchHtml || '';
@@ -1224,7 +1225,7 @@ function render(){
   const root = document.getElementById('root');
   if(!last){ return; }
   if(!ui) ui = last.ui || { switchActivityOpen:false, expandedAccounts:{} };
-  if(pendingUse && Date.now() - pendingUse.at > 90000) pendingUse = null; // the host always answers within the 60 s CLI timeout
+  if(pendingUse && Date.now() - pendingUse.at > 90000) pendingUse = null; // the host answers within its 90 s UI timeout (the result, or that the run goes on)
   let h = switchBlock() + useResultLine();
   const cards = (last.providers && last.providers.length) ? last.providers : [{
     id:'claude', provider:'claude', label:'Claude', active:true, ts:last.ts, official:last.official, gauges:last.gauges||[],
@@ -1377,9 +1378,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     },
   );
 
-  type UseFinish = (ok: boolean, text: string, cliMs: number | null) => void;
-  let usePending: { email: string; started: number; finish: UseFinish } | null = null; // the `claude-switch use` running right now
-  let useDone: { email: string; at: number; ok: boolean; text: string; until: number } | null = null;
+  type UseFinish = (ok: boolean, text: string, cliMs: number | null, running?: boolean) => void;
+  type UseRun = { email: string; started: number; finish: UseFinish };
+  let usePending: UseRun | null = null; // the `claude-switch use` the panel shows as "Switching…"
+  let useDone: { email: string; at: number; ok: boolean; text: string; until: number; running?: boolean } | null = null;
+  const switchRunner = new SwitchRunner(SWITCH_CLI); // one `use` or `tick --fresh` at a time, never signaled
 
   /**
    * claude-switch owns switching; this only shells out to its `use` command (no
@@ -1391,10 +1394,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     const received = Date.now();
     const t0 = useStartMs(clickedAt, received);
     const at = typeof clickedAt === "number" ? clickedAt : received;
-    const finish: UseFinish = (ok, text, cliMs) => {
-      useDone = { email, at, ok, text, until: Date.now() + (ok ? 10_000 : 30_000) };
+    const finish: UseFinish = (ok, text, cliMs, running = false) => {
+      useDone = { email, at, ok, text, until: running ? Infinity : Date.now() + (ok ? 10_000 : 30_000), ...(running ? { running } : {}) };
       pushUsagePayload();
-      log(`use: ${email} ${Date.now() - t0}ms (${cliMs === null ? "cli not run" : `cli ${cliMs}ms`}, ${ok ? "ok" : "failed"}: ${text})`);
+      log(`use: ${email} ${Date.now() - t0}ms (${cliMs === null ? "cli not run" : `cli ${cliMs}ms`}, ${ok ? "ok" : running ? "still running" : "failed"}: ${text})`);
       vscode.window.setStatusBarMessage(`claude-switch use ${email}: ${text.slice(0, 160)}`, 8000);
     };
     if (usePending) {
@@ -1406,39 +1409,43 @@ export function activate(ctx: vscode.ExtensionContext): void {
       finish(false, "claude-switch does not list this account right now (panel.json missing, stale or without it)", null);
       return;
     }
-    const run = { email, started: Date.now(), finish };
+    const run: UseRun = { email, started: Date.now(), finish };
+    const launch = switchRunner.start(["use", email], { timeoutMs: USE_STUCK_MS, onTimeout: () => stopWaitingForUse(run) });
+    if (!launch.started) {
+      finish(false, busyText(launch.running, Date.now()), null);
+      return;
+    }
     usePending = run;
     pushUsagePayload();
-    const started = Date.now();
-    try {
-      execFile(SWITCH_CLI, ["use", email], { timeout: 60_000 }, (err, stdout, stderr) => {
-        const cliMs = Date.now() - started;
-        const out = useOutcome(err, String(stdout ?? ""), String(stderr ?? ""));
+    void launch.done.then(
+      (res) => {
+        const cliMs = Date.now() - run.started;
+        const out = useOutcome(res);
         void syncActive(true)
           .catch((e: unknown) => {
             log("use: re-resolve failed " + String(e));
             return false;
           })
           .then(() => {
-            if (usePending === run) usePending = null; // a late exit (given up by expireStuckUse) must not clear a newer switch
+            if (usePending === run) usePending = null; // after the UI timeout the panel already stopped showing "Switching…"
             const now = accountsFile.accounts.find((a) => a.id === accountsFile.activeId)?.email;
             if (out.ok && now?.toLowerCase() !== email.toLowerCase()) finish(false, `claude-switch exited without error but the active login is ${now ?? "unknown"}`, cliMs);
             else finish(out.ok, out.text, cliMs);
           });
-      });
-    } catch (e) {
-      // A synchronous spawn failure (E2BIG, ENOMEM) never calls back: without this the button stays "Switching…" until reload.
-      usePending = null;
-      finish(false, `could not start claude-switch: ${e instanceof Error ? e.message : String(e)}`, null);
-    }
+      },
+      (e: unknown) => {
+        // Not started (ENOENT, EACCES, E2BIG): without this the button stays "Switching…" until the UI timeout.
+        if (usePending === run) usePending = null;
+        finish(false, spawnFailureText(e, SWITCH_CLI), null);
+      },
+    );
   }
 
-  /** Called every tick: a `use` whose exit never arrived (a child the 60 s timeout could not end) is given up, so the Use buttons come back. */
-  function expireStuckUse(): void {
-    if (!usePending || !useStuck(usePending.started, Date.now())) return;
-    const run = usePending;
+  /** The UI timeout of a `use`: the panel stops showing "Switching…" and says the run goes on; the process is never signaled and its exit is still handled. */
+  function stopWaitingForUse(run: UseRun): void {
+    if (usePending !== run) return;
     usePending = null;
-    run.finish(false, `claude-switch use did not exit within ${USE_STUCK_MS / 1000} s`, Date.now() - run.started);
+    run.finish(false, `claude-switch use has been running for ${USE_STUCK_MS / 1000} s; the panel will update from panel.json when it finishes`, Date.now() - run.started, true);
   }
   ctx.subscriptions.push(
     vscode.window.registerWebviewViewProvider("claudeSessionMonitor.limits", limitsView),
@@ -2536,7 +2543,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         ui: { switchActivityOpen: open, expandedAccounts: ctx.workspaceState.get<Record<string, boolean>>("csm.expandedAccounts", {}) },
         useEmails: fresh ? (panel.accounts ?? []).map((a) => a.email) : [],
         usePending: usePending?.email,
-        useResult: useDone && Date.now() < useDone.until ? { email: useDone.email, at: useDone.at, ok: useDone.ok, text: useDone.text } : undefined,
+        useResult: useDone && Date.now() < useDone.until ? { email: useDone.email, at: useDone.at, ok: useDone.ok, text: useDone.text, ...(useDone.running ? { running: true } : {}) } : undefined,
       });
       renderStatusBar();
     } catch {
@@ -2602,7 +2609,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
     // keychain read only on change / every 60 s.
     if (claudeEnabled()) followActive();
     if (claudeEnabled()) void captureActiveLogin(false);
-    expireStuckUse();
 
     // Official usage poll — coordinated across ALL VS Code windows through the
     // shared snapshot file (see pollUsage).
@@ -3176,15 +3182,24 @@ export function activate(ctx: vscode.ExtensionContext): void {
       ]);
       try {
         if (switchInstalled()) {
-          execFile(SWITCH_CLI, ["tick", "--fresh"], { timeout: 90_000 }, (err, stdout, stderr) => {
-            try {
-              const out = String(err ? stderr || stdout || err.message : stdout || stderr || "done").trim().split("\n").filter(Boolean).pop() ?? "";
-              vscode.window.setStatusBarMessage(`claude-switch: ${out.slice(0, 160)}`, 8000);
-              pushUsagePayload();
-            } catch {
-              /* never fail the refresh */
-            }
-          });
+          const launch = switchRunner.start(["tick", "--fresh"]);
+          if (!launch.started) {
+            vscode.window.setStatusBarMessage(busyText(launch.running, Date.now()), 8000);
+          } else {
+            launch.done
+              .then(
+                (res) => {
+                  const ok = res.code === 0;
+                  const out = ok ? lastLine(res.stdout) || lastLine(res.stderr) || "done" : lastLine(res.stderr) || lastLine(res.stdout) || exitText(res, "tick --fresh");
+                  vscode.window.setStatusBarMessage(`claude-switch: ${out.slice(0, 160)}`, 8000);
+                  pushUsagePayload();
+                },
+                (e: unknown) => vscode.window.setStatusBarMessage(spawnFailureText(e, SWITCH_CLI), 8000),
+              )
+              .catch(() => {
+                /* never fail the refresh */
+              });
+          }
         }
       } catch {
         /* never fail the refresh */

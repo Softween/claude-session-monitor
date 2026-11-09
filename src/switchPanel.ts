@@ -25,6 +25,7 @@ export interface PanelAccount {
   rank?: number;
   needsLogin?: boolean;
   needsLoginReason?: string | null;
+  excluded?: boolean; // claude-switch never switches to it (the panel's skip box); absent on older CLIs = false
 }
 export interface PanelEvent { ts: number; kind: string; text: string }
 export interface SwitchPanel {
@@ -116,10 +117,11 @@ export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number, acti
 export interface CardHeader {
   rank?: number;
   name: string;
-  chip: "active" | "ready" | "exhausted" | "login";
+  chip: "active" | "ready" | "exhausted" | "login" | "excluded";
   resetMs?: number; // exhausted: when the exhausting gauge(s) reset
   exhausted?: boolean; // active login that is also exhausted (the chip stays "active")
   loginNeeded?: boolean; // active login that claude-switch flags as needing a login (the chip stays "active")
+  excluded?: boolean; // set only for accounts claude-switch lists (they get the skip box): true = never switched to
   gauges?: HeaderGauge[];
 }
 export interface HeaderGauge { label: string; short: string; pct: number; hot: boolean }
@@ -159,17 +161,39 @@ export function headerGauges(gauges: HGauge[]): HeaderGauge[] {
     .map((x) => named(x.g));
 }
 
-/** Header chip: the active login is always "active" (adding login needed and an exhausted reset); others login needed > exhausted (a gauge at 100%) > ready. */
+/**
+ * Header chip: the active login is always "active" (adding login needed and an exhausted reset); others
+ * excluded > login needed > exhausted (a gauge at 100%) > ready. `excluded` (claude-switch lists the
+ * account) is passed through: it ticks the skip box, and an active excluded login stays "active".
+ */
 export function headerChip(
-  a: { active: boolean; loginNeeded: boolean; gauges: HGauge[] },
-): Pick<CardHeader, "chip" | "resetMs" | "exhausted" | "loginNeeded"> {
+  a: { active: boolean; loginNeeded: boolean; gauges: HGauge[]; excluded?: boolean },
+): Pick<CardHeader, "chip" | "resetMs" | "exhausted" | "loginNeeded" | "excluded"> {
   const full = a.gauges.filter((g) => typeof g.pct === "number" && g.pct >= 100);
   const resets = full.map((g) => g.resetMs).filter((r): r is number => typeof r === "number");
   const reset = resets.length ? { resetMs: Math.max(...resets) } : {};
-  if (a.active) return { chip: "active", ...(a.loginNeeded ? { loginNeeded: true } : {}), ...(full.length ? { exhausted: true, ...reset } : {}) };
-  if (a.loginNeeded) return { chip: "login" };
-  if (full.length) return { chip: "exhausted", ...reset };
-  return { chip: "ready" };
+  const ex = a.excluded === undefined ? {} : { excluded: a.excluded };
+  if (a.active) return { chip: "active", ...(a.loginNeeded ? { loginNeeded: true } : {}), ...(full.length ? { exhausted: true, ...reset } : {}), ...ex };
+  if (a.excluded) return { chip: "excluded", ...ex };
+  if (a.loginNeeded) return { chip: "login", ...ex };
+  if (full.length) return { chip: "exhausted", ...reset, ...ex };
+  return { chip: "ready", ...ex };
+}
+
+/** claude-switch's skip flag for an account its panel lists (absent on older CLIs = false); undefined when it does not list the email. */
+export function excludedOf(panel: SwitchPanel | null, email: string): boolean | undefined {
+  const a = panel ? findAccount(panel, email) : undefined;
+  return a ? a.excluded === true : undefined;
+}
+
+/** Emails a "Use this account" button may target: every account the panel lists except the excluded ones. */
+export function useTargets(panel: SwitchPanel | null): string[] {
+  return (panel?.accounts ?? []).filter((a) => a.excluded !== true).map((a) => a.email);
+}
+
+/** Lower-cased emails the panel marks excluded: the extension's own automatic picks (best, Rotate, auto-rotate) skip them. */
+export function excludedEmails(panel: SwitchPanel | null): Set<string> {
+  return new Set((panel?.accounts ?? []).filter((a) => a.excluded === true).map((a) => a.email.toLowerCase()));
 }
 
 /** Claude cards by claude-switch priority (rank, else priority order); unranked after, Codex last. Stable. */

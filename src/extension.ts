@@ -17,7 +17,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, headerGauges, switchInstalled, type CardHeader } from "./switchPanel";
+import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, excludedEmails, excludedOf, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, headerGauges, switchInstalled, useTargets, type CardHeader } from "./switchPanel";
 import { gaugeColumn } from "./compact";
 import { TYPED_REASON, deliverText, registerRemoteBridge, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt, type RemoteBridge } from "./remoteBridge";
 import { runTool } from "./remote";
@@ -572,6 +572,7 @@ interface LimitsPayload {
   useEmails?: string[]; // non-active accounts the panel can switch to
   usePending?: string; // email `claude-switch use` is switching to right now (until it exits or the 90 s UI timeout)
   useResult?: { email: string; at: number; ok: boolean; text: string; running?: boolean }; // last finished `use` (at = its click time), shown for a few seconds; running: past the UI timeout, until it exits
+  skipFailed?: { email: string; at: number }; // last skip box change claude-switch did not apply (at = its click time): the webview drops its optimistic state
 }
 
 // ---------------------------------------------------------------------------
@@ -929,6 +930,7 @@ class LimitsView implements vscode.WebviewViewProvider {
     private readonly onRotate: () => void,
     private readonly onUse: (email: string, clickedAt?: number) => void,
     private readonly onUi: (key: string, value: unknown) => void,
+    private readonly onExclude: (email: string, excluded: boolean, clickedAt?: number) => void,
   ) {}
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -941,6 +943,7 @@ class LimitsView implements vscode.WebviewViewProvider {
       else if (m && m.type === "rotateBest") this.onRotate();
       else if (m && m.type === "useAccount" && typeof m.email === "string") this.onUse(m.email, typeof m.at === "number" ? m.at : undefined);
       else if (m && m.type === "setUi" && typeof m.key === "string") this.onUi(m.key, m.value);
+      else if (m && m.type === "setExcluded" && typeof m.email === "string" && typeof m.excluded === "boolean") this.onExclude(m.email, m.excluded, typeof m.at === "number" ? m.at : undefined);
     });
     if (this.pending) view.webview.postMessage(this.pending);
   }
@@ -1013,6 +1016,13 @@ function limitsHtml(): string {
   @container (max-width: 360px) { .chdr .gl { display:none; } .chdr .gs { display:inline; } }
   .chip { font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .chip.login { color: var(--vscode-charts-red, #f14c4c); font-weight:600; }
+  /* Skip box: outside the role=button header so it never toggles the card; an excluded header is dimmed. */
+  .chrow { display:flex; align-items:center; gap:6px; min-width:0; }
+  .chrow .chdr { flex:1; min-width:0; }
+  .chdr.excl { opacity:.55; }
+  .skipbox { flex:none; display:flex; align-items:center; gap:3px; font-size:10px; line-height:16px; color: var(--vscode-descriptionForeground); cursor:pointer; user-select:none; }
+  .skipbox input { margin:0; width:11px; height:11px; cursor:pointer; accent-color: var(--vscode-checkbox-background, auto); }
+  body.vscode-dark .skipbox input { color-scheme: dark; }
   .cbody { margin-top:4px; padding-bottom:4px; }
   .useacct { border:0; background:transparent; color: var(--vscode-textLink-foreground); font:inherit; font-size:11px; cursor:pointer; padding:0; margin-top:4px; }
   .useacct:hover { text-decoration:underline; }
@@ -1165,25 +1175,36 @@ function providerCard(card){
 }
 let ui = null;
 let pendingUse = null; // { email, at }: a Use this account click waiting for the host's result
+let pendingSkip = {}; // email -> { value, at }: a skip box change shown as clicked until the panel agrees, the host reports a failure or 20 s pass
 function expandedOf(card){
   const v = ui && ui.expandedAccounts ? ui.expandedAccounts[card.id] : undefined;
   return v === undefined ? !!card.active : !!v;
 }
 function chipHtml(h){
-  if(h.chip==='active') return '<span class="adot" title="active login"></span><span class="chip'+(h.loginNeeded?' login':'')+'">active'+(h.loginNeeded?' · login needed':'')+(h.exhausted?' · exhausted'+(h.resetMs?' · '+fmtLeft(h.resetMs).replace('resets now','now'):''):'')+'</span>';
+  if(h.chip==='active') return '<span class="adot" title="active login"></span><span class="chip'+(h.loginNeeded?' login':'')+'">active'+(h.excluded?' · excluded':'')+(h.loginNeeded?' · login needed':'')+(h.exhausted?' · exhausted'+(h.resetMs?' · '+fmtLeft(h.resetMs).replace('resets now','now'):''):'')+'</span>';
+  if(h.chip==='excluded') return '<span class="chip">excluded</span>';
   if(h.chip==='exhausted') return '<span class="chip">exhausted'+(h.resetMs?' · '+fmtLeft(h.resetMs).replace('resets now','now'):'')+'</span>';
   if(h.chip==='login') return '<span class="chip login">login needed</span>';
   return '<span class="chip">ready</span>';
 }
+// Skip box for an account claude-switch lists (hdr.excluded is set only for those): ticked = never switched to.
+function skipBox(card, email){
+  const h = card.hdr;
+  if(card.provider!=='claude' || typeof h.excluded!=='boolean') return '';
+  const p = pendingSkip[email], on = p ? p.value : h.excluded;
+  return '<label class="skipbox" title="Skip: claude-switch never switches to this account. Untick to use it again.">'
+    + '<input type="checkbox" data-skip="'+esc(email)+'" aria-label="Skip '+esc(email)+' in claude-switch" data-testid="csm-account-skip"'+(on?' checked':'')+'> skip</label>';
+}
 // Simplified card: ONE always-visible header line, gauge rows only when expanded.
 function collapsibleCard(card){
   const h = card.hdr, open = expandedOf(card);
-  let out = '<div class="card ccard" data-testid="csm-account-row"><div class="chdr" role="button" tabindex="0" data-toggle="'+esc(card.id)+'" aria-expanded="'+open+'" title="'+esc(card.label)+'">'
+  const email = card.email || card.label.replace(/^(Claude|Codex) · /,'');
+  let out = '<div class="card ccard" data-testid="csm-account-row"><div class="chrow"><div class="chdr'+(h.excluded?' excl':'')+'" role="button" tabindex="0" data-toggle="'+esc(card.id)+'" aria-expanded="'+open+'" title="'+esc(card.label)+'">'
     + '<span class="chev">'+(open?'▾':'▸')+'</span>'
     + '<span class="ctitle">'+(h.rank?'<span class="swrank num">#'+h.rank+'</span> ':'')+esc(h.name)+'</span>'
     + chipHtml(h)
     + (h.gauges && h.gauges.length ? '<span class="cgauges num" data-testid="csm-account-gauges">'+h.gauges.map(g=>'<span class="hg'+(g.hot?' hot':'')+'"><span class="gl">'+esc(g.label)+'</span><span class="gs">'+esc(g.short)+'</span> '+fmtPct(g.pct)+'%</span>').join(' · ')+'</span>' : '')
-    + '</div>';
+    + '</div>' + skipBox(card, email) + '</div>';
   if(open){
     out += '<div class="cbody">';
     const gauges = card.official ? (card.gauges||[]) : [];
@@ -1191,7 +1212,6 @@ function collapsibleCard(card){
     if(card.provider==='claude' && card.active && gauges.some(g=>g.key==='session'||g.key==='5h')) out += etaLine(last.eta);
     if(card.note) out += '<div class="note">'+esc(card.note)+'</div>';
     else if(!card.official) out += '<div class="note">Official '+esc(card.label)+' usage is unavailable. Session state remains available.</div>';
-    const email = card.email || card.label.replace(/^(Claude|Codex) · /,'');
     if(card.provider==='claude' && !card.active && last.useEmails && last.useEmails.indexOf(email)>=0) out += useButton(email);
     out += '</div>';
   }
@@ -1226,6 +1246,7 @@ function render(){
   if(!last){ return; }
   if(!ui) ui = last.ui || { switchActivityOpen:false, expandedAccounts:{} };
   if(pendingUse && Date.now() - pendingUse.at > 90000) pendingUse = null; // the host answers within its 90 s UI timeout (the result, or that the run goes on)
+  for(const e in pendingSkip) if(Date.now() - pendingSkip[e].at > 20000) delete pendingSkip[e];
   let h = switchBlock() + useResultLine();
   const cards = (last.providers && last.providers.length) ? last.providers : [{
     id:'claude', provider:'claude', label:'Claude', active:true, ts:last.ts, official:last.official, gauges:last.gauges||[],
@@ -1268,6 +1289,7 @@ document.getElementById('root').addEventListener('keydown', (ev) => {
 document.getElementById('root').addEventListener('click', (ev) => {
   let el = ev.target;
   while(el && el !== ev.currentTarget){
+    if(el.classList && el.classList.contains('skipbox')) return; // the skip box and its label never toggle the card
     if(el.dataset && el.dataset.switch){ vscodeApi.postMessage({ type:'switchAccount', id: el.dataset.switch }); return; }
     if(el.dataset && el.dataset.use){
       if(!pendingUse && !last.usePending){
@@ -1289,10 +1311,26 @@ document.getElementById('root').addEventListener('click', (ev) => {
     el = el.parentElement;
   }
 });
+document.getElementById('root').addEventListener('change', (ev) => {
+  const t = ev.target, email = t && t.dataset && t.dataset.skip;
+  if(!email) return;
+  pendingSkip[email] = { value: !!t.checked, at: Date.now() };
+  vscodeApi.postMessage({ type:'setExcluded', email: email, excluded: !!t.checked, at: pendingSkip[email].at });
+});
+// A pending skip box ends when the panel reports the clicked value or the host reports that click failed.
+function settleSkips(){
+  const f = last.skipFailed;
+  if(f && pendingSkip[f.email] && pendingSkip[f.email].at===f.at) delete pendingSkip[f.email];
+  for(const c of (last.providers||[])){
+    const p = c.email && pendingSkip[c.email];
+    if(p && c.hdr && c.hdr.excluded===p.value) delete pendingSkip[c.email];
+  }
+}
 window.addEventListener('message', e => {
   if(e.data && e.data.type==='update'){
     last = e.data;
     if(pendingUse && last.useResult && last.useResult.at===pendingUse.at) pendingUse = null;
+    settleSkips();
     render();
   }
 });
@@ -1376,13 +1414,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
       if (key === "switchActivityOpen") void ctx.workspaceState.update("csm.switchActivityOpen", value === true);
       else if (key === "expandedAccounts" && value && typeof value === "object") void ctx.workspaceState.update("csm.expandedAccounts", value);
     },
+    (email, excluded, clickedAt) => setExcludedViaCli(email, excluded, clickedAt),
   );
 
   type UseFinish = (ok: boolean, text: string, cliMs: number | null, running?: boolean) => void;
   type UseRun = { email: string; started: number; finish: UseFinish };
   let usePending: UseRun | null = null; // the `claude-switch use` the panel shows as "Switching…"
   let useDone: { email: string; at: number; ok: boolean; text: string; until: number; running?: boolean } | null = null;
-  const switchRunner = new SwitchRunner(SWITCH_CLI); // one `use` or `tick --fresh` at a time, never signaled
+  let skipFailed: { email: string; at: number; until: number } | null = null; // last skip box change claude-switch did not apply
+  const switchRunner = new SwitchRunner(SWITCH_CLI); // one `use`, `tick --fresh` or `exclude`/`include` at a time, never signaled
 
   /**
    * claude-switch owns switching; this only shells out to its `use` command (no
@@ -1446,6 +1486,46 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (usePending !== run) return;
     usePending = null;
     run.finish(false, `claude-switch use has been running for ${USE_STUCK_MS / 1000} s; the panel will update from panel.json when it finishes`, Date.now() - run.started, true);
+  }
+
+  /**
+   * The skip box: `claude-switch exclude|include <email>` through the same runner as
+   * `use` (one claude-switch run at a time, never signaled). While another run is in
+   * flight the change is refused with a warning, not queued. On success panel.json is
+   * re-read at once; on failure the CLI's message is shown and the webview drops its
+   * optimistic box state.
+   */
+  function setExcludedViaCli(email: string, excluded: boolean, clickedAt?: number): void {
+    const at = typeof clickedAt === "number" ? clickedAt : Date.now();
+    const cmd = excluded ? "exclude" : "include";
+    const fail = (text: string): void => {
+      skipFailed = { email, at, until: Date.now() + 30_000 };
+      pushUsagePayload();
+      log(`${cmd}: ${email} failed: ${text}`);
+      void vscode.window.showWarningMessage(`claude-switch ${cmd} ${email}: ${text}`);
+    };
+    if (!(installedPanel()?.accounts ?? []).some((a) => a.email === email)) {
+      fail("claude-switch does not list this account (panel.json missing or without it)");
+      return;
+    }
+    const launch = switchRunner.start([cmd, email]);
+    if (!launch.started) {
+      fail(`${busyText(launch.running, Date.now())}; try again when it ends`);
+      return;
+    }
+    void launch.done.then(
+      (res) => {
+        if (res.code !== 0) {
+          fail(lastLine(res.stderr) || lastLine(res.stdout) || exitText(res, cmd));
+          return;
+        }
+        const out = lastLine(res.stdout) || `${cmd} ${email}: done`;
+        log(`${cmd}: ${email} ok: ${out}`);
+        vscode.window.setStatusBarMessage(`claude-switch: ${out.slice(0, 160)}`, 8000);
+        pushUsagePayload(); // re-reads panel.json now, not after the watch debounce
+      },
+      (e: unknown) => fail(spawnFailureText(e, SWITCH_CLI)),
+    );
   }
   ctx.subscriptions.push(
     vscode.window.registerWebviewViewProvider("claudeSessionMonitor.limits", limitsView),
@@ -2346,6 +2426,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     const selId = activeId;
     const list = track ? accountsFile.accounts : accountsFile.accounts.filter((a) => a.id === activeId);
     const labels = accountPillLabels(list.map((a) => a.email));
+    const skip = excludedEmails(installedPanel()); // claude-switch's skip boxes: no automatic pick (best, Rotate, auto-rotate) lands on one
     const accounts: AccountView[] = list.map((a, i) => {
       const e = usageByAccount.get(a.id);
       return {
@@ -2362,6 +2443,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
             ? false
             : (e?.stale ?? false) || a.needsLogin === true || (a.tokenExpiresAt != null && Date.now() > a.tokenExpiresAt),
         needsLogin: a.id !== activeId && a.needsLogin === true,
+        excluded: skip.has(a.email.toLowerCase()),
       };
     });
     return {
@@ -2527,7 +2609,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           const hdr: CardHeader = {
             ...(b.rank !== undefined ? { rank: b.rank } : {}),
             name: p.provider === "claude" ? claudeNames[ci++] : "Codex",
-            ...headerChip({ active: p.provider === "claude" && p.active, loginNeeded: !!p.loginNeeded || !!b.loginNeeded, gauges: p.official ? p.gauges : [] }),
+            ...headerChip({ active: p.provider === "claude" && p.active, loginNeeded: !!p.loginNeeded || !!b.loginNeeded, excluded: p.provider === "claude" ? excludedOf(panel, email) : undefined, gauges: p.official ? p.gauges : [] }),
             gauges: headerGauges(p.official ? p.gauges : []),
           };
           return { ...p, hdr };
@@ -2541,9 +2623,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
         panelFresh: fresh,
         showTokenStats: showTokenStats(),
         ui: { switchActivityOpen: open, expandedAccounts: ctx.workspaceState.get<Record<string, boolean>>("csm.expandedAccounts", {}) },
-        useEmails: fresh ? (panel.accounts ?? []).map((a) => a.email) : [],
+        useEmails: fresh ? useTargets(panel) : [],
         usePending: usePending?.email,
         useResult: useDone && Date.now() < useDone.until ? { email: useDone.email, at: useDone.at, ok: useDone.ok, text: useDone.text, ...(useDone.running ? { running: true } : {}) } : undefined,
+        skipFailed: skipFailed && Date.now() < skipFailed.until ? { email: skipFailed.email, at: skipFailed.at } : undefined,
       });
       renderStatusBar();
     } catch {

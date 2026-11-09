@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { accountBadges, displayNames, headerChip, headerGauges, installedPanel, mergePanelAccounts, orderCards, panelAge, panelFresh, readPanel, renderSwitchBlock, switchInstalled, worstGauge, type SwitchPanel } from "../src/switchPanel";
+import { accountBadges, displayNames, excludedEmails, excludedOf, headerChip, headerGauges, installedPanel, mergePanelAccounts, orderCards, panelAge, panelFresh, readPanel, renderSwitchBlock, switchInstalled, useTargets, worstGauge, type SwitchPanel } from "../src/switchPanel";
 
 const NOW = 1_792_200_000_000;
 const sec = NOW / 1000;
@@ -150,6 +150,41 @@ describe("card helpers", () => {
     expect(headerChip({ ...base, loginNeeded: true, gauges: [g("s", 100, 5000)] })).toEqual({ chip: "login" });
     expect(headerChip({ ...base, gauges: [g("s", 100, 5000), g("w", 100, 9000), g("f", 40, 99999)] })).toEqual({ chip: "exhausted", resetMs: 9000 });
     expect(headerChip({ ...base, gauges: [g("s", 99, 5000)] })).toEqual({ chip: "ready" });
+  });
+});
+
+describe("skip box (accounts claude-switch excludes)", () => {
+  const g = (label: string, pct: number | null, resetMs: number | null = null) => ({ label, pct, resetMs });
+  const p = full({
+    accounts: [
+      { email: "esya@example.com", rank: 1, excluded: true },
+      { email: "bilal@softween.com", rank: 2, excluded: false },
+      { email: "bilal@glossgo.com", rank: 3 }, // older CLI: no excluded key
+    ],
+  });
+  it("chip: a non-active excluded account is 'excluded' over login, exhausted and ready; the active one stays 'active' with the flag", () => {
+    const base = { active: false, loginNeeded: false, gauges: [g("s", 10)] };
+    expect(headerChip({ ...base, excluded: true })).toEqual({ chip: "excluded", excluded: true });
+    expect(headerChip({ ...base, excluded: true, loginNeeded: true, gauges: [g("s", 100, 5000)] })).toEqual({ chip: "excluded", excluded: true });
+    expect(headerChip({ ...base, active: true, excluded: true, gauges: [g("s", 100, 5000)] })).toEqual({ chip: "active", exhausted: true, resetMs: 5000, excluded: true });
+    expect(headerChip({ ...base, excluded: false })).toEqual({ chip: "ready", excluded: false });
+    expect(headerChip({ ...base, excluded: false, gauges: [g("s", 100, 5000)] })).toEqual({ chip: "exhausted", resetMs: 5000, excluded: false });
+    expect(headerChip({ ...base, excluded: false, loginNeeded: true })).toEqual({ chip: "login", excluded: false });
+    expect(headerChip(base)).toEqual({ chip: "ready" }); // not listed by claude-switch: no flag, so no skip box
+  });
+  it("excludedOf: true or false for listed accounts (a missing key is false), undefined when the panel does not list the email", () => {
+    expect(excludedOf(p, "esya@example.com")).toBe(true);
+    expect(excludedOf(p, "bilal@softween.com")).toBe(false);
+    expect(excludedOf(p, "bilal@glossgo.com")).toBe(false);
+    expect(excludedOf(p, "who@example.com")).toBeUndefined();
+    expect(excludedOf(null, "esya@example.com")).toBeUndefined();
+  });
+  it("useTargets leaves excluded accounts out; excludedEmails lists them lower-cased", () => {
+    expect(useTargets(p)).toEqual(["bilal@softween.com", "bilal@glossgo.com"]);
+    expect(useTargets(full({ accounts: [] }))).toEqual([]);
+    expect(useTargets(null)).toEqual([]);
+    expect([...excludedEmails(full({ accounts: [{ email: "Esya@Example.com", excluded: true }, { email: "b@x.com" }, { email: "c@x.com", excluded: false }] }))]).toEqual(["esya@example.com"]);
+    expect(excludedEmails(null).size).toBe(0);
   });
 });
 

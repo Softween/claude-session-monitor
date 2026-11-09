@@ -1,7 +1,7 @@
 // Runs the real Usage Limits webview script (an inline <script> inside a TS
 // template string, invisible to tsc) against a stub DOM, so a missing render
 // helper fails here instead of leaving the panel on "Waiting for usage-limit data".
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import vm from "node:vm";
@@ -17,7 +17,10 @@ function webviewScript(): string {
   return src.slice(start, end).replace(/\$\{[^}]*\}/g, "0").replace(/\\`/g, "`");
 }
 
-interface Harness { root: { innerHTML: string }; send: (data: unknown) => void; posted: unknown[]; click: (attr: string, value: string) => void; key: (attr: string, value: string, k: string) => void }
+interface Harness {
+  root: { innerHTML: string }; send: (data: unknown) => void; posted: unknown[]; click: (attr: string, value: string) => void; key: (attr: string, value: string, k: string) => void;
+  clickOn: (target: unknown) => void; change: (attr: string, value: string, checked: boolean) => void;
+}
 type Handler = (ev: any) => void;
 
 function mount(): Harness {
@@ -44,6 +47,8 @@ function mount(): Harness {
     root, posted, send: (data) => send({ data }),
     click: (attr, value) => handlers.click({ target: target(attr, value), currentTarget: root }),
     key: (attr, value, k) => handlers.keydown({ key: k, target: target(attr, value), preventDefault: () => undefined }),
+    clickOn: (t) => handlers.click({ target: t, currentTarget: root }),
+    change: (attr, value, checked) => handlers.change({ target: { ...target(attr, value), checked } }),
   };
 }
 
@@ -309,5 +314,96 @@ describe("Usage Limits webview", () => {
     expect(h.root.innerHTML).toContain(">Session</span><span class=\"gs\">S</span> 27%");
     expect(h.root.innerHTML).toContain("71%");
     expect(spans("full")[2]).toContain("hot");
+  });
+
+  it("skip box: ticked for excluded accounts, outside the toggle header; a change posts setExcluded, never toggles the card and holds until the panel agrees, a failure or 20 s", () => {
+    const now = Date.now();
+    const ok = [gauge("session", "Session (5h)", 20)];
+    const mk = (name: string, active: boolean, excluded: boolean | undefined) => ({
+      id: `claude:${name}`, provider: "claude", label: `Claude · ${name}@x.com`, email: `${name}@x.com`, accountId: name, active, official: true, ts: now / 1000, note: null, gauges: ok,
+      hdr: { name, ...headerChip({ active, loginNeeded: false, excluded, gauges: ok }), gauges: headerGauges(ok) } as CardHeader,
+    });
+    const codex = { id: "codex", provider: "codex", label: "Codex", email: "Codex", active: false, official: true, ts: now / 1000, note: null, gauges: ok,
+      hdr: { name: "Codex", ...headerChip({ active: false, loginNeeded: false, gauges: ok }), gauges: headerGauges(ok) } as CardHeader };
+    const base = {
+      type: "update", ts: now / 1000, official: true, accounts: [{ id: "ana" }, { id: "esya" }, { id: "zed" }], eta: null, tokens: null, models: [], switchHtml: "", switchBadges: {},
+      panelFresh: true, ui: { switchActivityOpen: false, expandedAccounts: { "claude:esya": true } },
+    };
+    // esya excluded or not; zed is a Claude login claude-switch does not list (no excluded flag)
+    const state = (esya: boolean, ana = false) => ({
+      ...base, providers: [mk("ana", true, ana), mk("esya", false, esya), mk("zed", false, undefined), codex],
+      useEmails: ["ana@x.com", ...(esya ? [] : ["esya@x.com"]), "zed@x.com"],
+    });
+    const row = (h: Harness, name: string) => h.root.innerHTML.split('data-testid="csm-account-row"').find((r) => r.includes(`title="Claude · ${name}@x.com"`)) ?? "";
+    const box = (h: Harness, name: string) => row(h, name).match(/<input type="checkbox"[^>]*>/)?.[0] ?? "";
+    const hdr = (h: Harness, name: string) => row(h, name).match(/<div class="chdr[^"]*"[^>]*>[\s\S]*?<\/div>/)?.[0] ?? "";
+    const skips = (h: Harness) => h.posted.filter((m) => (m as { type: string }).type === "setExcluded") as { email: string; excluded: boolean; at: number }[];
+
+    const h = mount();
+    h.send(state(true));
+    expect(hdr(h, "esya")).toContain('<div class="chdr excl" role="button"');
+    expect(hdr(h, "esya")).toContain('<span class="chip">excluded</span>');
+    expect(hdr(h, "esya")).not.toContain("skip");
+    expect(row(h, "esya")).toContain('<div class="chrow"><div class="chdr excl"');
+    expect(row(h, "esya")).toContain('</div><label class="skipbox" title="Skip: claude-switch never switches to this account. Untick to use it again.">');
+    expect(box(h, "esya")).toContain('data-skip="esya@x.com"');
+    expect(box(h, "esya")).toContain('data-testid="csm-account-skip" checked>');
+    expect(row(h, "esya")).toContain('class="cbody"'); // expanded, yet no Use button for an excluded account
+    expect(row(h, "esya")).not.toContain("Use this account");
+    expect(hdr(h, "ana")).toContain('<div class="chdr" role="button"');
+    expect(box(h, "ana")).not.toContain("checked");
+    expect(box(h, "zed")).toBe("");
+    expect(h.root.innerHTML.match(/data-testid="csm-account-skip"/g)).toHaveLength(2); // ana + esya: not zed, not Codex
+
+    // the active login can be excluded too: it stays active, dimmed, until claude-switch moves off it
+    h.send(state(true, true));
+    expect(hdr(h, "ana")).toContain('<div class="chdr excl"');
+    expect(hdr(h, "ana")).toContain('<span class="adot" title="active login"></span><span class="chip">active · excluded</span>');
+    expect(box(h, "ana")).toContain("checked");
+
+    // neither a click on the box or its label nor Space/Enter on the box reaches a data-toggle ancestor
+    const toggler = { dataset: { toggle: "claude:esya" }, classList: { contains: () => false }, parentElement: null };
+    const label = { dataset: {}, classList: { contains: (c: string) => c === "skipbox" }, parentElement: toggler };
+    const input = { dataset: { skip: "esya@x.com" }, classList: { contains: () => false }, parentElement: label };
+    h.clickOn(input);
+    h.clickOn(label);
+    h.key("skip", "esya@x.com", " ");
+    h.key("skip", "esya@x.com", "Enter");
+    expect(h.posted).toEqual([]);
+
+    // unticking posts include; the box stays unticked across ticks until panel.json agrees
+    h.change("skip", "esya@x.com", false);
+    expect(skips(h)).toEqual([{ type: "setExcluded", email: "esya@x.com", excluded: false, at: expect.any(Number) }]);
+    expect(h.posted).toHaveLength(1);
+    h.send(state(true));
+    expect(box(h, "esya")).not.toContain("checked");
+    h.send(state(false));
+    expect(box(h, "esya")).not.toContain("checked");
+    expect(hdr(h, "esya")).toContain(">ready</span>");
+    expect(row(h, "esya")).toContain('data-use="esya@x.com"');
+    h.send(state(true)); // settled: the box follows the panel again
+    expect(box(h, "esya")).toContain("checked");
+
+    // a failure for that click drops the pending state (an older failure does not)
+    h.change("skip", "esya@x.com", false);
+    const at = skips(h)[1].at;
+    h.send({ ...state(true), skipFailed: { email: "esya@x.com", at: at - 1 } });
+    expect(box(h, "esya")).not.toContain("checked");
+    h.send({ ...state(true), skipFailed: { email: "esya@x.com", at } });
+    expect(box(h, "esya")).toContain("checked");
+
+    // with no answer at all the box returns to the panel's value after 20 s
+    const clock = vi.spyOn(Date, "now");
+    try {
+      clock.mockReturnValue(now + 1_000);
+      h.change("skip", "esya@x.com", false);
+      h.send(state(true));
+      expect(box(h, "esya")).not.toContain("checked");
+      clock.mockReturnValue(now + 1_000 + 20_001);
+      h.send(state(true));
+      expect(box(h, "esya")).toContain("checked");
+    } finally {
+      clock.mockRestore();
+    }
   });
 });

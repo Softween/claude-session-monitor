@@ -25,6 +25,7 @@ export type OAuthBlob = Record<string, unknown> & {
 export interface RotationAccount {
   id: string;
   stale: boolean;
+  excluded?: boolean; // claude-switch's skip box: never an automatic pick
   gauges: { key: string; pct: number | null; resetMs: number | null }[];
 }
 
@@ -48,12 +49,12 @@ function limitingReset(a: Pick<RotationAccount, "gauges">): number {
   return best?.resetMs ?? Infinity;
 }
 
-/** Highest score wins (stale / no-data accounts excluded); tie -> earliest reset of its most-used gauge. */
+/** Highest score wins (stale, skipped and no-data accounts excluded); tie -> earliest reset of its most-used gauge. */
 export function pickBestAccount<T extends RotationAccount>(views: T[]): T | undefined {
   let best: T | undefined;
   let bestScore = -Infinity;
   for (const v of views) {
-    if (v.stale) continue;
+    if (v.stale || v.excluded) continue;
     const s = accountScore(v);
     if (s == null) continue;
     if (best === undefined || s > bestScore || (s === bestScore && limitingReset(v) < limitingReset(best))) {

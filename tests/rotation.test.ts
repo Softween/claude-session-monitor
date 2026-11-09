@@ -30,6 +30,13 @@ describe("pickBestAccount", () => {
     expect(pickBestAccount([a, b, c])?.id).toBe("a");
     expect(pickBestAccount([b, c])).toBeUndefined();
   });
+  it("skips accounts claude-switch excludes (the skip box), even with the most headroom", () => {
+    const a = acct("a", 60, 10); // score 40
+    const b = acct("b", 0, 0, { excluded: true }); // score 100, skipped
+    expect(pickBestAccount([a, b])?.id).toBe("a");
+    expect(pickBestAccount([b])).toBeUndefined();
+    expect(pickBestAccount([a, { ...b, excluded: false }])?.id).toBe("b");
+  });
   it("breaks ties by the earliest reset of the most-used gauge", () => {
     const a = acct("a", 50, 10, {}, 5000);
     const b = acct("b", 50, 10, {}, 2000);

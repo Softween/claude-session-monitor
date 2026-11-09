@@ -316,6 +316,32 @@ describe("Usage Limits webview", () => {
     expect(spans("full")[2]).toContain("hot");
   });
 
+  it("an old reading shows ~ before its percentages and its age in the header: active login over 2 min, other accounts over 10 min", () => {
+    const h = mount();
+    const now = Date.now();
+    const mk = (id: string, active: boolean, ageS: number) => {
+      const gauges = [gauge("session", "Session (5h)", 83), gauge("weekly", "Weekly (7d)", 40)];
+      const p = { id, provider: "claude", label: `Claude · ${id}@x.com`, email: `${id}@x.com`, accountId: id, active, official: true, ts: now / 1000 - ageS, note: null, gauges };
+      return { ...p, hdr: { name: id, ...headerChip({ active, loginNeeded: false, gauges }), gauges: headerGauges(gauges) } as CardHeader };
+    };
+    h.send({
+      type: "update", ts: now / 1000, official: true, accounts: [], eta: null, tokens: null, models: [], switchHtml: "", switchBadges: {}, panelFresh: true,
+      ui: { switchActivityOpen: false, expandedAccounts: {} }, useEmails: [],
+      providers: [mk("hot", true, 12 * 60), mk("live", true, 30), mk("calm", false, 5 * 60), mk("cold", false, 15 * 60)],
+    });
+    const row = (id: string) => h.root.innerHTML.split('data-testid="csm-account-row"').find((r) => r.includes(`title="Claude · ${id}@x.com"`)) ?? "";
+    expect(row("hot")).toContain('<span class="cold num" title="');
+    expect(row("hot")).toContain(">12m ago</span>");
+    expect(row("hot")).toContain("</span> ~83%");
+    expect(row("hot")).toMatch(/<span class="p num" style="color:[^"]*">~83%<\/span>/);
+    expect(row("live")).not.toContain("ago</span>");
+    expect(row("live")).not.toContain("~");
+    expect(row("calm")).not.toContain("ago</span>");
+    expect(row("calm")).not.toContain("~");
+    expect(row("cold")).toContain(">15m ago</span>");
+    expect(row("cold")).toContain("</span> ~40%");
+  });
+
   it("skip box: ticked for excluded accounts, outside the toggle header; a change posts setExcluded, never toggles the card and holds until the panel agrees, a failure or 20 s", () => {
     const now = Date.now();
     const ok = [gauge("session", "Session (5h)", 20)];

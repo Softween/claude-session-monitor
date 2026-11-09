@@ -598,6 +598,8 @@ interface ClaudeCredentials {
 // would be constant churn, so the credentials are cached and invalidated on 401/403
 // (captureActiveLogin also replaces them with each of its fresh reads).
 const TOKEN_TTL_SEC = 300;
+// No countdown: it froze between panel pushes. Each card shows its reading's age instead (webview readingOld).
+const RATE_LIMITED_NOTE = "usage API rate-limited — showing the last successful read, retrying automatically";
 let cachedCreds: { creds: ClaudeCredentials; ts: number } | undefined;
 
 async function readClaudeCredentialsCached(): Promise<ClaudeCredentials | undefined> {
@@ -1009,6 +1011,7 @@ function limitsHtml(): string {
   .chdr { container-type:inline-size; }
   .chdr .ctitle { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .chdr .chip { flex:none; }
+  .chdr .cold { flex:none; font-size:10px; color: var(--vscode-charts-yellow, #cca700); white-space:nowrap; }
   .chdr .chev { color: var(--vscode-descriptionForeground); font-size:10px; width:10px; flex:none; }
   .chdr .cgauges { margin-left:auto; flex:none; font-size:11px; white-space:nowrap; }
   .chdr .cgauges .hot { color: var(--vscode-charts-red, #f14c4c); }
@@ -1093,6 +1096,10 @@ function fmtPct(p){
   if(p==null) return '?';
   return p < 10 ? (Math.round(p*10)/10).toString() : String(Math.round(p));
 }
+// The active login is polled every 30 s and keeps burning, so its reading is old after 2 min; other accounts move only
+// at a reset (or through claude.ai), 10 min. An old reading gets ~ before its percentages and its age in the header.
+function readingAge(card){ return card.ts ? Math.max(0, Math.round(Date.now()/1000 - card.ts)) : null; }
+function readingOld(card, age){ return age!=null && age > (card.active ? 120 : 600); }
 function fmtTokens(n){
   if(n==null) return '0';
   if(n<1000) return ''+Math.round(n);
@@ -1142,16 +1149,16 @@ function nameSpan(card, name){
     ? '<span class="ctitle sw" role="button" tabindex="0" data-switch="'+esc(card.accountId)+'" title="Switch Claude Code to this account">'+esc(name)+'</span>'
     : '<span class="ctitle" title="'+esc(card.label)+'">'+esc(name)+'</span>';
 }
-function gaugeRow(g){
+function gaugeRow(g, old){
   const p = g.pct, spent = p!=null && p>=90;
   return '<div class="bar"><span class="l" title="'+esc(g.label)+'">'+esc(gaugeLabel(g.label))+'</span>'
     + '<span class="t"><i'+(spent?' class="bad"':'')+' style="width:'+(p==null?0:Math.min(100,Math.max(1,p)))+'%"></i></span>'
-    + '<span class="p num" style="color:'+color(p)+'">'+fmtPct(p)+'%</span>'
+    + '<span class="p num" style="color:'+color(p)+'">'+(old&&p!=null?'~':'')+fmtPct(p)+'%</span>'
     + '<span class="r num">'+(g.resetMs?fmtLeft(g.resetMs).replace('resets now','now'):'')+'</span></div>';
 }
 // One card per account: header line, then the original one-row-per-gauge bars.
 function providerCard(card){
-  const age = card.ts ? Math.max(0, Math.round(Date.now()/1000 - card.ts)) : null;
+  const age = readingAge(card), old = readingOld(card, age);
   const name = card.label.replace(/^(Claude|Codex) · /,'');
   const sb = (card.provider==='claude' && last.switchBadges && last.switchBadges[name]) || {};
   let h='<div class="card" data-testid="csm-account-row"><div class="chead">'
@@ -1162,11 +1169,11 @@ function providerCard(card){
     + (card.note && card.loginNeeded ? '<span class="clogin">login</span>' : '')
     + (sb.loginNeeded ? '<span class="clogin" title="claude-switch">login needed ('+esc(sb.loginNeeded)+')</span>' : '')
     + (card.plan ? '<span class="cplan">'+esc(card.plan)+'</span>' : '')
-    + (age!=null && age>600 ? '<span class="cage num" title="last official usage fetch">'+fmtAge(age)+' ago</span>' : '')
+    + (old ? '<span class="cage num" title="last official usage fetch">'+fmtAge(age)+' ago</span>' : '')
     + '</div>';
   const gauges = card.official ? (card.gauges||[]) : [];
   if(gauges.length){
-    h += gauges.map(gaugeRow).join('');
+    h += gauges.map(g=>gaugeRow(g, old)).join('');
     if(card.provider==='claude' && card.active && gauges.some(g=>g.key==='session'||g.key==='5h')) h += etaLine(last.eta);
   }
   if(card.note) h += '<div class="note">'+esc(card.note)+'</div>';
@@ -1197,18 +1204,19 @@ function skipBox(card, email){
 }
 // Simplified card: ONE always-visible header line, gauge rows only when expanded.
 function collapsibleCard(card){
-  const h = card.hdr, open = expandedOf(card);
+  const h = card.hdr, open = expandedOf(card), age = readingAge(card), old = readingOld(card, age);
   const email = card.email || card.label.replace(/^(Claude|Codex) · /,'');
   let out = '<div class="card ccard" data-testid="csm-account-row"><div class="chrow"><div class="chdr'+(h.excluded?' excl':'')+'" role="button" tabindex="0" data-toggle="'+esc(card.id)+'" aria-expanded="'+open+'" title="'+esc(card.label)+'">'
     + '<span class="chev">'+(open?'▾':'▸')+'</span>'
     + '<span class="ctitle">'+(h.rank?'<span class="swrank num">#'+h.rank+'</span> ':'')+esc(h.name)+'</span>'
     + chipHtml(h)
-    + (h.gauges && h.gauges.length ? '<span class="cgauges num" data-testid="csm-account-gauges">'+h.gauges.map(g=>'<span class="hg'+(g.hot?' hot':'')+'"><span class="gl">'+esc(g.label)+'</span><span class="gs">'+esc(g.short)+'</span> '+fmtPct(g.pct)+'%</span>').join(' · ')+'</span>' : '')
+    + (old ? '<span class="cold num" title="time since the last successful usage read">'+fmtAge(age)+' ago</span>' : '')
+    + (h.gauges && h.gauges.length ? '<span class="cgauges num" data-testid="csm-account-gauges">'+h.gauges.map(g=>'<span class="hg'+(g.hot?' hot':'')+'"><span class="gl">'+esc(g.label)+'</span><span class="gs">'+esc(g.short)+'</span> '+(old?'~':'')+fmtPct(g.pct)+'%</span>').join(' · ')+'</span>' : '')
     + '</div>' + skipBox(card, email) + '</div>';
   if(open){
     out += '<div class="cbody">';
     const gauges = card.official ? (card.gauges||[]) : [];
-    out += gauges.map(gaugeRow).join('');
+    out += gauges.map(g=>gaugeRow(g, old)).join('');
     if(card.provider==='claude' && card.active && gauges.some(g=>g.key==='session'||g.key==='5h')) out += etaLine(last.eta);
     if(card.note) out += '<div class="note">'+esc(card.note)+'</div>';
     else if(!card.official) out += '<div class="note">Official '+esc(card.label)+' usage is unavailable. Session state remains available.</div>';
@@ -1738,7 +1746,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
     const inBackoff = !force && !!snap?.backoffUntil && now < snap.backoffUntil;
     if (inBackoff) {
-      usageNote = `usage API rate-limited — retrying in ${humanizeAge(Math.max(1, (snap!.backoffUntil as number) - now))}, showing last known data`;
+      usageNote = RATE_LIMITED_NOTE;
     } else if (usageNote?.startsWith("usage API rate-limited")) {
       usageNote = null;
     }
@@ -1801,7 +1809,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       } else if (r.status === 429) {
         const b = nextUsageBackoffSec(r.retryAfterSec);
         writeOfficialSnapshot({ ...cur, attemptTs: nowSec, backoffUntil: nowSec + b, backoffSec: b });
-        usageNote = "usage API rate-limited — backing off, showing last known data";
+        usageNote = RATE_LIMITED_NOTE;
         log(`usage backoff ${b}s`);
       } else if (force) {
         // Manual refresh with no token / network / gauges: say so honestly.

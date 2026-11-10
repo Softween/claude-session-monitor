@@ -225,6 +225,21 @@ and the identity in `~/.claude.json`); nothing else on your machine is touched. 
 Claude Code sessions use the new account, running sessions switch at their next token
 refresh. macOS only.
 
+## Limit burn
+
+The **Limit burn** view ranks Claude sessions by how fast they spend your subscription
+limits over the last 5m, 15m, 1h or 5h. Subagent work counts toward the session that
+started it, and each row names what drives the burn (subagents, a large context, cache writes).
+
+- `+18%/h` is the session's pace over the last 5 minutes, in points of the 5-hour limit
+  per hour. `≈ 23%` is how much of the 5-hour limit it used in the selected window.
+- These are estimates: Anthropic does not publish how subscription limits weigh tokens,
+  so tokens are weighted by API list prices as a proxy and scaled against the account's
+  own 5-hour gauge. Until that gauge has moved 3 points, figures stay in API-equivalent
+  dollars.
+
+Terminal view: `npm run burn -- [--window 5m|15m|1h|5h] [--once] [--json]`.
+
 ## Remote bridge (optional)
 
 Off by default. When you run a relay that implements the `/fleet/*` routes, the extension can mirror the panel to it and take a few commands back, so a phone app or another client can see your sessions.

@@ -150,7 +150,7 @@ vi.mock("vscode", () => {
         return { dispose() {} };
       },
       showTextDocument: () => Promise.resolve(undefined),
-      tabGroups: { all: [], activeTabGroup: { activeTab: undefined } },
+      tabGroups: { all: [], activeTabGroup: { activeTab: undefined }, onDidChangeTabs: () => ({ dispose() {} }) },
     },
     workspace: {
       getConfiguration: () => ({

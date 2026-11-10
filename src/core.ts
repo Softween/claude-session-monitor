@@ -479,6 +479,60 @@ export function parseTranscriptTail(file: string, prev?: TxInfo): TxInfo {
   return info;
 }
 
+/** The newest assistant entry of a transcript (lastAssistantStop). */
+export interface AssistantStop {
+  ts: number; // epoch seconds (0 when the entry has no timestamp)
+  apiError: boolean; // isApiErrorMessage (classifyConvLine's api_error)
+  status?: number; // its apiErrorStatus
+}
+
+function assistantStopIn(file: string, maxBytes: number): AssistantStop | undefined {
+  let tail: { text: string; partialFirst: boolean };
+  try {
+    tail = readTail(file, maxBytes);
+  } catch {
+    return undefined;
+  }
+  const lines = tail.text.split("\n");
+  if (tail.partialFirst && lines.length) lines.shift(); // drop incomplete leading line
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const s = lines[i].trim();
+    if (!s) continue;
+    let obj: any;
+    try {
+      obj = JSON.parse(s);
+    } catch {
+      continue;
+    }
+    if (obj?.type !== "assistant") continue;
+    return {
+      ts: toEpochSeconds(obj.timestamp),
+      apiError: classifyConvLine(obj).kind === "api_error",
+      status: typeof obj.apiErrorStatus === "number" ? obj.apiErrorStatus : undefined,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * The newest assistant entry in a transcript's tail, whatever user, attachment or
+ * system entries follow it (a task-notification, a queued prompt): parseWindow's
+ * newest conversational line is then that user entry. The window grows once, like
+ * parseTranscriptTail's, when a huge last line hides it. undefined: unreadable or
+ * no assistant entry.
+ */
+export function lastAssistantStop(file: string): AssistantStop | undefined {
+  let size: number;
+  try {
+    size = fs.statSync(file).size;
+  } catch {
+    return undefined;
+  }
+  const hit = assistantStopIn(file, MAX_TAIL);
+  if (hit || size <= MAX_TAIL) return hit;
+  return assistantStopIn(file, Math.min(size, MAX_TAIL_GROW));
+}
+
 // ---------------------------------------------------------------------------
 // State resolution
 // ---------------------------------------------------------------------------

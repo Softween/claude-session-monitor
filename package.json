@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.27.1",
+  "version": "2.28.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -150,6 +150,11 @@
         "shortTitle": "Stop Sweep"
       },
       {
+        "command": "claudeSessionMonitor.wakeDeadTabsNow",
+        "title": "Agent Sessions: Wake limit-stopped tabs now",
+        "shortTitle": "Wake Limit-Stopped Tabs"
+      },
+      {
         "command": "claudeSessionMonitor.setModelAll",
         "title": "Agent Sessions: Set Model for All Claude Sessions…",
         "icon": "$(chip)",
@@ -215,6 +220,12 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "claudeSessionMonitor.wakeDeadTabsNow",
+          "when": "config.claudeSessionMonitor.wakeDeadTabs"
+        }
+      ],
       "view/title": [
         {
           "command": "claudeSessionMonitor.toggleProvider",
@@ -440,6 +451,12 @@
           "type": "boolean",
           "default": false,
           "description": "When Claude sessions hit the usage limit (or the Claude 5h window is at 99%+), automatically run the staggered resume sweep ~90s after the window resets."
+        },
+        "claudeSessionMonitor.wakeDeadTabs": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "markdownDescription": "After VS Code restarts, start the process of restored Claude Code tabs whose session had stopped on a usage limit (its last reply is a 429 API error from the last 24 hours), so the paths that resume running sessions reach them too. A restored tab gets its process only once it is shown, so the monitor briefly activates each such tab (one per step, 60 s after the window starts, then every 30 s while you are idle, at least 10 s apart), waits for its process and puts your tabs and focus back. Nothing is typed or sent into a session. Relies on the Claude Code extension's internal `claude-vscode.editor.open` command; after two failed wakes in a row it stops until the window starts again. **Agent Sessions: Wake limit-stopped tabs now** runs it at once."
         },
         "claudeSessionMonitor.idleRamWarnMb": {
           "type": "number",

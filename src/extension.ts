@@ -32,6 +32,7 @@ import { ResumeRegistry, isClaudeCliCommand, isClaudeSessionCommand } from "./re
 import { allowedCwds, mergeSeen, withoutPaths } from "./remoteCwds";
 import { startNewSession } from "./remoteNewSession";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
+import { TabWaker, nodeProbes, summaryText } from "./wakeTabs";
 import {
   KEYCHAIN_SERVICE,
   REFRESH_MARGIN_MS,
@@ -1551,6 +1552,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastViews: SessionView[] = [];
   let lastAllViews: SessionView[] = [];
   let remoteBridge: RemoteBridge | undefined; // optional remote bridge (remoteBridge.ts), off unless url + token are set
+  let tabWaker: TabWaker<TabMemo> | undefined; // wakeTabs.ts, inert unless claudeSessionMonitor.wakeDeadTabs is on
   let lastRecentScan = 0;
   let lastCleanup = 0;
   let lastResourceSample = 0;
@@ -2783,6 +2785,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     remoteBridge?.onRows(allViews);
 
     maybeScheduleAutoResume(allViews);
+    tabWaker?.observe();
 
     // Idle RAM advisory: waiting/your-turn sessions silent >1h holding real memory.
     const idleThr = c.get<number>("idleRamWarnMb", 2000);
@@ -3195,6 +3198,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
         doneLabel: "resume",
         autoType: c.get<boolean>("resumeAutoType", true),
       });
+    }),
+    vscode.commands.registerCommand("claudeSessionMonitor.wakeDeadTabsNow", async () => {
+      if (tabWaker) vscode.window.showInformationMessage(summaryText(await tabWaker.runNow()));
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.setModelAll", async () => {
       const queue = lastAllViews.filter(
@@ -3671,6 +3677,31 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   remoteBridge = registerRemoteBridge(ctx, { log, accounts: remoteAccounts, execute: executeRemote, allowedCwds: () => remoteCwds() });
 
+  // After a restart, show each limit-stopped Claude Code tab once so its process runs
+  // again (wakeTabs.ts). Started before the first refresh, which updates its registry.
+  tabWaker = new TabWaker<TabMemo>({
+    ...nodeProbes(),
+    enabled: () => claudeEnabled() && cfg().get<boolean>("wakeDeadTabs", false) === true,
+    store: ctx.workspaceState,
+    log,
+    now: () => Date.now(),
+    hostPid: process.pid,
+    titleOf: (sid) => lastAllViews.find((v) => v.provider === "claude" && v.sessionId === sid)?.title,
+    windowFocused: () => vscode.window.state.focused,
+    commandExists: async (id) => (await vscode.commands.getCommands(true)).includes(id),
+    executeCommand: (id, ...args) => vscode.commands.executeCommand(id, ...args),
+    snapshotTabs,
+    activeTab: () => vscode.window.tabGroups.activeTabGroup.activeTab,
+    restoreTabs,
+  });
+  tabWaker.start();
+  ctx.subscriptions.push(
+    { dispose: () => tabWaker?.dispose() },
+    vscode.window.tabGroups.onDidChangeTabs((e) => {
+      for (const t of e.closed) if (isClaudePanelTab(t)) tabWaker?.tabClosed(t.label);
+    }),
+  );
+
   refresh();
 }
 
@@ -4090,6 +4121,39 @@ async function focusTab(gi: number, ti: number): Promise<string> {
     await vscode.commands.executeCommand("workbench.action.nextEditorInGroup");
   }
   return "step-to-" + ti;
+}
+
+/** Each editor group's active tab and the active group, taken before a tab wake (wakeTabs.ts). */
+interface TabMemo {
+  group: vscode.TabGroup;
+  actives: Array<[vscode.TabGroup, vscode.Tab | undefined]>;
+}
+
+function snapshotTabs(): TabMemo {
+  const groups = vscode.window.tabGroups;
+  return {
+    group: groups.activeTabGroup,
+    actives: groups.all.map((g): [vscode.TabGroup, vscode.Tab | undefined] => [g, g.activeTab]),
+  };
+}
+
+/** Make every remembered tab its group's active tab again, then focus the remembered group. */
+async function restoreTabs(memo: TabMemo): Promise<void> {
+  const all = vscode.window.tabGroups.all;
+  for (const [g, tab] of memo.actives) {
+    const gi = all.indexOf(g);
+    const ti = tab ? g.tabs.indexOf(tab) : -1;
+    if (gi >= 0 && ti >= 0 && g.activeTab !== tab) await focusTab(gi, ti);
+  }
+  const ai = all.indexOf(memo.group);
+  if (ai >= 0 && ai < FOCUS_GROUP_CMDS.length && vscode.window.tabGroups.activeTabGroup !== memo.group) {
+    await vscode.commands.executeCommand(FOCUS_GROUP_CMDS[ai]);
+  }
+}
+
+/** A Claude Code editor tab (the anthropic.claude-code `claudeVSCodePanel` webview). */
+function isClaudePanelTab(tab: vscode.Tab): boolean {
+  return tab.input instanceof vscode.TabInputWebview && tab.input.viewType.endsWith("claudeVSCodePanel");
 }
 
 async function jumpToSession(v: SessionView): Promise<void> {

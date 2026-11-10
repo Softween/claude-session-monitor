@@ -11,6 +11,7 @@ docs/**
 node_modules/**
 graphify-out/**
 dist/verify.cjs
+dist/burn.cjs
 **/*.ts
 **/*.map
 tsconfig.json

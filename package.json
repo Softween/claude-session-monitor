@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.27.1",
+  "version": "2.28.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -77,6 +77,12 @@
           "name": "Sessions",
           "type": "webview",
           "initialSize": 1
+        },
+        {
+          "id": "claudeSessionMonitor.burn",
+          "name": "Limit burn",
+          "type": "webview",
+          "initialSize": 2
         },
         {
           "id": "claudeSessionMonitor.limits",
@@ -484,6 +490,7 @@
     "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
     "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "verify": "esbuild src/verify.ts --bundle --platform=node --format=cjs --outfile=dist/verify.cjs && node dist/verify.cjs",
+    "burn": "esbuild src/burnCli.ts --bundle --platform=node --format=cjs --outfile=dist/burn.cjs && node dist/burn.cjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

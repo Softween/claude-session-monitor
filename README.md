@@ -200,6 +200,7 @@ All settings are under `claudeSessionMonitor.*`:
 | `resumeAutoType` | `true` | Auto-type resume + Enter (needs Accessibility) |
 | `resumePrompt` | `"resume"` | Text typed during a resume sweep |
 | `resumeStaggerSeconds` | `60` | Seconds between sessions in a resume sweep |
+| `wakeDeadTabs` | `false` | After a restart, briefly activate each restored Claude Code tab whose session stopped on a usage limit (last reply a 429 API error, at most 24 h old) so its process runs again, then restore your tabs and focus. Uses Claude Code's `claude-vscode.editor.open`; user settings only. **Wake limit-stopped tabs now** runs it at once |
 | `resourceSampleMs` | `3000` | CPU/RAM sampling interval |
 | `pollIntervalMs` | `1500` | Status refresh interval |
 | `recentScanMaxAgeHours` | `6` | Show sessions active within the last N hours |

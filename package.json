@@ -79,6 +79,12 @@
           "initialSize": 1
         },
         {
+          "id": "claudeSessionMonitor.burn",
+          "name": "Limit burn",
+          "type": "webview",
+          "initialSize": 2
+        },
+        {
           "id": "claudeSessionMonitor.limits",
           "name": "Usage limits",
           "type": "webview",
@@ -484,6 +490,7 @@
     "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
     "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "verify": "esbuild src/verify.ts --bundle --platform=node --format=cjs --outfile=dist/verify.cjs && node dist/verify.cjs",
+    "burn": "esbuild src/burnCli.ts --bundle --platform=node --format=cjs --outfile=dist/burn.cjs && node dist/burn.cjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

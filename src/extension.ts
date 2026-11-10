@@ -19,6 +19,10 @@ import * as os from "os";
 import * as path from "path";
 import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, excludedEmails, excludedOf, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, headerGauges, switchInstalled, useTargets, type CardHeader } from "./switchPanel";
 import { gaugeColumn } from "./compact";
+import { calibrate } from "./burn";
+import { BURN_WINDOWS, DEFAULT_BURN_WINDOW_MS, buildBurnPayload, burnShares, gaugeSamplesFromHistory, resolveScale } from "./burnPayload";
+import { BurnTracker } from "./burnTracker";
+import { BurnView } from "./burnView";
 import { TYPED_REASON, deliverText, registerRemoteBridge, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt, type RemoteBridge } from "./remoteBridge";
 import { runTool } from "./remote";
 import { sanitizeRemoteLine } from "./remoteInput";
@@ -1540,6 +1544,30 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.window.registerWebviewViewProvider("claudeSessionMonitor.limits", limitsView),
   );
 
+  // Limit burn: what each session spends, read from the transcripts (subagents
+  // included) every few seconds and ranked in its own view.
+  const BURN_HORIZON_MS = 5.5 * 3_600_000;
+  const burnTracker = new BurnTracker({ projectsDir: PROJECTS_DIR, horizonMs: BURN_HORIZON_MS });
+  const storedBurnWindow = ctx.globalState.get<number>("burnWindowMs", DEFAULT_BURN_WINDOW_MS);
+  let burnWindowMs = BURN_WINDOWS.some((w) => w.ms === storedBurnWindow) ? storedBurnWindow : DEFAULT_BURN_WINDOW_MS;
+  let burnScaleCache: Readonly<Record<string, number>> = ctx.globalState.get<Record<string, number>>("burnScaleByAcct") ?? {};
+  let burnShareBySession: Map<string, number> | null = null; // null until the first transcript scan finished
+  let burnHogId: string | null = null;
+  let lastBurnTick = 0;
+  const burnView = new BurnView((action, value) => {
+    if (action === "window") {
+      const ms = Number(value);
+      if (!BURN_WINDOWS.some((w) => w.ms === ms)) return;
+      burnWindowMs = ms;
+      void ctx.globalState.update("burnWindowMs", ms);
+      void burnTick();
+      return;
+    }
+    const v = lastAllViews.find((session) => session.key === value);
+    if (v) void jumpToSession(v);
+  });
+  ctx.subscriptions.push(vscode.window.registerWebviewViewProvider("claudeSessionMonitor.burn", burnView));
+
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusBar.command = "claudeSessionMonitor.focus";
   statusBar.show();
@@ -2537,7 +2565,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
   function pushSessions(views: SessionView[], allViews: SessionView[] = views): void {
     // Token hog: the biggest 5h consumer, only when it is a meaningful share.
     let hogId: string | null = null;
-    if (tokenUsage?.bySession5h) {
+    if (burnShareBySession) {
+      hogId = burnHogId; // priced and with subagents, so it decides once it is available
+    } else if (tokenUsage?.bySession5h) {
       const top = Object.entries(tokenUsage.bySession5h).sort((a, b) => b[1] - a[1])[0];
       if (top && top[1] >= 200_000 && top[1] >= tokenUsage.fiveHour * 0.25) hogId = top[0];
     }
@@ -2568,6 +2598,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
             : providerFilter !== "all" || needsYouOnly
               ? "No sessions match the active filters."
               : "No recent Claude or Codex sessions. Start one and it will appear here.",
+        burnShareBySession,
       ),
     );
     let badge = 0;
@@ -2576,6 +2607,47 @@ export function activate(ctx: vscode.ExtensionContext): void {
       if (g === "limited" || g === "waiting") badge++;
     }
     sessionsView.setBadge(badge, `${badge} session(s) waiting / limited`);
+  }
+
+  // Limit burn tick: tail the transcripts, turn spend into 5h-limit percent with
+  // the account's own gauge history, and push the ranked list to its view.
+  async function burnTick(): Promise<void> {
+    try {
+      await burnTracker.refresh();
+      if (disposed) return;
+      const nowMs = Date.now();
+      const samples = gaugeSamplesFromHistory(readLimitsHistory(240));
+      const latest = samples.length ? samples[samples.length - 1] : null;
+      const fresh = calibrate(samples, burnTracker.records(), { sinceTs: nowMs - BURN_HORIZON_MS });
+      const resolved = resolveScale(fresh, latest?.acct ?? null, burnScaleCache);
+      if (resolved.cache !== burnScaleCache) {
+        burnScaleCache = resolved.cache;
+        void ctx.globalState.update("burnScaleByAcct", burnScaleCache);
+      }
+      const summary5h = burnTracker.summary(5 * 3_600_000);
+      const top = summary5h.sessions[0];
+      burnShareBySession = burnShares(summary5h);
+      burnHogId = top && top.share >= 0.25 && top.cost >= 10 ? top.sessionId : null;
+      const listed = new Map(
+        lastAllViews.filter((v) => v.provider === "claude").map((v) => [v.sessionId, v] as const),
+      );
+      burnView.update(
+        buildBurnPayload({
+          summary: burnTracker.summary(burnWindowMs),
+          scale: resolved.scale,
+          sessionPct: latest && nowMs - latest.ts <= 600_000 ? latest.pct : null,
+          nowMs,
+          lookup: (id) => {
+            const v = listed.get(id);
+            if (v) return { title: v.title, openId: v.key, ended: groupOf(v) === "ended" };
+            const dir = path.basename(burnTracker.cwdOf(id) ?? "");
+            return { title: burnTracker.titleOf(id) ?? `${dir || "session"} ${id.slice(0, 8)}`, openId: "", ended: true };
+          },
+        }),
+      );
+    } catch (e) {
+      log("burn tick error: " + String(e));
+    }
   }
 
   /** syncActive for ticks and watchers: re-render when the active login moved, or always when asked. */
@@ -2695,6 +2767,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
       } catch {
         /* ignore */
       }
+    }
+
+    if (claudeEnabled() && now - lastBurnTick > 5) {
+      lastBurnTick = now;
+      void burnTick();
     }
 
     // Follow the active login on every tick (a stat, a parse only on change) and
@@ -3849,6 +3926,7 @@ function buildSessionsPayload(
   providerFilter: AgentProvider | "all",
   health: ProviderHealth[],
   emptyMessage: string,
+  burnShare: ReadonlyMap<string, number> | null = null,
 ): SessionsPayload {
   const nowSec = Date.now() / 1000;
   const grouped = new Map<GroupKey, SessionRow[]>();
@@ -3868,14 +3946,18 @@ function buildSessionsPayload(
     const tok = tokOf(v);
     const tokenScope = v.tokenScope ?? (v.provider === "claude" ? "rolling-5h" : undefined);
     const total5h = tokens?.fiveHour ?? 0;
+    // Once the burn tracker has data its share (priced, subagents included) replaces the raw token share.
+    const burnPct = burnShare && v.provider === "claude" ? (burnShare.get(v.sessionId) ?? 0) : undefined;
     const share =
-      tokenScope === "rolling-5h" && tok && total5h > 0
-        ? Math.round((tok / total5h) * 100)
-        : 0;
+      burnPct !== undefined
+        ? Math.round(burnPct)
+        : tokenScope === "rolling-5h" && tok && total5h > 0
+          ? Math.round((tok / total5h) * 100)
+          : 0;
     const resTip = res ? `\nCPU: ${Math.round(res.cpu)}%  RAM: ${res.rssMb}MB  (pid ${v.pid})` : "";
     const tokTip =
       tok >= 10_000
-        ? `\ntokens (${tokenScope === "thread-total" ? "thread total" : "rolling 5h"}): ${fmtTokensCompact(tok)}${share >= 1 ? ` · ${share}% of this Mac's total` : ""}${v.provider === "claude" && v.sessionId === hogId ? " · top consumer" : ""}`
+        ? `\ntokens (${tokenScope === "thread-total" ? "thread total" : "rolling 5h"}): ${fmtTokensCompact(tok)}${share >= 1 ? ` · ${share}% of this Mac's ${burnPct !== undefined ? "5h limit burn" : "total"}` : ""}${v.provider === "claude" && v.sessionId === hogId ? " · top consumer" : ""}`
         : "";
     const row: SessionRow = {
       id: v.key,

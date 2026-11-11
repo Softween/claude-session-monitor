@@ -1,21 +1,23 @@
 import { describe, expect, it } from "vitest";
 import {
-  RESETS_URL,
+  USAGE_URL,
   accountView,
   claimReset,
   claimUnresolved,
   cliUserAgent,
   describeClaim,
-  fetchResets,
   fmtUseBy,
   grantKind,
   isUsable,
-  listingDue,
-  nextBackoffSec,
   parseCedarEmber,
+  parseResetsFile,
   pickGrant,
   refillText,
+  resetsFilePath,
+  resetsFileText,
+  resetsTotal,
   summarize,
+  usageRequest,
   withResetsLeft,
   type CedarEmber,
   type ClaimOutcome,
@@ -175,9 +177,9 @@ describe("summarize", () => {
     expect(summarize(s, NOW).map((r) => [r.kind, r.count])).toEqual([["fable", 1]]);
     expect(pickGrant(s, "full", NOW)).toBeNull();
     expect(pickGrant(s, "fable", NOW)?.id).toBe("launch-2610-fable");
-    const view = accountView({ fetchedAt: NOW, status: s }, NOW);
+    const view = accountView({ ts: NOW / 1000, status: s }, undefined, NOW);
     expect(view.kinds.map((k) => k.kind)).toEqual(["fable"]);
-    expect(view.kinds.reduce((n, k) => n + k.count, 0)).toBe(1);
+    expect(resetsTotal([{ ts: NOW / 1000, status: s }, undefined], NOW)).toBe(1);
   });
 
   it("an unusable kind keeps its count and says why; expired grants drop out", () => {
@@ -261,32 +263,51 @@ describe("cliUserAgent", () => {
   });
 });
 
-describe("fetchResets", () => {
-  it("GETs the usage endpoint with the cedar_ember params and the CLI headers", async () => {
-    const f = fakeFetch(200, body([FULL_TEAM]));
-    const r = await fetchResets("tok-1", UA, f.fn);
-    expect(f.calls).toHaveLength(1);
-    expect(f.calls[0].url).toBe("https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1");
-    expect(RESETS_URL).toBe(f.calls[0].url);
-    expect(f.calls[0].init.method).toBe("GET");
-    expect(f.calls[0].init.headers).toEqual({
-      Authorization: "Bearer tok-1",
-      "anthropic-beta": "oauth-2025-04-20",
-      "Content-Type": "application/json",
-      "User-Agent": "claude-cli/2.1.322 (external, cli)",
-    });
-    expect(f.calls[0].init.signal).toBeDefined();
-    expect(r.ok && r.status.grants.map((g) => g.id)).toEqual(["full-reset-2611"]);
+describe("usageRequest", () => {
+  const plain = { "Content-Type": "application/json", Authorization: "Bearer tok-1", "anthropic-beta": "oauth-2025-04-20" };
+  it("is the plain usage request, without a User-Agent, unless Limit resets are on and the CLI was found", () => {
+    expect(usageRequest("tok-1", false, UA)).toEqual({ url: "https://api.anthropic.com/api/oauth/usage", headers: plain });
+    expect(usageRequest("tok-1", true, null)).toEqual({ url: "https://api.anthropic.com/api/oauth/usage", headers: plain });
+    expect(usageRequest("tok-1", false, null)).toEqual({ url: USAGE_URL, headers: plain });
   });
-  it("maps 429 with Retry-After, 401/403 to auth and other failures to error", async () => {
-    expect(await fetchResets("t", UA, fakeFetch(429, "", { "retry-after": "120" }).fn)).toEqual({ ok: false, kind: "rate_limited", httpStatus: 429, retryAfterSec: 120 });
-    expect(await fetchResets("t", UA, fakeFetch(429, "").fn)).toEqual({ ok: false, kind: "rate_limited", httpStatus: 429 });
-    expect(await fetchResets("t", UA, fakeFetch(401, "").fn)).toEqual({ ok: false, kind: "auth", httpStatus: 401 });
-    expect(await fetchResets("t", UA, fakeFetch(403, "").fn)).toEqual({ ok: false, kind: "auth", httpStatus: 403 });
-    expect(await fetchResets("t", UA, fakeFetch(502, "").fn)).toEqual({ ok: false, kind: "error", httpStatus: 502 });
-    expect(await fetchResets("t", UA, fakeFetch(200, "<html>").fn)).toEqual({ ok: false, kind: "error", httpStatus: 200 });
-    expect(await fetchResets("t", UA, fakeFetch(200, { cedar_ember: null }).fn)).toEqual({ ok: false, kind: "error", httpStatus: 200 });
-    expect(await fetchResets("t", UA, throwingFetch)).toEqual({ ok: false, kind: "error" });
+  it("asks for the cedar_ember block, without the spend block, under the CLI's User-Agent", () => {
+    expect(usageRequest("tok-1", true, UA)).toEqual({
+      url: "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1",
+      headers: { ...plain, "User-Agent": "claude-cli/2.1.322 (external, cli)" },
+    });
+  });
+});
+
+describe("persisted resets file", () => {
+  const ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  it("lives next to the usage snapshots, only for plain account uuids", () => {
+    expect(resetsFilePath("/h/.claude/session-monitor", ID)).toBe(`/h/.claude/session-monitor/resets-${ID}.json`);
+    expect(resetsFilePath("/h", "default")).toBeNull();
+    expect(resetsFilePath("/h", "../../etc/passwd-aaaaaaaaaaaaaaaaaaaa")).toBeNull();
+  });
+  it("round-trips {ts, status} in the server's wire shape", () => {
+    for (const st of [MAX(), TEAM(), status([FULL_TEAM], { at_limit: true, next_grant_id: null }), status([], { eligible: false, ineligible_reason: "surface" })]) {
+      const text = resetsFileText({ ts: 1_762_850_000.5, status: st });
+      const raw = JSON.parse(text);
+      expect(Object.keys(raw)).toEqual(["ts", "status"]);
+      expect(raw.status.grants.every((g: Record<string, unknown>) => "resets_left" in g && "usable_now" in g)).toBe(true);
+      expect(parseResetsFile(text)).toEqual({ ts: 1_762_850_000.5, status: st });
+    }
+  });
+  it("ignores a malformed file", () => {
+    const good = JSON.parse(resetsFileText({ ts: 1_762_850_000, status: TEAM() }));
+    expect(parseResetsFile("")).toBeNull();
+    expect(parseResetsFile("{not json")).toBeNull();
+    expect(parseResetsFile("null")).toBeNull();
+    expect(parseResetsFile("[]")).toBeNull();
+    expect(parseResetsFile(JSON.stringify({ status: good.status }))).toBeNull();
+    expect(parseResetsFile(JSON.stringify({ ts: "1762850000", status: good.status }))).toBeNull();
+    expect(parseResetsFile(JSON.stringify({ ts: 0, status: good.status }))).toBeNull();
+    expect(parseResetsFile(JSON.stringify({ ts: 1_762_850_000 }))).toBeNull();
+    expect(parseResetsFile(JSON.stringify({ ts: 1_762_850_000, status: { grants: [] } }))).toBeNull();
+    // a malformed grant inside a valid file is dropped like in a live response
+    const mixed = parseResetsFile(JSON.stringify({ ts: 1_762_850_000, status: { ...good.status, grants: [...good.status.grants, { id: "Bad Id", resets_left: 1 }] } }));
+    expect(mixed?.status.grants.map((g) => g.id)).toEqual(["full-reset-2611", "launch-2610-fable"]);
   });
 });
 
@@ -372,49 +393,40 @@ describe("describeClaim", () => {
   });
 });
 
-describe("backoff and listing cadence", () => {
-  it("nextBackoffSec: Retry-After capped at an hour, 300 s default, an hour after auth failures", () => {
-    expect(nextBackoffSec("rate_limited", 120)).toBe(120);
-    expect(nextBackoffSec("rate_limited", 0)).toBe(300);
-    expect(nextBackoffSec("rate_limited")).toBe(300);
-    expect(nextBackoffSec("rate_limited", 99_999)).toBe(3600);
-    expect(nextBackoffSec("auth")).toBe(3600);
-    expect(nextBackoffSec("error")).toBe(300);
-  });
-  it("listingDue: older than the asked age and not in backoff", () => {
-    expect(listingDue(undefined, 1800, NOW)).toBe(true);
-    expect(listingDue({ fetchedAt: NOW - 1_000_000 }, 1800, NOW)).toBe(false);
-    expect(listingDue({ fetchedAt: NOW - 1_000_000 }, 300, NOW)).toBe(true);
-    expect(listingDue({ fetchedAt: NOW }, 0, NOW)).toBe(true);
-    expect(listingDue({ fetchedAt: 0, backoffUntil: NOW + 1 }, 0, NOW)).toBe(false);
-  });
-});
-
 describe("accountView", () => {
-  it("loading until the first listing, ok with kinds after it", () => {
-    expect(accountView(undefined, NOW)).toEqual({ atLimit: false, state: "loading", note: "checking…", kinds: [] });
-    const v = accountView({ fetchedAt: NOW, status: MAX() }, NOW);
-    expect(v.state).toBe("ok");
-    expect(v.note).toBeUndefined();
-    expect(v.kinds).toEqual([
-      { kind: "fable", label: "Fable reset", count: 3, until: fmtUseBy("2027-03-09T07:59:00Z", NOW), tip: "Refills your 5-hour limit and Fable allowance, and gives back what Fable used on your weekly limit", usable: true },
-      { kind: "weekly", label: "Weekly reset", count: 1, until: fmtUseBy("2026-12-10T22:00:00Z", NOW), tip: "Refills your weekly limit and Fable allowance", usable: true },
-    ]);
+  const TS = NOW / 1000 - 60;
+  it("waits for the first usage reading", () => {
+    expect(accountView(undefined, undefined, NOW)).toEqual({ atLimit: false, state: "waiting", ts: null, note: "waiting for the next usage reading", kinds: [] });
+    expect(accountView(undefined, { kind: "rate_limited", httpStatus: 429 }, NOW).note).toBe("waiting for the next usage reading · usage API rate-limited");
   });
-  it("a failed attempt keeps the last kinds and explains itself", () => {
-    const v = accountView({ fetchedAt: NOW - 60_000, status: TEAM(), error: { kind: "rate_limited", httpStatus: 429 }, backoffUntil: NOW + 300_000 }, NOW);
-    expect(v.state).toBe("rate_limited");
-    expect(v.note).toMatch(/^usage API rate-limited · next try (at|on) /);
+  it("rows come from the last known reading, with its time", () => {
+    expect(accountView({ ts: TS, status: MAX() }, undefined, NOW)).toEqual({
+      atLimit: false, state: "ok", ts: TS,
+      kinds: [
+        { kind: "fable", label: "Fable reset", count: 3, until: fmtUseBy("2027-03-09T07:59:00Z", NOW), tip: "Refills your 5-hour limit and Fable allowance, and gives back what Fable used on your weekly limit", usable: true },
+        { kind: "weekly", label: "Weekly reset", count: 1, until: fmtUseBy("2026-12-10T22:00:00Z", NOW), tip: "Refills your weekly limit and Fable allowance", usable: true },
+      ],
+    });
+  });
+  it("a failed latest poll keeps the rows and adds its short note", () => {
+    const v = accountView({ ts: TS, status: TEAM() }, { kind: "rate_limited", httpStatus: 429 }, NOW);
+    expect(v.state).toBe("ok");
+    expect(v.note).toBe("usage API rate-limited");
     expect(v.kinds.map((k) => k.kind)).toEqual(["fable", "full"]);
-    expect(accountView({ fetchedAt: 0, error: { kind: "auth", httpStatus: 401 } }, NOW).note).toBe("token rejected (HTTP 401)");
-    expect(accountView({ fetchedAt: 0, error: { kind: "error" } }, NOW).note).toBe("could not read resets (network)");
-    expect(accountView({ fetchedAt: 0, error: { kind: "no_token", note: "token expired · claude-switch keeper refreshes it" } }, NOW))
-      .toEqual({ atLimit: false, state: "no_token", note: "token expired · claude-switch keeper refreshes it", kinds: [] });
+    expect(accountView({ ts: TS, status: TEAM() }, { kind: "auth", httpStatus: 401 }, NOW).note).toBe("token rejected (HTTP 401)");
+    expect(accountView({ ts: TS, status: TEAM() }, { kind: "auth" }, NOW).note).toBe("token rejected");
   });
   it("ineligible accounts and the at-limit flag", () => {
-    expect(accountView({ fetchedAt: NOW, status: status([], { eligible: false, ineligible_reason: "surface" }) }, NOW))
-      .toEqual({ atLimit: false, state: "ineligible", note: "not eligible (surface)", kinds: [] });
-    expect(accountView({ fetchedAt: NOW, status: status([FULL_TEAM], { at_limit: true }) }, NOW).atLimit).toBe(true);
+    expect(accountView({ ts: TS, status: status([], { eligible: false, ineligible_reason: "surface" }) }, undefined, NOW))
+      .toEqual({ atLimit: false, state: "ineligible", ts: TS, note: "not eligible (surface)", kinds: [] });
+    expect(accountView({ ts: TS, status: status([], { eligible: false, ineligible_reason: "surface" }) }, { kind: "auth", httpStatus: 403 }, NOW).note)
+      .toBe("not eligible (surface) · token rejected (HTTP 403)");
+    expect(accountView({ ts: TS, status: status([FULL_TEAM], { at_limit: true }) }, undefined, NOW).atLimit).toBe(true);
+  });
+  it("resetsTotal counts every account with a known reading; null until one has one", () => {
+    expect(resetsTotal([undefined, undefined], NOW)).toBeNull();
+    expect(resetsTotal([{ ts: TS, status: MAX() }, undefined, { ts: TS, status: TEAM() }], NOW)).toBe(6);
+    expect(resetsTotal([{ ts: TS, status: status([], { eligible: false }) }], NOW)).toBe(0);
   });
   it("withResetsLeft updates one grant without touching the original", () => {
     const s = TEAM();

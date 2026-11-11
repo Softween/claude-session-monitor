@@ -713,7 +713,74 @@ describe("active login and Use this account", () => {
     send({ type: "useReset", key: `${UA}|full`, at: 5 });
     await vi.waitFor(() => expect(posted[posted.length - 1].resets.done).toEqual({ at: 5 }));
     expect(fetchMock.mock.calls.filter((c: unknown[]) => /cedar_ember|reset_rate_limits/.test(String(c[0])))).toEqual([]);
-    expect(debugLog()).toContain("resets: Claude Code CLI not found, no reset calls");
+    expect(debugLog()).toContain("resets: Claude Code CLI not found, usage polls carry no reset data");
+  });
+
+  // Limit resets ride on the usage polls: a passive account with a fresh token (claude-switch installed).
+  const FABLE_GRANT = { id: "launch-2610-fable", resets_left: 1, ends_at: "2027-03-09T07:59:00Z", clears: ["five_hour", "seven_day_overage_included"], paused: false, usable_now: true, use_requires_limit: false, type: "full", gives_back_weekly: true, unavailable_reason: null };
+  const passiveB = () => ({ [`csm.oauth.${UB}`]: JSON.stringify({ accessToken: "at-b", refreshToken: "rt-b", expiresAt: Date.now() + 3_600_000 }), [`csm.token.${UB}`]: "at-b" });
+  function usageReplies(body: unknown): ReturnType<typeof vi.fn> {
+    const fetchMock = (globalThis as any).fetch as ReturnType<typeof vi.fn>;
+    fetchMock.mockClear();
+    fetchMock.mockImplementation(async () => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => body }));
+    return fetchMock;
+  }
+
+  it("Limit resets ride on the usage poll: cedar_ember under the CLI User-Agent, saved to resets-<uuid>.json, shown at once after a reload", async () => {
+    installSwitchCli();
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    fs.mkdirSync(`${HOME}/.local/share/claude/versions`, { recursive: true });
+    fs.writeFileSync(`${HOME}/.local/share/claude/versions/2.1.322`, "");
+    const fetchMock = usageReplies({ five_hour: { utilization: 37, resets_at: null }, cedar_ember: { eligible: true, at_limit: false, grants: [FABLE_GRANT], next_grant_id: "launch-2610-fable" } });
+    try {
+      const { posted } = activateWithLimitsView(passiveB());
+      const file = `${MON}/resets-${UB}.json`;
+      await vi.waitFor(() => expect(fs.existsSync(file)).toBe(true));
+      const calls = fetchMock.mock.calls.filter((c: unknown[]) => String(c[0]).startsWith("https://api.anthropic.com/api/oauth/usage"));
+      expect(calls).toHaveLength(1); // the poll itself, no separate listing call
+      expect(calls[0][0]).toBe("https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1");
+      expect(calls[0][1].headers).toEqual({ "Content-Type": "application/json", Authorization: "Bearer at-b", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-cli/2.1.322 (external, cli)" });
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+      expect(JSON.parse(fs.readFileSync(file, "utf8")).status.grants.map((g: { id: string }) => g.id)).toEqual(["launch-2610-fable"]);
+      await vi.waitFor(() => expect(posted[posted.length - 1].resets.total).toBe(1));
+      const b = posted[posted.length - 1].resets.accounts.find((x: { id: string }) => x.id === UB);
+      expect(b.kinds.map((k: { kind: string; count: number; usable: boolean }) => [k.kind, k.count, k.usable])).toEqual([["fable", 1, true]]);
+      expect(card(posted[posted.length - 1], UB).gauges[0].pct).toBe(37); // gauges parsed as before (the seed had 12)
+      expect(debugLog()).toContain("resets: b@x.com fable=1");
+
+      // Reload: the saved reading is in the section before any poll, and opening the section calls nothing.
+      disposeCtx(lastCtx);
+      fetchMock.mockClear();
+      fetchMock.mockImplementation(() => Promise.reject(new Error("mocked")));
+      const again = activateWithLimitsView(passiveB());
+      await vi.waitFor(() => expect(again.posted.length).toBeGreaterThan(0));
+      const r = again.posted[again.posted.length - 1].resets;
+      expect(r.total).toBe(1);
+      expect(r.accounts.find((x: { id: string }) => x.id === UB).kinds[0]).toMatchObject({ kind: "fable", count: 1, usable: true });
+      again.send({ type: "setUi", key: "resetsOpen", value: true });
+      expect(fetchMock.mock.calls).toEqual([]);
+    } finally {
+      ((globalThis as any).fetch as ReturnType<typeof vi.fn>).mockImplementation(() => Promise.reject(new Error("mocked")));
+    }
+  });
+
+  it("without the Claude Code CLI the usage poll is the plain request it always was and nothing is saved", async () => {
+    installSwitchCli();
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    const fetchMock = usageReplies({ five_hour: { utilization: 37, resets_at: null } });
+    try {
+      const { posted } = activateWithLimitsView(passiveB());
+      await vi.waitFor(() => expect(card(posted[posted.length - 1], UB).gauges[0]?.pct).toBe(37));
+      const calls = fetchMock.mock.calls.filter((c: unknown[]) => String(c[0]).startsWith("https://api.anthropic.com/api/oauth/usage"));
+      expect(calls.map((c: unknown[]) => c[0])).toEqual(["https://api.anthropic.com/api/oauth/usage"]);
+      expect(calls[0][1].headers).toEqual({ "Content-Type": "application/json", Authorization: "Bearer at-b", "anthropic-beta": "oauth-2025-04-20" });
+      expect(fs.existsSync(`${MON}/resets-${UB}.json`)).toBe(false);
+      expect(posted[posted.length - 1].resets.cliMissing).toBe(true);
+    } finally {
+      fetchMock.mockImplementation(() => Promise.reject(new Error("mocked")));
+    }
   });
 
   it("Use this account: Switching… while claude-switch runs, then re-resolves and re-renders on exit", async () => {

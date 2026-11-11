@@ -695,6 +695,27 @@ describe("active login and Use this account", () => {
     expect(debugLog()).toContain("from panel.json");
   });
 
+  it("Limit resets: with claude-switch the payload carries the closed section in card order; without the Claude Code CLI it says so and nothing is called", async () => {
+    installSwitchCli();
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    writePanel(UA, "a@x.com");
+    const fetchMock = (globalThis as any).fetch as ReturnType<typeof vi.fn>;
+    fetchMock.mockClear();
+    const { posted, send } = activateWithLimitsView();
+    await vi.waitFor(() => expect(posted[posted.length - 1]?.resets?.cliMissing).toBe(true));
+    const last = posted[posted.length - 1];
+    expect(last.ui.resetsOpen).toBe(false);
+    expect(last.resets.open).toBe(false);
+    expect(last.resets.total).toBeNull();
+    expect(last.resets.accounts.map((a: { id: string; email: string; name: string }) => [a.id, a.email, a.name])).toEqual([[UA, "a@x.com", "a"], [UB, "b@x.com", "b"]]);
+    send({ type: "setUi", key: "resetsOpen", value: true });
+    send({ type: "useReset", key: `${UA}|full`, at: 5 });
+    await vi.waitFor(() => expect(posted[posted.length - 1].resets.done).toEqual({ at: 5 }));
+    expect(fetchMock.mock.calls.filter((c: unknown[]) => /cedar_ember|reset_rate_limits/.test(String(c[0])))).toEqual([]);
+    expect(debugLog()).toContain("resets: Claude Code CLI not found, no reset calls");
+  });
+
   it("Use this account: Switching… while claude-switch runs, then re-resolves and re-renders on exit", async () => {
     installSwitchCli();
     seedRegistryOnA();
@@ -966,6 +987,7 @@ describe("active login and Use this account", () => {
     expect(last.panelFresh).toBe(false);
     expect(last.useEmails).toEqual([]);
     expect(last.providers.some((p: { hdr?: unknown }) => p.hdr)).toBe(false);
+    expect(last.resets).toBeUndefined();
     send({ type: "useAccount", email: "a@x.com", at: Date.now() });
     await rec.commands.get("claudeSessionMonitor.refreshUsage")!();
     expect(calls).toEqual([]);

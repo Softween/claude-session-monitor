@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import vm from "node:vm";
 import { allBadges, displayNames, headerChip, orderCards, renderSwitchBlock, headerGauges, type CardHeader, type SwitchPanel } from "../src/switchPanel";
+import { accountView, parseCedarEmber } from "../src/resets";
 
 function webviewScript(): string {
   const src = readFileSync(join(__dirname, "..", "src", "extension.ts"), "utf8");
@@ -431,5 +432,146 @@ describe("Usage Limits webview", () => {
     } finally {
       clock.mockRestore();
     }
+  });
+});
+
+describe("Usage Limits webview: Limit resets", () => {
+  const now = Date.now();
+  const card = (id: string, email: string, active: boolean) => ({
+    id: `claude:${id}`, provider: "claude", label: `Claude · ${email}`, email, accountId: id, active, official: true, ts: now / 1000, note: null, gauges: [gauge("session", "Session (5h)", 20)],
+  });
+  const base = {
+    type: "update", ts: now / 1000, official: true, accounts: [{ id: "m" }, { id: "s" }, { id: "n" }, { id: "t" }], eta: null, tokens: null, models: [],
+    switchHtml: '<div class="swblock" data-testid="csm-switch-block"><div class="swline">claude-switch · max@x.com · auto</div></div>', switchBadges: {},
+    providers: [card("m", "max@x.com", true), card("s", "soft@x.com", false), card("n", "none@x.com", false), card("t", "team@x.com", false)],
+  };
+  // Live 2026-11-11: a Full reset spent elsewhere comes back as resets_left 0 / usable_now false and next_grant_id moves on.
+  const spent = parseCedarEmber({ cedar_ember: { eligible: true, at_limit: false, next_grant_id: "launch-2610-fable", grants: [
+    { id: "full-reset-2611", type: "full", clears: ["five_hour", "seven_day", "seven_day_overage_included"], resets_left: 0, usable_now: false, use_requires_limit: false, ends_at: "2026-12-10T22:00:00Z" },
+    { id: "launch-2610-fable", type: "full", gives_back_weekly: true, clears: ["five_hour", "seven_day_overage_included"], resets_left: 1, usable_now: true, use_requires_limit: false, ends_at: "2027-03-09T07:59:00Z" },
+  ] } });
+  const resets = (over: Record<string, unknown> = {}) => ({
+    open: false, total: 6, done: null,
+    accounts: [
+      { id: "m", name: "max", email: "max@x.com", atLimit: true, state: "ok", kinds: [
+        { kind: "fable", label: "Fable reset", count: 3, until: "9 Mar 2027", tip: "Refills your 5-hour limit and Fable allowance, and gives back what Fable used on your weekly limit", usable: true },
+        { kind: "full", label: "Full reset", count: 1, until: "11 Dec", tip: "Refills your 5-hour limit, weekly limit and Fable allowance", usable: true },
+        { kind: "weekly", label: "Weekly reset", count: 1, until: "11 Dec", tip: "Refills your weekly limit and Fable allowance", usable: false, why: "needs a limit hit first" },
+      ] },
+      { id: "s", name: "soft", email: "soft@x.com", ...accountView({ fetchedAt: now, status: spent ?? undefined }, now) },
+      { id: "n", name: "none", email: "none@x.com", atLimit: false, state: "ok", kinds: [] },
+      { id: "t", name: "team", email: "team@x.com", atLimit: false, state: "rate_limited", note: "usage API rate-limited · next try at 14:05", kinds: [] },
+    ],
+    ...over,
+  });
+  const opened = { ui: { switchActivityOpen: false, expandedAccounts: {}, resetsOpen: true } };
+  const acct = (h: Harness, name: string) => h.root.innerHTML.split('data-testid="csm-resets-account"').find((r) => r.includes(`title="${name}@x.com"`)) ?? "";
+  const resetPosts = (h: Harness) => h.posted.filter((m) => (m as { type: string }).type === "useReset") as { type: string; key: string; at: number }[];
+
+  it("no resets field (claude-switch not installed): no section", () => {
+    const h = mount();
+    h.send(base);
+    expect(h.root.innerHTML).not.toContain("Limit resets");
+    expect(h.root.innerHTML).not.toContain("csm-resets");
+  });
+
+  it("collapsed by default: one header line with the total between the claude-switch block and the cards; the toggle posts setUi resetsOpen", () => {
+    const h = mount();
+    h.send({ ...base, resets: resets() });
+    let html = h.root.innerHTML;
+    expect(html).toContain('<div class="swtoggle" role="button" tabindex="0" data-rstoggle="1" aria-expanded="false" data-testid="csm-resets-toggle"><span class="chev">▸</span> Limit resets (6)</div>');
+    expect(html.indexOf("csm-switch-block")).toBeLessThan(html.indexOf("csm-resets-toggle"));
+    expect(html.indexOf("csm-resets-toggle")).toBeLessThan(html.indexOf('data-testid="csm-account-row"'));
+    expect(html).not.toContain("csm-resets-account");
+    expect(html).not.toContain("csm-reset-row");
+
+    h.click("rstoggle", "1");
+    expect(h.posted).toEqual([{ type: "setUi", key: "resetsOpen", value: true }]);
+    html = h.root.innerHTML;
+    expect(html).toContain('data-rstoggle="1" aria-expanded="true" data-testid="csm-resets-toggle"><span class="chev">▾</span> Limit resets (6)</div>');
+    expect(html.match(/data-testid="csm-resets-account"/g)).toHaveLength(4);
+    h.key("rstoggle", "1", "Enter");
+    expect(h.posted).toContainEqual({ type: "setUi", key: "resetsOpen", value: false });
+    expect(h.root.innerHTML).not.toContain("csm-resets-account");
+  });
+
+  it("open: per account its name, at-limit chip and note, one row per kind with Use or the reason; a spent reset has no row", () => {
+    const h = mount();
+    h.send({ ...base, ...opened, resets: resets() });
+    const max = acct(h, "max");
+    expect(max).toContain('<span class="ctitle" title="max@x.com">max</span><span class="chip">at limit</span></div>');
+    expect(max).toContain('<div class="rsrow" title="Refills your 5-hour limit and Fable allowance, and gives back what Fable used on your weekly limit" data-testid="csm-reset-row"><span class="rsk">Fable reset · 3</span><span class="rsd">first expires 9 Mar 2027</span><button type="button" class="useacct" data-use-reset="m|fable" data-testid="csm-reset-use">Use</button></div>');
+    expect(max).toContain('<span class="rsk">Full reset · 1</span><span class="rsd">use by 11 Dec</span><button type="button" class="useacct" data-use-reset="m|full"');
+    expect(max).toContain('<span class="rsk">Weekly reset · 1</span><span class="rsd">use by 11 Dec</span><span class="rsact" title="needs a limit hit first">needs a limit hit first</span></div>');
+    expect(max).not.toContain('data-use-reset="m|weekly"');
+
+    const soft = acct(h, "soft");
+    expect(soft.match(/data-testid="csm-reset-row"/g)).toHaveLength(1);
+    expect(soft).toContain('<span class="rsk">Fable reset · 1</span>');
+    expect(soft).toContain('data-use-reset="s|fable"');
+    expect(soft).not.toContain("Full reset");
+    expect(soft).not.toContain('data-use-reset="s|full"');
+
+    expect(acct(h, "none")).toContain('<div class="rsnone">no resets</div>');
+    const team = acct(h, "team");
+    expect(team).toContain('<span class="rsnote" title="usage API rate-limited · next try at 14:05">usage API rate-limited · next try at 14:05</span>');
+    expect(team).not.toContain("no resets");
+    expect(h.root.innerHTML.match(/<span class="chip">at limit<\/span>/g)).toHaveLength(1);
+  });
+
+  it("Use posts useReset with its key and shows Using… until the host's done.at for that click; other Use buttons wait", () => {
+    const h = mount();
+    h.send({ ...base, ...opened, resets: resets() });
+    h.click("useReset", "m|fable");
+    const posts = resetPosts(h);
+    expect(posts).toEqual([{ type: "useReset", key: "m|fable", at: expect.any(Number) }]);
+    const at = posts[0].at;
+    expect(acct(h, "max")).toContain('<span class="rsk">Fable reset · 3</span><span class="rsd">first expires 9 Mar 2027</span><button type="button" class="useacct" disabled aria-busy="true" data-testid="csm-reset-use">Using…</button>');
+    expect(acct(h, "max")).toContain('data-use-reset="m|full" disabled data-testid="csm-reset-use">Use</button>');
+    expect(acct(h, "soft")).toContain('data-use-reset="s|fable" disabled');
+    h.click("useReset", "m|full");
+    expect(resetPosts(h)).toHaveLength(1);
+
+    h.send({ ...base, ...opened, resets: resets() }); // a tick while the modal is open
+    expect(acct(h, "max")).toContain("Using…");
+    h.send({ ...base, ...opened, resets: resets({ done: { at: at - 1 } }) }); // an older click's answer
+    expect(acct(h, "max")).toContain("Using…");
+    h.send({ ...base, ...opened, resets: resets({ done: { at } }) });
+    expect(acct(h, "max")).not.toContain("Using…");
+    expect(acct(h, "max")).toContain('data-use-reset="m|fable" data-testid="csm-reset-use">Use</button>');
+    expect(acct(h, "max")).toContain('data-use-reset="m|full" data-testid="csm-reset-use">Use</button>');
+  });
+
+  it("a lost answer: Using… ends after 60 s", () => {
+    const clock = vi.spyOn(Date, "now");
+    try {
+      clock.mockReturnValue(now + 1_000);
+      const h = mount();
+      h.send({ ...base, ...opened, resets: resets() });
+      h.click("useReset", "m|fable");
+      expect(acct(h, "max")).toContain("Using…");
+      clock.mockReturnValue(now + 1_000 + 59_000);
+      h.send({ ...base, ...opened, resets: resets() });
+      expect(acct(h, "max")).toContain("Using…");
+      clock.mockReturnValue(now + 1_000 + 60_001);
+      h.send({ ...base, ...opened, resets: resets() });
+      expect(acct(h, "max")).not.toContain("Using…");
+      expect(acct(h, "max")).toContain('data-use-reset="m|fable" data-testid="csm-reset-use">Use</button>');
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("plain header until any listing; Claude Code CLI not found replaces the accounts; checking… while loading", () => {
+    const loading = [{ id: "m", name: "max", email: "max@x.com", atLimit: false, state: "loading", note: "checking…", kinds: [] }];
+    const h = mount();
+    h.send({ ...base, ...opened, resets: { open: true, total: null, cliMissing: true, accounts: loading, done: null } });
+    expect(h.root.innerHTML).toContain('<span class="chev">▾</span> Limit resets</div>');
+    expect(h.root.innerHTML).toContain('<div class="rsnone">Claude Code CLI not found</div>');
+    expect(h.root.innerHTML).not.toContain("csm-resets-account");
+    const l = mount();
+    l.send({ ...base, ...opened, resets: { open: true, total: null, accounts: loading, done: null } });
+    expect(acct(l, "max")).toContain('<span class="rsnote" title="checking…">checking…</span>');
+    expect(acct(l, "max")).not.toContain("no resets");
   });
 });

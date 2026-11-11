@@ -31,12 +31,37 @@ import { sendToSession } from "./peerSend";
 import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, type ActiveCandidate } from "./activeAccount";
 import { SwitchRunner, busyText, exitText, lastLine, spawnFailureText } from "./switchRunner";
 import { execFile } from "child_process";
+import { randomUUID } from "crypto";
 import { parseParentPid, pickSessionTerminal, pickUniqueLabel } from "./terminalMatch";
 import { ResumeRegistry, isClaudeCliCommand, isClaudeSessionCommand } from "./resumeRegistry";
 import { allowedCwds, mergeSeen, withoutPaths } from "./remoteCwds";
 import { startNewSession } from "./remoteNewSession";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import { TabWaker, nodeProbes, summaryText } from "./wakeTabs";
+import {
+  KIND_LABEL,
+  RESET_KINDS,
+  accountView,
+  claimReset,
+  claimUnresolved,
+  cliUserAgent,
+  describeClaim,
+  fetchResets,
+  fmtUseBy,
+  listingDue,
+  nextBackoffSec,
+  pickGrant,
+  refillText,
+  resetsTotal,
+  summarize,
+  withResetsLeft,
+  type CedarEmber,
+  type ResetGrant,
+  type ResetKind,
+  type ResetsEntry,
+  type ResetsFetch,
+  type ResetsPayload,
+} from "./resets";
 import {
   KEYCHAIN_SERVICE,
   REFRESH_MARGIN_MS,
@@ -573,11 +598,12 @@ interface LimitsPayload {
   switchBadges?: Record<string, { rank?: number; loginNeeded?: string }>; // by account email
   showTokenStats?: boolean; // render the Tokens row + Models block (claudeSessionMonitor.showTokenStats)
   panelFresh?: boolean; // claude-switch owns switching: simplified cards, no Rotate
-  ui?: { switchActivityOpen: boolean; expandedAccounts: Record<string, boolean> }; // persisted in workspaceState
+  ui?: { switchActivityOpen: boolean; expandedAccounts: Record<string, boolean>; resetsOpen: boolean }; // persisted in workspaceState
   useEmails?: string[]; // non-active accounts the panel can switch to
   usePending?: string; // email `claude-switch use` is switching to right now (until it exits or the 90 s UI timeout)
   useResult?: { email: string; at: number; ok: boolean; text: string; running?: boolean }; // last finished `use` (at = its click time), shown for a few seconds; running: past the UI timeout, until it exits
   skipFailed?: { email: string; at: number }; // last skip box change claude-switch did not apply (at = its click time): the webview drops its optimistic state
+  resets?: ResetsPayload; // Limit resets section (claude-switch installed only)
 }
 
 // ---------------------------------------------------------------------------
@@ -938,6 +964,7 @@ class LimitsView implements vscode.WebviewViewProvider {
     private readonly onUse: (email: string, clickedAt?: number) => void,
     private readonly onUi: (key: string, value: unknown) => void,
     private readonly onExclude: (email: string, excluded: boolean, clickedAt?: number) => void,
+    private readonly onUseReset: (key: string, clickedAt?: number) => void,
   ) {}
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -951,6 +978,7 @@ class LimitsView implements vscode.WebviewViewProvider {
       else if (m && m.type === "useAccount" && typeof m.email === "string") this.onUse(m.email, typeof m.at === "number" ? m.at : undefined);
       else if (m && m.type === "setUi" && typeof m.key === "string") this.onUi(m.key, m.value);
       else if (m && m.type === "setExcluded" && typeof m.email === "string" && typeof m.excluded === "boolean") this.onExclude(m.email, m.excluded, typeof m.at === "number" ? m.at : undefined);
+      else if (m && m.type === "useReset" && typeof m.key === "string") this.onUseReset(m.key, typeof m.at === "number" ? m.at : undefined);
     });
     if (this.pending) view.webview.postMessage(this.pending);
   }
@@ -1009,6 +1037,17 @@ function limitsHtml(): string {
   .swtoggle:hover { color: var(--vscode-foreground); }
   .swline.sw-muted { color: var(--vscode-descriptionForeground); opacity:.7; }
   .swevents[hidden] { display:none; }
+  /* Limit resets: one toggle line under the claude-switch block; per account a line per kind only while open. */
+  .rsblock { padding:0 0 4px; }
+  .rsacct { margin-top:5px; }
+  .rsname { display:flex; align-items:baseline; gap:6px; min-width:0; font-size:11px; }
+  .rsnote { min-width:0; font-size:10px; color: var(--vscode-descriptionForeground); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rsrow { display:flex; align-items:baseline; gap:8px; min-width:0; margin:2px 0 0 10px; font-size:11px; }
+  .rsrow .rsk { flex:none; white-space:nowrap; }
+  .rsrow .rsd, .rsrow .rsact { min-width:0; font-size:10px; color: var(--vscode-descriptionForeground); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rsrow .rsact, .rsrow .useacct { margin:0 0 0 auto; }
+  .rsrow .useacct { flex:none; }
+  .rsnone { margin:2px 0 0 10px; font-size:10px; color: var(--vscode-descriptionForeground); }
   /* Collapsed card = one 16px line + 4px padding top and bottom + 1px separator = 25px. */
   .card.ccard { padding:4px 0; }
   .card.ccard:first-child { padding-top:0; }
@@ -1244,6 +1283,38 @@ function useResultLine(){
   return '<div class="useres'+(r.ok||r.running?'':' err')+'" role="status" data-testid="csm-use-result">'
     + (r.ok ? 'Switched to '+esc(r.email) : (r.running ? 'Still switching to ' : 'Could not switch to ')+esc(r.email)+': '+esc(r.text)) + '</div>';
 }
+let pendingReset = null; // { key, at }: a reset Use click waiting for the host's done.at (or 60 s)
+// One line per kind: its count, first expiry, and a Use button (or why it cannot be used now).
+function resetRow(a, k){
+  const key = a.id+'|'+k.kind;
+  let act;
+  if(!k.usable) act = '<span class="rsact" title="'+esc(k.why)+'">'+esc(k.why)+'</span>';
+  else if(pendingReset && pendingReset.key===key) act = '<button type="button" class="useacct" disabled aria-busy="true" data-testid="csm-reset-use">Using…</button>';
+  else act = '<button type="button" class="useacct" data-use-reset="'+esc(key)+'"'+(pendingReset?' disabled':'')+' data-testid="csm-reset-use">Use</button>';
+  return '<div class="rsrow" title="'+esc(k.tip)+'" data-testid="csm-reset-row"><span class="rsk">'+esc(k.label)+' · '+k.count+'</span>'
+    + (k.until ? '<span class="rsd">'+(k.count>1?'first expires ':'use by ')+esc(k.until)+'</span>' : '')
+    + act + '</div>';
+}
+// Limit resets (claude-switch only): collapsed to its header line unless opened; accounts in card order.
+function resetsSection(){
+  const r = last.resets;
+  if(!r) return '';
+  const open = !!ui.resetsOpen;
+  let h = '<div class="rsblock" data-testid="csm-resets"><div class="swtoggle" role="button" tabindex="0" data-rstoggle="1" aria-expanded="'+open+'" data-testid="csm-resets-toggle"><span class="chev">'+(open?'▾':'▸')+'</span> Limit resets'+(r.total!=null?' ('+r.total+')':'')+'</div>';
+  if(open){
+    if(r.cliMissing) h += '<div class="rsnone">Claude Code CLI not found</div>';
+    else for(const a of (r.accounts||[])){
+      h += '<div class="rsacct" data-testid="csm-resets-account"><div class="rsname"><span class="ctitle" title="'+esc(a.email)+'">'+esc(a.name)+'</span>'
+        + (a.atLimit ? '<span class="chip">at limit</span>' : '')
+        + (a.note ? '<span class="rsnote" title="'+esc(a.note)+'">'+esc(a.note)+'</span>' : '') + '</div>';
+      const kinds = a.kinds || [];
+      if(kinds.length) h += kinds.map(k=>resetRow(a, k)).join('');
+      else if(a.state==='ok') h += '<div class="rsnone">no resets</div>';
+      h += '</div>';
+    }
+  }
+  return h + '</div>';
+}
 function switchBlock(){
   let h = last.switchHtml || '';
   if(ui && ui.switchActivityOpen) h = h.replace('data-swtoggle="1" aria-expanded="false"','data-swtoggle="1" aria-expanded="true"').replace('<span class="chev">▸</span>','<span class="chev">▾</span>').replace(' data-testid="csm-switch-activity" hidden',' data-testid="csm-switch-activity"');
@@ -1260,7 +1331,8 @@ function render(){
   if(!ui) ui = last.ui || { switchActivityOpen:false, expandedAccounts:{} };
   if(pendingUse && Date.now() - pendingUse.at > 90000) pendingUse = null; // the host answers within its 90 s UI timeout (the result, or that the run goes on)
   for(const e in pendingSkip) if(Date.now() - pendingSkip[e].at > 20000) delete pendingSkip[e];
-  let h = switchBlock() + useResultLine();
+  if(pendingReset && Date.now() - pendingReset.at > 60000) pendingReset = null; // the host answers when its modal closes; 60 s caps a lost answer
+  let h = switchBlock() + resetsSection() + useResultLine();
   const cards = (last.providers && last.providers.length) ? last.providers : [{
     id:'claude', provider:'claude', label:'Claude', active:true, ts:last.ts, official:last.official, gauges:last.gauges||[],
     note:last.usageNote||last.accountNote||null, sevenDayTokens:null, lifetimeTokens:null
@@ -1298,6 +1370,7 @@ document.getElementById('root').addEventListener('keydown', (ev) => {
   if(d.switch){ vscodeApi.postMessage({ type:'switchAccount', id: d.switch }); ev.preventDefault(); }
   else if(d.toggle){ toggleAccount(d.toggle); ev.preventDefault(); }
   else if(d.swtoggle){ setUi('switchActivityOpen', !ui.switchActivityOpen); ev.preventDefault(); }
+  else if(d.rstoggle){ setUi('resetsOpen', !ui.resetsOpen); ev.preventDefault(); }
 });
 document.getElementById('root').addEventListener('click', (ev) => {
   let el = ev.target;
@@ -1312,8 +1385,17 @@ document.getElementById('root').addEventListener('click', (ev) => {
       }
       return;
     }
+    if(el.dataset && el.dataset.useReset){
+      if(!pendingReset){
+        pendingReset = { key: el.dataset.useReset, at: Date.now() };
+        vscodeApi.postMessage({ type:'useReset', key: pendingReset.key, at: pendingReset.at });
+        render();
+      }
+      return;
+    }
     if(el.dataset && el.dataset.toggle){ toggleAccount(el.dataset.toggle); return; }
     if(el.dataset && el.dataset.swtoggle){ setUi('switchActivityOpen', !ui.switchActivityOpen); return; }
+    if(el.dataset && el.dataset.rstoggle){ setUi('resetsOpen', !ui.resetsOpen); return; }
     if(el.dataset && el.dataset.rotate){ vscodeApi.postMessage({ type:'rotateBest' }); return; }
     if(el.classList && el.classList.contains('sech') && el.dataset.sec){
       collapsed[el.dataset.sec] = !collapsed[el.dataset.sec];
@@ -1343,6 +1425,7 @@ window.addEventListener('message', e => {
   if(e.data && e.data.type==='update'){
     last = e.data;
     if(pendingUse && last.useResult && last.useResult.at===pendingUse.at) pendingUse = null;
+    if(pendingReset && last.resets && last.resets.done && last.resets.done.at===pendingReset.at) pendingReset = null;
     settleSkips();
     render();
   }
@@ -1426,8 +1509,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
     (key, value) => {
       if (key === "switchActivityOpen") void ctx.workspaceState.update("csm.switchActivityOpen", value === true);
       else if (key === "expandedAccounts" && value && typeof value === "object") void ctx.workspaceState.update("csm.expandedAccounts", value);
+      else if (key === "resetsOpen") {
+        void ctx.workspaceState.update("csm.resetsOpen", value === true);
+        if (value === true) requestResets(300); // opening lists accounts whose listing is older than 5 min
+      }
     },
     (email, excluded, clickedAt) => setExcludedViaCli(email, excluded, clickedAt),
+    (key, clickedAt) => void useResetFromPanel(key, clickedAt),
   );
 
   type UseFinish = (ok: boolean, text: string, cliMs: number | null, running?: boolean) => void;
@@ -1540,6 +1628,231 @@ export function activate(ctx: vscode.ExtensionContext): void {
       (e: unknown) => fail(spawnFailureText(e, SWITCH_CLI)),
     );
   }
+
+  // --- Limit resets (pure logic in src/resets.ts) ----------------------------
+  // claude-switch installs only. Each account's gift resets are listed with its own
+  // token through the read-only usage call the Claude Code CLI makes: in the
+  // background when a listing is 30 min old, at 5 min when the section is opened, on
+  // a usage refresh and after a claim; one sweep at a time, calls 1 s apart, with
+  // per-account backoff. A reset is spent only after a click and a modal confirm.
+  // Tokens are never refreshed here and the active login is never written.
+  const resetsByAccount = new Map<string, ResetsEntry>();
+  const resetsWanted = new Map<string, number>(); // accountId -> oldest listing age (s) its request accepts
+  const resetsRequestIds = new Map<string, string>(); // "<accountId>|<grantId>" -> request_id of a claim that came back unresolved
+  let resetsSweeping = false;
+  let resetsCallAt = 0; // ms of the last listing call
+  let resetsUa: string | null | undefined; // claude-cli User-Agent of the last sweep; null = Claude Code CLI not found (no calls)
+  let resetsClaiming = false;
+  let resetsDone: { at: number } | null = null; // the last finished Use click (at = its click time)
+  let lastResetsCheck = 0;
+  const resetsFetch: ResetsFetch = (url, init) => fetch(url, init);
+  const resetsOn = (): boolean => claudeEnabled() && switchInstalled();
+  const readCliUa = (): string | null =>
+    cliUserAgent({ home: os.homedir(), readdir: (d) => fs.readdirSync(d), realpath: (p) => fs.realpathSync(p) });
+
+  /** Claude accounts the cards list: every tracked login when there are two or more, else the active one. */
+  function resetsAccounts(): { id: string; email: string }[] {
+    const list = trackAllAccounts() ? accountsFile.accounts : accountsFile.accounts.filter((a) => a.id === accountsFile.activeId);
+    if (list.length > 1) return list.map((a) => ({ id: a.id, email: a.email }));
+    const active = accountsFile.accounts.find((a) => a.id === accountsFile.activeId);
+    return active ? [{ id: active.id, email: active.email }] : [];
+  }
+
+  /** List these accounts (default: every card's) unless their listing is younger than `maxAgeSec` or in backoff. */
+  function requestResets(maxAgeSec: number, ids?: string[]): void {
+    if (disposed || !resetsOn()) return;
+    const now = Date.now();
+    for (const id of ids ?? resetsAccounts().map((a) => a.id)) {
+      if (listingDue(resetsByAccount.get(id), maxAgeSec, now)) resetsWanted.set(id, Math.min(maxAgeSec, resetsWanted.get(id) ?? Infinity));
+    }
+    if (resetsWanted.size && !resetsSweeping) void resetsSweep();
+  }
+
+  /** The one listing sweep: wanted accounts one at a time; requests arriving meanwhile join it. */
+  async function resetsSweep(): Promise<void> {
+    resetsSweeping = true;
+    try {
+      const ua = readCliUa();
+      if (ua === null && resetsUa !== null) log("resets: Claude Code CLI not found, no reset calls");
+      const flip = (ua === null) !== (resetsUa === null);
+      resetsUa = ua;
+      if (flip) pushUsagePayload(); // "Claude Code CLI not found" appears or goes
+      if (ua === null) {
+        resetsWanted.clear();
+        return;
+      }
+      while (!disposed) {
+        const next = resetsWanted.entries().next();
+        if (next.done) break;
+        const [id, maxAgeSec] = next.value;
+        resetsWanted.delete(id);
+        if (!listingDue(resetsByAccount.get(id), maxAgeSec, Date.now())) continue;
+        await listResets(id, ua);
+        pushUsagePayload();
+      }
+    } catch (e) {
+      log("resets: sweep error " + String(e));
+    } finally {
+      resetsSweeping = false;
+    }
+  }
+
+  /** One account's listing with its own token; a failure sets its backoff. */
+  async function listResets(id: string, ua: string): Promise<void> {
+    const email = accountsFile.accounts.find((a) => a.id === id)?.email ?? `acct ${id.slice(0, 8)}`;
+    const prev = resetsByAccount.get(id) ?? { fetchedAt: 0 };
+    const creds = await resetsCreds(id, false);
+    if (!creds.token) {
+      if (prev.error?.note !== creds.why) log(`resets: ${email} not listed: ${creds.why}`);
+      resetsByAccount.set(id, { ...prev, error: { kind: "no_token", note: creds.why } });
+      return;
+    }
+    const wait = resetsCallAt + 1000 - Date.now();
+    if (wait > 0) await sleep(wait);
+    resetsCallAt = Date.now();
+    const r = await fetchResets(creds.token, ua, resetsFetch);
+    const now = Date.now();
+    if (r.ok) {
+      resetsByAccount.set(id, { fetchedAt: now, status: r.status });
+      const kinds = summarize(r.status, now).map((k) => `${k.kind}=${k.count}${k.usable ? "" : " (not usable)"}`).join(" ");
+      log(`resets: ${email} ${r.status.eligible ? kinds || "none" : `ineligible (${r.status.ineligibleReason ?? "?"})`}${r.status.atLimit ? " · at limit" : ""}`);
+      return;
+    }
+    const b = nextBackoffSec(r.kind, r.retryAfterSec);
+    resetsByAccount.set(id, { ...prev, error: { kind: r.kind, ...(r.httpStatus ? { httpStatus: r.httpStatus } : {}) }, backoffUntil: now + b * 1000 });
+    log(`resets: ${email} ${r.kind}${r.httpStatus ? ` (HTTP ${r.httpStatus})` : ""}, next try in ${b}s`);
+  }
+
+  /**
+   * Token and organization for one account's reset calls, never refreshed here: the keychain for the
+   * active login (read fresh for a claim, with the login re-checked after the read), else the
+   * claude-switch vault (decidePassiveSource; the extension's own vault when the CLI has no file for it).
+   */
+  async function resetsCreds(id: string, fresh: boolean): Promise<{ token?: string; orgUuid?: string; why: string }> {
+    const activeIdent = async (): Promise<ActiveIdentity | undefined> => {
+      const m = await claudeJsonMtimeMs();
+      return m === undefined ? undefined : readIdentityFileAt(m);
+    };
+    const orgOf = (b: Record<string, unknown> | undefined): string | undefined => (typeof b?.organizationUuid === "string" ? b.organizationUuid : undefined);
+    const expired = (at: unknown): boolean => typeof at === "number" && Date.now() > at - 60_000;
+    const ident = await activeIdent();
+    if (ident?.id === id) {
+      const creds = fresh ? await readClaudeCredentials() : await readClaudeCredentialsCached();
+      if (fresh && (await activeIdent())?.id !== id) return { why: "the active login changed meanwhile" };
+      if (!creds) return { why: "no keychain token" };
+      if (expired(creds.expiresAt)) return { why: "token expired · Claude Code refreshes it" };
+      return { token: creds.token, orgUuid: orgOf(ident.block), why: "" };
+    }
+    const cli = await readCliVault(id, log);
+    const own = await readVaultOauth(id);
+    const oauth = decidePassiveSource(own, cli?.claudeAiOauth) === "use-cli" ? cli?.claudeAiOauth : own;
+    const token = typeof oauth?.accessToken === "string" ? oauth.accessToken : undefined;
+    if (!token) return { why: "no stored token" };
+    if (expired(oauth?.expiresAt)) return { why: "token expired · claude-switch keeper refreshes it" };
+    let ownIdent: Record<string, unknown> | undefined;
+    try {
+      ownIdent = parseJsonObject(await ctx.secrets.get(vaultIdentKey(id)));
+    } catch {
+      ownIdent = undefined;
+    }
+    return { token, orgUuid: orgOf(cli?.oauthAccount) ?? orgOf(ownIdent), why: "" };
+  }
+
+  /** The section's payload: every Claude account the cards list, in card order, with its card's display name. */
+  function resetsPayload(cards: UsageProviderCard[], open: boolean): ResetsPayload {
+    const now = Date.now();
+    const accounts: ResetsPayload["accounts"] = [];
+    for (const c of cards) {
+      if (c.provider !== "claude") continue;
+      const id = c.accountId ?? accountsFile.activeId; // the single "Claude" card is the active login
+      const email = accountsFile.accounts.find((a) => a.id === id)?.email;
+      if (!id || !email) continue;
+      accounts.push({ id, name: c.hdr?.name ?? c.label.replace(/^Claude · /, ""), email, ...accountView(resetsByAccount.get(id), now) });
+    }
+    return {
+      open,
+      total: resetsTotal(accounts.map((a) => resetsByAccount.get(a.id)), now),
+      ...(resetsUa === null ? { cliMissing: true } : {}),
+      accounts,
+      done: resetsDone,
+    };
+  }
+
+  /** A Use click: the host picks the grant from its own listing (never from the webview), confirms in a modal, then claims. */
+  async function useResetFromPanel(key: string, clickedAt?: number): Promise<void> {
+    const sep = key.lastIndexOf("|");
+    const id = key.slice(0, sep);
+    const kind = RESET_KINDS.find((k) => k === key.slice(sep + 1));
+    const email = accountsFile.accounts.find((a) => a.id === id)?.email;
+    const status = resetsByAccount.get(id)?.status;
+    const grant = status && kind ? pickGrant(status, kind, Date.now()) : null;
+    if (resetsClaiming) {
+      vscode.window.setStatusBarMessage("Limit resets: another reset is being used", 5000);
+    } else if (!resetsOn() || !kind || !email || !status || !grant) {
+      void vscode.window.showInformationMessage(`No usable ${kind ? KIND_LABEL[kind] : "reset"}${email ? ` on ${email}` : ""} right now.`);
+    } else {
+      resetsClaiming = true;
+      try {
+        await confirmAndClaim(id, email, kind, status, grant);
+      } catch (e) {
+        log("resets: claim error " + String(e));
+      } finally {
+        resetsClaiming = false;
+      }
+    }
+    resetsDone = { at: typeof clickedAt === "number" ? clickedAt : Date.now() };
+    pushUsagePayload();
+  }
+
+  async function confirmAndClaim(id: string, email: string, kind: ResetKind, status: CedarEmber, grant: ResetGrant): Promise<void> {
+    const label = KIND_LABEL[kind];
+    const now = Date.now();
+    const count = summarize(status, now).find((r) => r.kind === kind)?.count ?? grant.resetsLeft;
+    const useBy = grant.endsAt ? ` · use by ${fmtUseBy(grant.endsAt, now)}` : "";
+    const pick = await vscode.window.showWarningMessage(
+      `Use a ${label} on ${email}?`,
+      { modal: true, detail: `${refillText(grant)}. ${count} left${useBy}.` },
+      "Use reset",
+    );
+    if (pick !== "Use reset") return;
+    const ua = readCliUa();
+    const creds = await resetsCreds(id, true);
+    if (!ua || !creds.token || !creds.orgUuid) {
+      const why = !ua ? "Claude Code CLI not found" : !creds.token ? creds.why : "its organization is unknown";
+      log(`resets: claim ${email} ${grant.id} not sent: ${why}`);
+      void vscode.window.showWarningMessage(`The ${label} on ${email} was not used: ${why}.`);
+      return;
+    }
+    const slot = `${id}|${grant.id}`;
+    const retry = resetsRequestIds.get(slot);
+    const requestId = retry ?? randomUUID();
+    log(`resets: claim ${email} ${grant.id}${retry ? " (same request id as the unresolved try)" : ""}`);
+    const out = await claimReset(creds.token, creds.orgUuid, grant.id, requestId, ua, resetsFetch);
+    const result = out.ok
+      ? `${out.reply.result}${out.reply.reason ? ` (${out.reply.reason})` : ""}${out.reply.cleared.length ? ` · cleared ${out.reply.cleared.join(",")}` : ""}`
+      : out.kind === "invalid"
+        ? `not sent: malformed ${out.field}`
+        : `${out.kind}${out.httpStatus ? ` (HTTP ${out.httpStatus})` : ""}`;
+    log(`resets: claim ${email} ${grant.id} -> ${result}`);
+    const sent = out.ok || out.kind !== "invalid";
+    if (sent) {
+      if (claimUnresolved(out)) resetsRequestIds.set(slot, requestId);
+      else resetsRequestIds.delete(slot);
+    }
+    if (!out.ok || out.reply.result !== "reset") {
+      void vscode.window.showWarningMessage(describeClaim(out, label, email, Date.now()));
+      if (sent) requestResets(0, [id]); // the panel follows what the server holds now
+      return;
+    }
+    const entry = resetsByAccount.get(id);
+    const after = entry?.status ? withResetsLeft(entry.status, grant.id, out.reply.resetsLeft ?? Math.max(0, grant.resetsLeft - 1)) : undefined;
+    if (entry && after) resetsByAccount.set(id, { ...entry, status: after });
+    const left = after ? summarize(after, Date.now()).find((r) => r.kind === kind)?.count ?? 0 : 0;
+    vscode.window.setStatusBarMessage(`${label} used on ${email} · ${left} left`, 10_000);
+    requestResets(0, [id]);
+    void vscode.commands.executeCommand("claudeSessionMonitor.refreshUsage"); // gauges and claude-switch see the refilled limits
+  }
+
   ctx.subscriptions.push(
     vscode.window.registerWebviewViewProvider("claudeSessionMonitor.limits", limitsView),
   );
@@ -2678,6 +2991,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const panel = installed ? readPanel() : null;
       const fresh = panelFresh(panel, Date.now());
       const open = ctx.workspaceState.get<boolean>("csm.switchActivityOpen", false);
+      const resetsOpen = ctx.workspaceState.get<boolean>("csm.resetsOpen", false);
       const emailById = new Map(payload.accounts.map((a) => [a.id, a.email] as const));
       let providers = decorateCards(payload.providers).map((p) => ({ ...p, email: p.accountId ? emailById.get(p.accountId) ?? p.label.replace(/^Claude · /, "") : p.label.replace(/^(Claude|Codex) · /, "") }));
       if (fresh) {
@@ -2704,11 +3018,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
         switchBadges: allBadges(panel),
         panelFresh: fresh,
         showTokenStats: showTokenStats(),
-        ui: { switchActivityOpen: open, expandedAccounts: ctx.workspaceState.get<Record<string, boolean>>("csm.expandedAccounts", {}) },
+        ui: { switchActivityOpen: open, expandedAccounts: ctx.workspaceState.get<Record<string, boolean>>("csm.expandedAccounts", {}), resetsOpen },
         useEmails: fresh ? useTargets(panel) : [],
         usePending: usePending?.email,
         useResult: useDone && Date.now() < useDone.until ? { email: useDone.email, at: useDone.at, ok: useDone.ok, text: useDone.text, ...(useDone.running ? { running: true } : {}) } : undefined,
         skipFailed: skipFailed && Date.now() < skipFailed.until ? { email: skipFailed.email, at: skipFailed.at } : undefined,
+        ...(installed && claudeEnabled() ? { resets: resetsPayload(providers, resetsOpen) } : {}),
       });
       renderStatusBar();
     } catch {
@@ -2801,6 +3116,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
         }
       }
       void pollOtherAccounts(false);
+    }
+
+    // Limit resets (claude-switch only): a listing is refreshed once it is 30 min old.
+    if (claudeEnabled() && now - lastResetsCheck > 30) {
+      lastResetsCheck = now;
+      requestResets(1800);
     }
 
     const wsOnly =
@@ -3354,6 +3675,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           : Promise.resolve(),
         codexEnabled() ? pollCodex(true) : Promise.resolve(),
       ]);
+      requestResets(30); // Limit resets: every account listed more than 30 s ago and not in backoff
       try {
         if (switchInstalled()) {
           const launch = switchRunner.start(["tick", "--fresh"]);

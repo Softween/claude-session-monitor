@@ -91,8 +91,8 @@ export function panelFresh(panel: SwitchPanel | null, nowMs: number): panel is S
 const ACTIVITY_KINDS = new Set(["switch", "restore", "needsLogin", "cleared", "error", "rollback", "paused", "resumed", "offline", "ratelimit"]);
 const MUTED_KINDS = new Set(["offline", "ratelimit"]);
 
-/** HTML for the claude-switch block (empty-state line when missing or stale). `activityOpen` is the persisted toggle (default collapsed). */
-export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number, activityOpen = false): string {
+/** HTML for the claude-switch status lines at the top of the Usage Limits view (empty-state line when missing or stale). */
+export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number): string {
   const age = panel ? panelAge(panel, nowMs) : null;
   if (!panel || age === null || age > PANEL_STALE_SEC) {
     const why = panel && age !== null ? `${ageText(age)} old` : "file missing";
@@ -100,18 +100,24 @@ export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number, acti
   }
   const rank = rankOf(panel, panel.active?.email);
   const parts = [`claude-switch`, panel.active?.email ?? "?", ...(rank !== undefined ? [`#${rank}`] : []), panel.paused ? "PAUSED" : "auto"];
+  let h = `<div class="swblock" data-testid="csm-switch-block"><div class="swline">${esc(parts.join(" · "))}</div>`;
+  if (panel.nextHint) h += `<div class="swline sw-hint">next: ${esc(panel.nextHint)}</div>`;
+  return h + "</div>";
+}
+
+/** The Activity tab: claude-switch's latest meaningful events, newest first; null while the panel is missing or stale. */
+export function renderSwitchActivity(panel: SwitchPanel | null, nowMs: number): { count: number; html: string } | null {
+  if (!panelFresh(panel, nowMs)) return null;
   const events = [...(panel.events ?? [])]
     .filter((e) => ACTIVITY_KINDS.has(e.kind))
     .sort((a, b) => b.ts - a.ts)
     .slice(0, MAX_EVENTS);
-  let h = `<div class="swblock" data-testid="csm-switch-block"><div class="swline">${esc(parts.join(" · "))}</div>`;
-  if (panel.nextHint) h += `<div class="swline sw-hint">next: ${esc(panel.nextHint)}</div>`;
-  h += `<div class="swtoggle" role="button" tabindex="0" data-swtoggle="1" aria-expanded="${activityOpen}" data-testid="csm-switch-activity-toggle"><span class="chev">${activityOpen ? "▾" : "▸"}</span> Activity (${events.length})</div>`;
-  h += `<div class="swevents" data-testid="csm-switch-activity"${activityOpen ? "" : " hidden"}>`;
+  let h = `<div class="swevents" data-testid="csm-switch-activity">`;
   for (const e of events) {
     h += `<div class="swline ${cls(e.kind)}${MUTED_KINDS.has(e.kind) ? " sw-muted" : ""}"><span class="num">${hhmm(e.ts)}</span>  ${esc(e.text)}</div>`;
   }
-  return h + "</div></div>";
+  if (!events.length) h += `<div class="swline sw-muted">No claude-switch activity yet</div>`;
+  return { count: events.length, html: h + "</div>" };
 }
 
 export interface CardHeader {

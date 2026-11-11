@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { accountBadges, displayNames, excludedEmails, excludedOf, headerChip, headerGauges, installedPanel, mergePanelAccounts, orderCards, panelAge, panelFresh, readPanel, renderSwitchBlock, switchInstalled, useTargets, worstGauge, type SwitchPanel } from "../src/switchPanel";
+import { accountBadges, displayNames, excludedEmails, excludedOf, headerChip, headerGauges, installedPanel, mergePanelAccounts, orderCards, panelAge, panelFresh, readPanel, renderSwitchActivity, renderSwitchBlock, switchInstalled, useTargets, worstGauge, type SwitchPanel } from "../src/switchPanel";
 
 const NOW = 1_792_200_000_000;
 const sec = NOW / 1000;
@@ -54,22 +54,22 @@ describe("switchInstalled / installedPanel", () => {
 });
 
 describe("renderSwitchBlock", () => {
-  it("renders line 1, the hint and a collapsed activity row", () => {
+  it("renders line 1 and the hint; the events belong to the Activity tab", () => {
     const h = renderSwitchBlock(full(), NOW);
     expect(h).toContain("claude-switch · bilal@softween.com · #2 · auto<");
     expect(h).not.toContain("breaker");
     expect(h).not.toContain("last:");
     expect(h).toContain("next: restore to bilal@softween.com when its peak &lt;= 80 (now 92)");
-    expect(h).toContain('aria-expanded="false"');
-    expect(h).toContain("▸</span> Activity (1)");
-    expect(h).toContain('data-testid="csm-switch-activity" hidden');
-    expect(h).toContain(`${hhmm(sec - 100)}</span>  a -&gt; b (auto-restore)`);
+    expect(h).not.toContain("Activity");
+    expect(h).not.toContain("auto-restore");
+    const a = renderSwitchActivity(full(), NOW);
+    expect(a?.count).toBe(1);
+    expect(a?.html).toContain(`${hhmm(sec - 100)}</span>  a -&gt; b (auto-restore)`);
   });
-  it("renders expanded when asked", () => {
-    const h = renderSwitchBlock(full(), NOW, true);
-    expect(h).toContain('aria-expanded="true"');
-    expect(h).toContain("▾</span> Activity (1)");
-    expect(h).not.toContain(" hidden");
+  it("activity: none while the panel is missing or stale, a muted line when it has no events", () => {
+    expect(renderSwitchActivity(null, NOW)).toBeNull();
+    expect(renderSwitchActivity(full({ ts: sec - 11 * 60 }), NOW)).toBeNull();
+    expect(renderSwitchActivity(full({ events: [] }), NOW)).toEqual({ count: 0, html: '<div class="swevents" data-testid="csm-switch-activity"><div class="swline sw-muted">No claude-switch activity yet</div></div>' });
   });
   it("shows PAUSED and omits the rank when unknown", () => {
     expect(renderSwitchBlock(full({ paused: true }), NOW)).toContain("#2 · PAUSED<");
@@ -87,8 +87,9 @@ describe("renderSwitchBlock", () => {
   it("filters kinds, orders newest first, truncates to 8, mutes offline and ratelimit", () => {
     const kinds = ["info", "kept", "debug", "switch", "restore", "needsLogin", "cleared", "error", "rollback", "paused", "resumed", "offline", "ratelimit"];
     const events = kinds.map((kind, i) => ({ ts: sec - 1000 + i * 10, kind, text: `ev-${kind}` }));
-    const h = renderSwitchBlock(full({ events }), NOW);
-    expect(h).toContain("Activity (8)");
+    const a = renderSwitchActivity(full({ events }), NOW);
+    expect(a?.count).toBe(8);
+    const h = a?.html ?? "";
     for (const k of ["info", "kept", "debug"]) expect(h).not.toContain(`ev-${k}<`);
     expect(h).toContain("ev-ratelimit<");
     expect(h.indexOf("ev-ratelimit")).toBeLessThan(h.indexOf("ev-offline"));
@@ -98,7 +99,9 @@ describe("renderSwitchBlock", () => {
     expect(h).not.toContain("sw-error sw-muted");
   });
   it("escapes event text", () => {
-    expect(renderSwitchBlock(full({ events: [{ ts: sec, kind: "error", text: "<b>x</b>" }] }), NOW)).not.toContain("<b>x");
+    const h = renderSwitchActivity(full({ events: [{ ts: sec, kind: "error", text: "<b>x</b>" }] }), NOW)?.html ?? "";
+    expect(h).not.toContain("<b>x");
+    expect(h).toContain("&lt;b&gt;x&lt;/b&gt;");
   });
 });
 

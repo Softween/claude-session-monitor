@@ -498,7 +498,6 @@ export function resetsTotal(entries: (ResetsEntry | undefined)[], nowMs: number)
 
 /** The Limit resets section of the Usage Limits payload. */
 export interface ResetsPayload {
-  open: boolean;
   total: number | null; // null until any account has a known reading
   cliMissing?: boolean;
   accounts: ({ id: string; name: string; email: string; active: boolean } & ResetsAccountView)[];

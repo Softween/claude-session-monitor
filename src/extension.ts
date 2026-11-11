@@ -20,9 +20,8 @@ import * as path from "path";
 import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, excludedEmails, excludedOf, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, renderSwitchActivity, headerGauges, switchInstalled, useTargets, type CardHeader } from "./switchPanel";
 import { gaugeColumn } from "./compact";
 import { calibrate } from "./burn";
-import { BURN_WINDOWS, DEFAULT_BURN_WINDOW_MS, buildBurnPayload, burnShares, gaugeSamplesFromHistory, resolveScale } from "./burnPayload";
+import { BURN_WINDOWS, DEFAULT_BURN_WINDOW_MS, buildBurnPayload, burnShares, gaugeSamplesFromHistory, resolveScale, type BurnPayload } from "./burnPayload";
 import { BurnTracker } from "./burnTracker";
-import { BurnView } from "./burnView";
 import { TYPED_REASON, deliverText, registerRemoteBridge, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt, type RemoteBridge } from "./remoteBridge";
 import { runTool } from "./remote";
 import { sanitizeRemoteLine } from "./remoteInput";
@@ -608,10 +607,11 @@ interface LimitsPayload {
   useResult?: { email: string; at: number; ok: boolean; text: string; running?: boolean }; // last finished `use` (at = its click time), shown for a few seconds; running: past the UI timeout, until it exits
   skipFailed?: { email: string; at: number }; // last skip box change claude-switch did not apply (at = its click time): the webview drops its optimistic state
   resets?: ResetsPayload; // Resets tab (claude-switch installed only)
+  burnOn?: boolean; // Burn tab (Claude enabled): there before its first ranking arrives
 }
 
-/** The Usage Limits view's bottom tabs; Resets and Activity exist only with claude-switch. */
-const LIMITS_TABS = ["accounts", "resets", "activity"] as const;
+/** The Usage Limits view's bottom tabs; Burn needs Claude, Resets and Activity need claude-switch. */
+const LIMITS_TABS = ["accounts", "burn", "resets", "activity"] as const;
 type LimitsTab = (typeof LIMITS_TABS)[number];
 const isLimitsTab = (v: unknown): v is LimitsTab => (LIMITS_TABS as readonly unknown[]).includes(v);
 
@@ -961,6 +961,7 @@ function buildLimitsPayload(
 class LimitsView implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private pending?: LimitsPayload;
+  private pendingBurn?: BurnPayload; // the Burn tab's last ranking, replayed when the view resolves again
 
   constructor(
     private readonly onRefresh: () => void,
@@ -970,6 +971,7 @@ class LimitsView implements vscode.WebviewViewProvider {
     private readonly onUi: (key: string, value: unknown) => void,
     private readonly onExclude: (email: string, excluded: boolean, clickedAt?: number) => void,
     private readonly onUseReset: (key: string, clickedAt?: number) => void,
+    private readonly onBurn: (action: "open" | "window", value: string) => void,
   ) {}
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -984,13 +986,22 @@ class LimitsView implements vscode.WebviewViewProvider {
       else if (m && m.type === "setUi" && typeof m.key === "string") this.onUi(m.key, m.value);
       else if (m && m.type === "setExcluded" && typeof m.email === "string" && typeof m.excluded === "boolean") this.onExclude(m.email, m.excluded, typeof m.at === "number" ? m.at : undefined);
       else if (m && m.type === "useReset" && typeof m.key === "string") this.onUseReset(m.key, typeof m.at === "number" ? m.at : undefined);
+      else if (m && m.type === "burnWindow" && typeof m.ms === "number" && Number.isFinite(m.ms) && m.ms > 0) this.onBurn("window", String(m.ms));
+      else if (m && m.type === "openSession" && typeof m.id === "string" && m.id !== "") this.onBurn("open", m.id);
     });
     if (this.pending) view.webview.postMessage(this.pending);
+    if (this.pendingBurn) view.webview.postMessage({ ...this.pendingBurn, type: "burn" });
   }
 
   update(payload: LimitsPayload): void {
     this.pending = payload;
     this.view?.webview.postMessage(payload);
+  }
+
+  /** The Burn tab's ranking, every few seconds; posted as type "burn" beside the limits "update". */
+  updateBurn(payload: BurnPayload): void {
+    this.pendingBurn = payload;
+    this.view?.webview.postMessage({ ...payload, type: "burn" });
   }
 }
 
@@ -1050,13 +1061,46 @@ function limitsHtml(): string {
   .rsrow .rsact, .rsrow .useacct { margin:0 0 0 auto; }
   .rsrow .useacct { flex:none; }
   .rsnone { margin:2px 0 0 10px; font-size:10px; color: var(--vscode-descriptionForeground); }
-  /* Section tabs pinned to the bottom of the view, in the Sessions filter's pill style; the spacer keeps the last line above them. */
-  .ltabs { position:fixed; left:0; right:0; bottom:0; display:flex; align-items:center; gap:4px; padding:4px 12px;
-    background: var(--vscode-sideBar-background, var(--vscode-editor-background)); border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
-  .ltab { border:0; background:transparent; color:var(--vscode-descriptionForeground); border-radius:999px; padding:2px 8px; font:inherit; font-size:11px; cursor:pointer; }
-  .ltab:hover { color:var(--vscode-foreground); }
-  .ltab.active { color:var(--vscode-foreground); background:var(--vscode-badge-background, rgba(127,127,127,.25)); }
-  .ltabspace { height:30px; }
+  /* Section tabs pinned to the bottom of the view: equal-width boxed buttons, the selected one filled like a primary
+     button, counts in badges; the spacer keeps the last line above them. */
+  .ltabs { position:fixed; left:0; right:0; bottom:0; display:flex; gap:4px; padding:6px 8px;
+    background: var(--vscode-sideBar-background, var(--vscode-editor-background)); border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35)); }
+  .ltab { flex:1 1 0; min-width:0; display:flex; align-items:center; justify-content:center; gap:5px; height:26px; padding:0 6px;
+    border:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.35)); border-radius:4px; background: var(--vscode-editorWidget-background, rgba(127,127,127,.12));
+    color: var(--vscode-foreground); font:inherit; font-size:12px; white-space:nowrap; cursor:pointer; }
+  .ltab:hover { background: var(--vscode-list-hoverBackground, rgba(127,127,127,.2)); }
+  .ltab:focus-visible { outline:1px solid var(--vscode-focusBorder, #007fd4); outline-offset:1px; }
+  .ltab.active { background: var(--vscode-button-background, #0e639c); border-color: var(--vscode-button-background, #0e639c); color: var(--vscode-button-foreground, #fff); font-weight:600; }
+  .ltab .tl { min-width:0; overflow:hidden; text-overflow:ellipsis; }
+  .ltab .tn { flex:none; min-width:16px; padding:0 5px; border-radius:8px; font-size:10px; line-height:16px; text-align:center;
+    background: var(--vscode-badge-background, rgba(127,127,127,.3)); color: var(--vscode-badge-foreground, inherit); }
+  .ltab.active .tn { background: rgba(255,255,255,.25); color: inherit; }
+  .ltabspace { height:44px; }
+  /* Burn tab: window picker, headline, then per session two lines (rank · dot · title · rate · used, then the bar and the meta). */
+  .bwins { display:flex; gap:2px; margin:6px 0 2px; padding:2px; border-radius:4px; background: color-mix(in srgb, var(--vscode-foreground) 6%, transparent); }
+  .bwin { flex:1; border:0; border-radius:3px; background:transparent; color:var(--vscode-descriptionForeground); padding:2px 0; font:inherit; font-size:11px; cursor:pointer; }
+  .bwin:hover { color:var(--vscode-foreground); }
+  .bwin[aria-pressed="true"] { color:var(--vscode-foreground); background:var(--vscode-badge-background, rgba(127,127,127,.25)); box-shadow: inset 0 0 0 1px var(--vscode-contrastActiveBorder, transparent); }
+  .bwin:focus-visible { outline:1px solid var(--vscode-focusBorder, #007fd4); outline-offset:-1px; }
+  .bhead { padding:6px 0 4px; font-weight:600; line-height:1.4; overflow-wrap:break-word; }
+  .brow { display:grid; grid-template-columns: 16px 7px minmax(0,1fr) auto auto; column-gap:6px; row-gap:3px; align-items:center; margin:0 -12px; padding:4px 12px 5px; }
+  .brow[data-open] { cursor:pointer; }
+  .brow[data-open]:hover { background: var(--vscode-list-hoverBackground, rgba(127,127,127,.12)); }
+  .brow:focus { outline: 1px solid var(--vscode-focusBorder, #007fd4); outline-offset: -1px; }
+  .brow.ended { opacity: .6; }
+  .brank { text-align:right; color: var(--vscode-descriptionForeground); }
+  .bdot { width:7px; height:7px; border-radius:50%; border:1px solid var(--vscode-descriptionForeground); opacity:.6; }
+  .bdot.live { background: var(--vscode-charts-green, #89d185); border-color: var(--vscode-charts-green, #89d185); opacity:1; }
+  .btitle { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .brate { font-weight:600; min-width:7ch; text-align:right; white-space:nowrap; }
+  .bused { min-width:6ch; text-align:right; white-space:nowrap; color: var(--vscode-descriptionForeground); }
+  .bl2 { grid-column: 3 / -1; display:flex; align-items:center; gap:6px; min-width:0; }
+  .bbar { flex:0 0 30%; max-width:120px; height:3px; border-radius:2px; overflow:hidden; background: color-mix(in srgb, var(--vscode-foreground) 12%, transparent); }
+  .bfill { display:block; height:100%; background: var(--vscode-progressBar-background, #0e70c0); }
+  .bmeta { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px; color: var(--vscode-descriptionForeground); }
+  .bmore { padding:3px 0; font-size:11px; color: var(--vscode-descriptionForeground); }
+  .bnote { padding:8px 0 10px; font-size:10px; line-height:1.4; color: var(--vscode-descriptionForeground); }
+  .bempty { padding:14px 0; color: var(--vscode-descriptionForeground); line-height:1.5; }
   /* Collapsed card = one 16px line + 4px padding top and bottom + 1px separator = 25px. */
   .card.ccard { padding:4px 0; }
   .card.ccard:first-child { padding-top:0; }
@@ -1329,16 +1373,49 @@ function resetsList(){
   }
   return h + '</div>';
 }
-// Section tabs pinned to the bottom of the view: Accounts, plus Resets and Activity when claude-switch provides them.
+let burn = null; // the Burn tab's last ranking from the host (every few seconds)
+function burnPct(n){ n = Number(n); return n > 0 ? Math.min(100, Math.round(n * 10) / 10) : 0; }
+function burnRow(r){
+  const open = r.openId ? ' data-open="'+esc(r.openId)+'" tabindex="0" role="button"' : '';
+  return '<div class="brow'+(r.ended?' ended':'')+'" title="'+esc(r.tip)+'"'+open+'>'
+    + '<span class="num brank">'+esc(r.rank)+'</span>'
+    + '<span class="bdot'+(r.live?' live':'')+'" role="img" aria-label="'+(r.live?'live':'not live')+'"></span>'
+    + '<span class="btitle">'+esc(r.title)+'</span>'
+    + '<span class="num brate">'+esc(r.rate)+'</span>'
+    + '<span class="num bused">'+esc(r.used)+'</span>'
+    + '<div class="bl2"><span class="bbar"><span class="bfill" style="width:'+burnPct(r.barPct)+'%"></span></span>'
+    + '<span class="bmeta">'+esc(r.meta)+'</span></div>'
+    + '</div>';
+}
+// Burn tab: the window picker, the headline, one entry per session (a click opens it), the more line and the note.
+function burnTab(){
+  const p = burn;
+  if(!p) return '<div class="bempty">Collecting usage…</div>';
+  const ws = Array.isArray(p.windows) ? p.windows : [];
+  let h = ws.length ? '<div class="bwins" role="group" aria-label="Burn window">'
+    + ws.map(w=>'<button type="button" class="bwin" data-ms="'+esc(w.ms)+'" aria-pressed="'+(w.ms === p.windowMs)+'">'+esc(w.label)+'</button>').join('') + '</div>' : '';
+  if(p.headline) h += '<div class="bhead">'+esc(p.headline)+'</div>';
+  const rows = Array.isArray(p.rows) ? p.rows : [];
+  if(!rows.length) h += '<div class="bempty">'+esc(p.empty)+'</div>';
+  else {
+    h += rows.map(r=>burnRow(r)).join('');
+    const n = Number(p.more);
+    if(n > 0) h += '<div class="bmore">+ '+esc(n)+' more session'+(n === 1 ? '' : 's')+'</div>';
+  }
+  if(p.note) h += '<div class="bnote">'+esc(p.note)+'</div>';
+  return h;
+}
+// Section tabs pinned to the bottom of the view: Accounts, Burn while Claude is on, Resets and Activity from claude-switch.
 function tabList(){
   const t = [{ id:'accounts', label:'Accounts', n:null }];
+  if(last.burnOn) t.push({ id:'burn', label:'Burn', n:null });
   if(last.resets) t.push({ id:'resets', label:'Resets', n:last.resets.total });
   if(last.switchActivity) t.push({ id:'activity', label:'Activity', n:last.switchActivity.count });
   return t;
 }
 function tabBar(tabs, cur){
   return '<div class="ltabspace"></div><div class="ltabs" role="tablist" aria-label="Usage Limits sections" data-testid="csm-limits-tabs">'
-    + tabs.map(t=>'<button type="button" role="tab" class="ltab'+(t.id===cur?' active':'')+'" aria-selected="'+(t.id===cur)+'" data-tab="'+t.id+'" data-testid="csm-tab-'+t.id+'">'+t.label+(t.n!=null?' '+t.n:'')+'</button>').join('')
+    + tabs.map(t=>'<button type="button" role="tab" class="ltab'+(t.id===cur?' active':'')+'" aria-selected="'+(t.id===cur)+'" data-tab="'+t.id+'" data-testid="csm-tab-'+t.id+'"><span class="tl">'+t.label+'</span>'+(t.n!=null?'<span class="tn">'+t.n+'</span>':'')+'</button>').join('')
     + '</div>';
 }
 function setUi(key, value){
@@ -1356,6 +1433,7 @@ function render(){
   const tabs = tabList(), tab = tabs.some(t=>t.id===ui.tab) ? ui.tab : 'accounts';
   let h = last.switchHtml || '';
   if(tab==='resets') h += resetsList();
+  else if(tab==='burn') h += burnTab();
   else if(tab==='activity') h += last.switchActivity.html;
   else h += accountsHtml();
   if(tabs.length > 1) h += tabBar(tabs, tab);
@@ -1400,6 +1478,7 @@ document.getElementById('root').addEventListener('keydown', (ev) => {
   if(!d) return;
   if(d.switch){ vscodeApi.postMessage({ type:'switchAccount', id: d.switch }); ev.preventDefault(); }
   else if(d.toggle){ toggleAccount(d.toggle); ev.preventDefault(); }
+  else if(d.open){ vscodeApi.postMessage({ type:'openSession', id: d.open }); ev.preventDefault(); }
 });
 document.getElementById('root').addEventListener('click', (ev) => {
   let el = ev.target;
@@ -1424,6 +1503,8 @@ document.getElementById('root').addEventListener('click', (ev) => {
     }
     if(el.dataset && el.dataset.toggle){ toggleAccount(el.dataset.toggle); return; }
     if(el.dataset && el.dataset.tab){ setUi('tab', el.dataset.tab); return; }
+    if(el.dataset && el.dataset.ms){ const ms = Number(el.dataset.ms); if(ms > 0) vscodeApi.postMessage({ type:'burnWindow', ms: ms }); return; }
+    if(el.dataset && el.dataset.open){ vscodeApi.postMessage({ type:'openSession', id: el.dataset.open }); return; }
     if(el.dataset && el.dataset.rotate){ vscodeApi.postMessage({ type:'rotateBest' }); return; }
     if(el.classList && el.classList.contains('sech') && el.dataset.sec){
       collapsed[el.dataset.sec] = !collapsed[el.dataset.sec];
@@ -1457,6 +1538,7 @@ window.addEventListener('message', e => {
     settleSkips();
     render();
   }
+  else if(e.data && e.data.type==='burn'){ burn = e.data; render(); }
 });
 setInterval(render, 1000); // keep countdowns live
 </script>
@@ -1540,6 +1622,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     },
     (email, excluded, clickedAt) => setExcludedViaCli(email, excluded, clickedAt),
     (key, clickedAt) => void useResetFromPanel(key, clickedAt),
+    onBurnAction,
   );
 
   type UseFinish = (ok: boolean, text: string, cliMs: number | null, running?: boolean) => void;
@@ -1857,7 +1940,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   );
 
   // Limit burn: what each session spends, read from the transcripts (subagents
-  // included) every few seconds and ranked in its own view.
+  // included) every few seconds and ranked on the Usage limits view's Burn tab.
   const BURN_HORIZON_MS = 5.5 * 3_600_000;
   const burnTracker = new BurnTracker({ projectsDir: PROJECTS_DIR, horizonMs: BURN_HORIZON_MS });
   const storedBurnWindow = ctx.globalState.get<number>("burnWindowMs", DEFAULT_BURN_WINDOW_MS);
@@ -1866,7 +1949,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let burnShareBySession: Map<string, number> | null = null; // null until the first transcript scan finished
   let burnHogId: string | null = null;
   let lastBurnTick = 0;
-  const burnView = new BurnView((action, value) => {
+  /** A Burn tab click: one of BURN_WINDOWS, or a session row to open. */
+  function onBurnAction(action: "open" | "window", value: string): void {
     if (action === "window") {
       const ms = Number(value);
       if (!BURN_WINDOWS.some((w) => w.ms === ms)) return;
@@ -1877,8 +1961,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
     const v = lastAllViews.find((session) => session.key === value);
     if (v) void jumpToSession(v);
-  });
-  ctx.subscriptions.push(vscode.window.registerWebviewViewProvider("claudeSessionMonitor.burn", burnView));
+  }
 
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusBar.command = "claudeSessionMonitor.focus";
@@ -2940,7 +3023,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   }
 
   // Limit burn tick: tail the transcripts, turn spend into 5h-limit percent with
-  // the account's own gauge history, and push the ranked list to its view.
+  // the account's own gauge history, and push the ranked list to the Burn tab.
   async function burnTick(): Promise<void> {
     try {
       await burnTracker.refresh();
@@ -2961,7 +3044,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const listed = new Map(
         lastAllViews.filter((v) => v.provider === "claude").map((v) => [v.sessionId, v] as const),
       );
-      burnView.update(
+      limitsView.updateBurn(
         buildBurnPayload({
           summary: burnTracker.summary(burnWindowMs),
           scale: resolved.scale,
@@ -3035,6 +3118,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         switchBadges: allBadges(panel),
         panelFresh: fresh,
         showTokenStats: showTokenStats(),
+        burnOn: claudeEnabled(),
         ui: { tab: isLimitsTab(savedTab) ? savedTab : "accounts", expandedAccounts: ctx.workspaceState.get<Record<string, boolean>>("csm.expandedAccounts", {}) },
         useEmails: fresh ? useTargets(panel) : [],
         usePending: usePending?.email,

@@ -703,6 +703,8 @@ describe("active login and Use this account", () => {
     const fetchMock = (globalThis as any).fetch as ReturnType<typeof vi.fn>;
     fetchMock.mockClear();
     const { posted, send } = activateWithLimitsView();
+    const saved = new Map<string, unknown>(); // this test checks the chosen tab is kept, so its workspaceState keeps what is stored
+    lastCtx.workspaceState = { get: (k: string, def?: unknown) => (saved.has(k) ? saved.get(k) : def), update: (k: string, v: unknown) => { saved.set(k, v); return Promise.resolve(); } };
     await vi.waitFor(() => expect(posted[posted.length - 1]?.resets?.cliMissing).toBe(true));
     const last = posted[posted.length - 1];
     expect(last.ui.tab).toBe("accounts");
@@ -710,6 +712,7 @@ describe("active login and Use this account", () => {
     expect(last.resets.accounts.map((a: { id: string; email: string; name: string }) => [a.id, a.email, a.name])).toEqual([[UA, "a@x.com", "a"], [UB, "b@x.com", "b"]]);
     send({ type: "setUi", key: "tab", value: "bogus" });
     send({ type: "setUi", key: "tab", value: "resets" });
+    expect([...saved]).toEqual([["csm.limitsTab", "resets"]]); // the unknown tab was not stored
     send({ type: "useReset", key: `${UA}|full`, at: 5 });
     await vi.waitFor(() => expect(posted[posted.length - 1].resets.done).toEqual({ at: 5 }));
     expect(posted[posted.length - 1].ui.tab).toBe("resets");

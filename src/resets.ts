@@ -1,9 +1,10 @@
 // Limit resets: the gift resets ("cedar_ember" grants) Anthropic gives a Claude account,
 // listed per account in the Usage Limits panel and spent one at a time on a click.
 // Pure logic (no vscode import) so it stays unit-testable: fetch and the file lookups
-// are injected. Listing is the same read-only usage call the Claude Code CLI makes;
-// claimReset spends a reset and the extension calls it only after the user's click
-// and a modal confirm. Token values are never logged or returned.
+// are injected. The resets ride along on the extension's own usage polls (usageRequest)
+// and the last reading per account is kept on disk; claimReset spends a reset and the
+// extension calls it only after the user's click and a modal confirm. Token values are
+// never logged or returned.
 
 import * as path from "path";
 
@@ -17,14 +18,14 @@ export const KIND_LABEL: Record<ResetKind, string> = {
   session: "5-hour reset",
 };
 
-export const RESETS_URL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1";
+export const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 export const claimUrl = (orgUuid: string): string => `https://api.anthropic.com/api/organizations/${orgUuid}/reset_rate_limits`;
 const PROGRAM = "cedar_ember";
-const LIST_TIMEOUT_MS = 10_000;
 const CLAIM_TIMEOUT_MS = 25_000;
 const GRANT_ID_RE = /^[a-z0-9_-]{1,40}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const ORG_UUID_RE = /^[0-9a-f-]{36}$/i;
+const ACCOUNT_UUID_RE = /^[0-9a-f-]{36}$/i;
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -256,7 +257,22 @@ export type ResetsFetch = (
 ) => Promise<ResetsResponse>;
 
 export type FailKind = "rate_limited" | "auth" | "error";
-export type ListResult = { ok: true; status: CedarEmber } | { ok: false; kind: FailKind; httpStatus?: number; retryAfterSec?: number };
+
+/**
+ * The usage poll's request. With Limit resets on and the Claude Code CLI found it also asks for the
+ * cedar_ember block, under the CLI's User-Agent (the only one the server lists resets for); nothing
+ * reads the spend block, so skip_spend=1. Otherwise it is the plain request it always was, without a
+ * User-Agent.
+ */
+export function usageRequest(token: string, resetsOn: boolean, ua: string | null): { url: string; headers: Record<string, string> } {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
+    "anthropic-beta": "oauth-2025-04-20",
+  };
+  if (!resetsOn || !ua) return { url: USAGE_URL, headers };
+  return { url: `${USAGE_URL}?cedar_ember=1&skip_spend=1`, headers: { ...headers, "User-Agent": ua } };
+}
 
 const apiHeaders = (token: string, ua: string): Record<string, string> => ({
   Authorization: `Bearer ${token}`,
@@ -279,19 +295,6 @@ async function readJson(res: ResetsResponse): Promise<unknown> {
   } catch {
     return undefined;
   }
-}
-
-/** List one account's resets (read-only). */
-export async function fetchResets(token: string, ua: string, fetchFn: ResetsFetch): Promise<ListResult> {
-  let res: ResetsResponse;
-  try {
-    res = await fetchFn(RESETS_URL, { method: "GET", headers: apiHeaders(token, ua), signal: AbortSignal.timeout(LIST_TIMEOUT_MS) });
-  } catch {
-    return { ok: false, kind: "error" };
-  }
-  if (!res.ok) return httpFailure(res);
-  const status = parseCedarEmber(await readJson(res));
-  return status ? { ok: true, status } : { ok: false, kind: "error", httpStatus: res.status };
 }
 
 export type ClaimResult = "reset" | "already_used" | "not_limited" | "cooldown" | "ineligible" | "unavailable";
@@ -356,13 +359,6 @@ export function claimUnresolved(o: ClaimOutcome): boolean {
   return o.httpStatus === undefined || o.httpStatus >= 500 || o.httpStatus < 300;
 }
 
-/** Seconds before the next listing of an account after a failure. */
-export function nextBackoffSec(kind: FailKind, retryAfterSec?: number): number {
-  if (kind === "auth") return 3600;
-  if (kind === "rate_limited" && retryAfterSec !== undefined && retryAfterSec > 0) return Math.min(retryAfterSec, 3600);
-  return 300;
-}
-
 const SAFE_RETRY = "Trying again is safe: it repeats the same request.";
 
 /** One user-facing sentence for a claim outcome. */
@@ -394,21 +390,67 @@ export function describeClaim(o: ClaimOutcome, label: string, email: string, now
   }
 }
 
-/** Host state of one account's listing. */
+/** The last known resets of one account: the cedar_ember block of its newest usage reading. */
 export interface ResetsEntry {
-  fetchedAt: number; // ms of the last successful listing (0 = never)
-  status?: CedarEmber; // that listing
-  error?: { kind: FailKind | "no_token"; httpStatus?: number; note?: string }; // the last attempt failed (no_token: nothing was sent)
-  backoffUntil?: number; // ms: no listing before this
+  ts: number; // epoch seconds of that reading
+  status: CedarEmber;
 }
 
-/** True when a listing older than `maxAgeSec` may be refreshed now (never while in backoff). */
-export function listingDue(e: ResetsEntry | undefined, maxAgeSec: number, nowMs: number): boolean {
-  if (e?.backoffUntil && nowMs < e.backoffUntil) return false;
-  return nowMs - (e?.fetchedAt ?? 0) >= maxAgeSec * 1000;
+/** How an account's latest usage poll failed; its resets stay at the last reading meanwhile. */
+export interface UsageFail {
+  kind: "rate_limited" | "auth";
+  httpStatus?: number;
 }
 
-export type ResetsState = "ok" | "loading" | "rate_limited" | "auth" | "no_token" | "ineligible" | "error";
+/** A status in the server's wire shape, so a stored file is read back through parseCedarEmber. */
+function toWire(s: CedarEmber): Record<string, unknown> {
+  return {
+    eligible: s.eligible,
+    ineligible_reason: s.ineligibleReason,
+    at_limit: s.atLimit,
+    next_grant_id: s.nextGrantId,
+    grants: s.grants.map((g) => ({
+      id: g.id,
+      resets_left: g.resetsLeft,
+      ends_at: g.endsAt,
+      clears: g.clears,
+      paused: g.paused,
+      usable_now: g.usableNow,
+      use_requires_limit: g.useRequiresLimit,
+      type: g.type,
+      gives_back_weekly: g.givesBackWeekly,
+      unavailable_reason: g.unavailableReason,
+    })),
+  };
+}
+
+/** `<dir>/resets-<accountUuid>.json`, or null when the id is not a plain uuid (no path escape). */
+export function resetsFilePath(dir: string, accountId: string): string | null {
+  return ACCOUNT_UUID_RE.test(accountId) ? path.join(dir, `resets-${accountId}.json`) : null;
+}
+
+/** The stored file: `{ts, status}`, status in the server's cedar_ember shape. */
+export function resetsFileText(e: ResetsEntry): string {
+  return JSON.stringify({ ts: e.ts, status: toWire(e.status) });
+}
+
+const jsonOf = (text: string): unknown => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+};
+
+/** A stored file read back and validated like a fresh response; null when it is malformed. */
+export function parseResetsFile(text: string): ResetsEntry | null {
+  const v = jsonOf(text);
+  if (!isObj(v) || typeof v.ts !== "number" || !Number.isFinite(v.ts) || v.ts <= 0) return null;
+  const status = parseCedarEmber({ cedar_ember: v.status });
+  return status ? { ts: v.ts, status } : null;
+}
+
+export type ResetsState = "ok" | "ineligible" | "waiting"; // waiting: no reading with resets yet
 export interface ResetsKindView {
   kind: ResetKind;
   label: string;
@@ -421,23 +463,19 @@ export interface ResetsKindView {
 export interface ResetsAccountView {
   atLimit: boolean;
   state: ResetsState;
+  ts: number | null; // epoch seconds of the reading the rows come from: the webview shows "as of" once it is old
   note?: string;
-  kinds: ResetsKindView[]; // from the last successful listing, also while the latest attempt failed
+  kinds: ResetsKindView[]; // from the last known reading, also while the latest poll fails
 }
 
-function failNote(err: NonNullable<ResetsEntry["error"]>, backoffUntil: number | undefined, nowMs: number): string {
-  const next = backoffUntil && backoffUntil > nowMs ? ` · next try ${whenText(backoffUntil, nowMs)}` : "";
-  const http = err.httpStatus ? ` (HTTP ${err.httpStatus})` : "";
-  if (err.kind === "no_token") return err.note ?? "no stored token";
-  if (err.kind === "rate_limited") return `usage API rate-limited${next}`;
-  if (err.kind === "auth") return `token rejected${http}${next}`;
-  return `could not read resets${http || " (network)"}${next}`;
-}
+const failText = (f: UsageFail): string => (f.kind === "rate_limited" ? "usage API rate-limited" : `token rejected${f.httpStatus ? ` (HTTP ${f.httpStatus})` : ""}`);
 
-/** The panel's view of one account. */
-export function accountView(e: ResetsEntry | undefined, nowMs: number): ResetsAccountView {
-  const s = e?.status;
-  const kinds: ResetsKindView[] = (s ? summarize(s, nowMs) : []).map((r) => ({
+/** The panel's view of one account: rows from its last known reading, and why its latest usage poll failed. */
+export function accountView(e: ResetsEntry | undefined, fail: UsageFail | undefined, nowMs: number): ResetsAccountView {
+  const failNote = fail ? failText(fail) : undefined;
+  if (!e) return { atLimit: false, state: "waiting", ts: null, note: ["waiting for the next usage reading", failNote].filter((n): n is string => !!n).join(" · "), kinds: [] };
+  const s = e.status;
+  const kinds: ResetsKindView[] = summarize(s, nowMs).map((r) => ({
     kind: r.kind,
     label: r.label,
     count: r.count,
@@ -446,25 +484,23 @@ export function accountView(e: ResetsEntry | undefined, nowMs: number): ResetsAc
     usable: r.usable,
     ...(r.why ? { why: r.why } : {}),
   }));
-  const atLimit = s?.atLimit === true;
-  if (e?.error) return { atLimit, state: e.error.kind, note: failNote(e.error, e.backoffUntil, nowMs), kinds };
-  if (!s) return { atLimit, state: "loading", note: "checking…", kinds };
-  if (!s.eligible) return { atLimit, state: "ineligible", note: `not eligible${s.ineligibleReason ? ` (${reasonText(s.ineligibleReason)})` : ""}`, kinds };
-  return { atLimit, state: "ok", kinds };
+  const ineligible = s.eligible ? undefined : `not eligible${s.ineligibleReason ? ` (${reasonText(s.ineligibleReason)})` : ""}`;
+  const notes = [ineligible, failNote].filter((n): n is string => !!n);
+  return { atLimit: s.atLimit, state: s.eligible ? "ok" : "ineligible", ts: e.ts, ...(notes.length ? { note: notes.join(" · ") } : {}), kinds };
 }
 
-/** The section header's N: resets left across every listed account; null until one has a listing. */
+/** The section header's N: resets left across every account with a known reading; null until one has one. */
 export function resetsTotal(entries: (ResetsEntry | undefined)[], nowMs: number): number | null {
   let total: number | null = null;
-  for (const e of entries) if (e?.status) total = (total ?? 0) + summarize(e.status, nowMs).reduce((n, r) => n + r.count, 0);
+  for (const e of entries) if (e) total = (total ?? 0) + summarize(e.status, nowMs).reduce((n, r) => n + r.count, 0);
   return total;
 }
 
 /** The Limit resets section of the Usage Limits payload. */
 export interface ResetsPayload {
   open: boolean;
-  total: number | null; // null until any account has a listing
+  total: number | null; // null until any account has a known reading
   cliMissing?: boolean;
-  accounts: ({ id: string; name: string; email: string } & ResetsAccountView)[];
+  accounts: ({ id: string; name: string; email: string; active: boolean } & ResetsAccountView)[];
   done?: { at: number } | null; // the last finished Use click (at = its click time)
 }

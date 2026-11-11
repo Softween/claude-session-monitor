@@ -46,14 +46,16 @@ import {
   claimUnresolved,
   cliUserAgent,
   describeClaim,
-  fetchResets,
   fmtUseBy,
-  listingDue,
-  nextBackoffSec,
+  parseCedarEmber,
+  parseResetsFile,
   pickGrant,
   refillText,
+  resetsFilePath,
+  resetsFileText,
   resetsTotal,
   summarize,
+  usageRequest,
   withResetsLeft,
   type CedarEmber,
   type ResetGrant,
@@ -61,6 +63,7 @@ import {
   type ResetsEntry,
   type ResetsFetch,
   type ResetsPayload,
+  type UsageFail,
 } from "./resets";
 import {
   KEYCHAIN_SERVICE,
@@ -724,17 +727,13 @@ async function claudeJsonMtimeMs(): Promise<number | undefined> {
 }
 
 type UsageFetch =
-  | { ok: true; usage: OfficialUsage }
+  | { ok: true; usage: OfficialUsage; resets: CedarEmber | null } // resets: the cedar_ember block when the request asked for it (usageRequest)
   | { ok: false; status?: number; retryAfterSec?: number };
 
-async function fetchOfficialUsage(token: string): Promise<UsageFetch> {
+async function fetchOfficialUsage(req: { url: string; headers: Record<string, string> }): Promise<UsageFetch> {
   try {
-    const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-        "anthropic-beta": "oauth-2025-04-20",
-      },
+    const res = await fetch(req.url, {
+      headers: req.headers,
       signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) {
@@ -748,7 +747,7 @@ async function fetchOfficialUsage(token: string): Promise<UsageFetch> {
       log("usage: no gauges in payload");
       return { ok: false };
     }
-    return { ok: true, usage: { gauges, ts: Date.now() / 1000 } };
+    return { ok: true, usage: { gauges, ts: Date.now() / 1000 }, resets: parseCedarEmber(p) };
   } catch (e) {
     log("usage: fetch error " + String(e));
     return { ok: false };
@@ -1295,6 +1294,14 @@ function resetRow(a, k){
     + (k.until ? '<span class="rsd">'+(k.count>1?'first expires ':'use by ')+esc(k.until)+'</span>' : '')
     + act + '</div>';
 }
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+// The rows come from the account's last usage reading; an old one (active login 10 min, others 20 min) shows its time.
+function asOfNote(a){
+  if(!a.ts || Date.now()/1000 - a.ts <= (a.active ? 600 : 1200)) return '';
+  const d = new Date(a.ts*1000), hm = String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+  const day = d.toDateString()===new Date(Date.now()).toDateString() ? '' : d.getDate()+' '+MONTHS[d.getMonth()]+' ';
+  return '<span class="rsnote" data-testid="csm-resets-asof">as of '+day+hm+'</span>';
+}
 // Limit resets (claude-switch only): collapsed to its header line unless opened; accounts in card order.
 function resetsSection(){
   const r = last.resets;
@@ -1306,6 +1313,7 @@ function resetsSection(){
     else for(const a of (r.accounts||[])){
       h += '<div class="rsacct" data-testid="csm-resets-account"><div class="rsname"><span class="ctitle" title="'+esc(a.email)+'">'+esc(a.name)+'</span>'
         + (a.atLimit ? '<span class="chip">at limit</span>' : '')
+        + asOfNote(a)
         + (a.note ? '<span class="rsnote" title="'+esc(a.note)+'">'+esc(a.note)+'</span>' : '') + '</div>';
       const kinds = a.kinds || [];
       if(kinds.length) h += kinds.map(k=>resetRow(a, k)).join('');
@@ -1509,10 +1517,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     (key, value) => {
       if (key === "switchActivityOpen") void ctx.workspaceState.update("csm.switchActivityOpen", value === true);
       else if (key === "expandedAccounts" && value && typeof value === "object") void ctx.workspaceState.update("csm.expandedAccounts", value);
-      else if (key === "resetsOpen") {
-        void ctx.workspaceState.update("csm.resetsOpen", value === true);
-        if (value === true) requestResets(300); // opening lists accounts whose listing is older than 5 min
-      }
+      else if (key === "resetsOpen") void ctx.workspaceState.update("csm.resetsOpen", value === true);
     },
     (email, excluded, clickedAt) => setExcludedViaCli(email, excluded, clickedAt),
     (key, clickedAt) => void useResetFromPanel(key, clickedAt),
@@ -1630,105 +1635,83 @@ export function activate(ctx: vscode.ExtensionContext): void {
   }
 
   // --- Limit resets (pure logic in src/resets.ts) ----------------------------
-  // claude-switch installs only. Each account's gift resets are listed with its own
-  // token through the read-only usage call the Claude Code CLI makes: in the
-  // background when a listing is 30 min old, at 5 min when the section is opened, on
-  // a usage refresh and after a claim; one sweep at a time, calls 1 s apart, with
-  // per-account backoff. A reset is spent only after a click and a modal confirm.
-  // Tokens are never refreshed here and the active login is never written.
+  // claude-switch installs only. Each account's gift resets come with its own usage
+  // poll (usageRequest asks for the cedar_ember block as well), so they cost no extra
+  // call. The last reading per account is kept in resets-<accountUuid>.json next to
+  // the usage snapshots and loaded at activation, so a reload shows it at once. A reset
+  // is spent only after a click and a modal confirm. Tokens are never refreshed here
+  // and the active login is never written.
   const resetsByAccount = new Map<string, ResetsEntry>();
-  const resetsWanted = new Map<string, number>(); // accountId -> oldest listing age (s) its request accepts
+  const usageFail = new Map<string, UsageFail>(); // accountId -> how its latest usage poll failed (a good poll clears it)
+  const resetsLogged = new Map<string, string>(); // accountId -> last logged summary (a debug line only when it changes)
   const resetsRequestIds = new Map<string, string>(); // "<accountId>|<grantId>" -> request_id of a claim that came back unresolved
-  let resetsSweeping = false;
-  let resetsCallAt = 0; // ms of the last listing call
-  let resetsUa: string | null | undefined; // claude-cli User-Agent of the last sweep; null = Claude Code CLI not found (no calls)
   let resetsClaiming = false;
   let resetsDone: { at: number } | null = null; // the last finished Use click (at = its click time)
-  let lastResetsCheck = 0;
+  let cliUaCache: { at: number; ua: string | null } | undefined;
   const resetsFetch: ResetsFetch = (url, init) => fetch(url, init);
   const resetsOn = (): boolean => claudeEnabled() && switchInstalled();
-  const readCliUa = (): string | null =>
-    cliUserAgent({ home: os.homedir(), readdir: (d) => fs.readdirSync(d), realpath: (p) => fs.realpathSync(p) });
 
-  /** Claude accounts the cards list: every tracked login when there are two or more, else the active one. */
-  function resetsAccounts(): { id: string; email: string }[] {
-    const list = trackAllAccounts() ? accountsFile.accounts : accountsFile.accounts.filter((a) => a.id === accountsFile.activeId);
-    if (list.length > 1) return list.map((a) => ({ id: a.id, email: a.email }));
-    const active = accountsFile.accounts.find((a) => a.id === accountsFile.activeId);
-    return active ? [{ id: active.id, email: active.email }] : [];
-  }
-
-  /** List these accounts (default: every card's) unless their listing is younger than `maxAgeSec` or in backoff. */
-  function requestResets(maxAgeSec: number, ids?: string[]): void {
-    if (disposed || !resetsOn()) return;
-    const now = Date.now();
-    for (const id of ids ?? resetsAccounts().map((a) => a.id)) {
-      if (listingDue(resetsByAccount.get(id), maxAgeSec, now)) resetsWanted.set(id, Math.min(maxAgeSec, resetsWanted.get(id) ?? Infinity));
+  /** The Claude Code CLI's User-Agent, looked up at most once a minute; null when the CLI is not installed. */
+  function cliUa(): string | null {
+    if (!cliUaCache || Date.now() - cliUaCache.at > 60_000) {
+      const ua = cliUserAgent({ home: os.homedir(), readdir: (d) => fs.readdirSync(d), realpath: (p) => fs.realpathSync(p) });
+      if (ua === null && cliUaCache?.ua !== null) log("resets: Claude Code CLI not found, usage polls carry no reset data");
+      cliUaCache = { at: Date.now(), ua };
     }
-    if (resetsWanted.size && !resetsSweeping) void resetsSweep();
+    return cliUaCache.ua;
   }
 
-  /** The one listing sweep: wanted accounts one at a time; requests arriving meanwhile join it. */
-  async function resetsSweep(): Promise<void> {
-    resetsSweeping = true;
+  /** The usage poll's request: it asks for the resets too only with claude-switch and the Claude Code CLI installed. */
+  function usageReq(token: string): { url: string; headers: Record<string, string> } {
+    const on = resetsOn();
+    return usageRequest(token, on, on ? cliUa() : null);
+  }
+
+  /** Keep the resets that came with an account's usage reading (ts in epoch s), in memory and on disk. */
+  function storeResets(id: string, ts: number, status: CedarEmber): void {
+    if (!resetsOn()) return;
+    const entry: ResetsEntry = { ts, status };
+    resetsByAccount.set(id, entry);
+    const file = resetsFilePath(MONITOR_DIR, id);
     try {
-      const ua = readCliUa();
-      if (ua === null && resetsUa !== null) log("resets: Claude Code CLI not found, no reset calls");
-      const flip = (ua === null) !== (resetsUa === null);
-      resetsUa = ua;
-      if (flip) pushUsagePayload(); // "Claude Code CLI not found" appears or goes
-      if (ua === null) {
-        resetsWanted.clear();
-        return;
-      }
-      while (!disposed) {
-        const next = resetsWanted.entries().next();
-        if (next.done) break;
-        const [id, maxAgeSec] = next.value;
-        resetsWanted.delete(id);
-        if (!listingDue(resetsByAccount.get(id), maxAgeSec, Date.now())) continue;
-        await listResets(id, ua);
-        pushUsagePayload();
-      }
+      if (file) writePrivateTextAtomic(file, resetsFileText(entry));
     } catch (e) {
-      log("resets: sweep error " + String(e));
-    } finally {
-      resetsSweeping = false;
+      log(`resets: could not save acct ${id.slice(0, 8)}: ${String(e)}`);
     }
+    const kinds = summarize(status, Date.now()).map((k) => `${k.kind}=${k.count}${k.usable ? "" : " (not usable)"}`).join(" ");
+    const line = `${status.eligible ? kinds || "none" : `ineligible (${status.ineligibleReason ?? "?"})`}${status.atLimit ? " · at limit" : ""}`;
+    if (resetsLogged.get(id) === line) return;
+    resetsLogged.set(id, line);
+    log(`resets: ${accountsFile.accounts.find((a) => a.id === id)?.email ?? `acct ${id.slice(0, 8)}`} ${line}`);
   }
 
-  /** One account's listing with its own token; a failure sets its backoff. */
-  async function listResets(id: string, ua: string): Promise<void> {
-    const email = accountsFile.accounts.find((a) => a.id === id)?.email ?? `acct ${id.slice(0, 8)}`;
-    const prev = resetsByAccount.get(id) ?? { fetchedAt: 0 };
-    const creds = await resetsCreds(id, false);
-    if (!creds.token) {
-      if (prev.error?.note !== creds.why) log(`resets: ${email} not listed: ${creds.why}`);
-      resetsByAccount.set(id, { ...prev, error: { kind: "no_token", note: creds.why } });
-      return;
+  /** Adopt every saved reading newer than the one in memory (at activation, then other windows' polls); true when one was. */
+  function loadResetsFiles(): boolean {
+    let changed = false;
+    for (const a of accountsFile.accounts) {
+      const file = resetsFilePath(MONITOR_DIR, a.id);
+      let entry: ResetsEntry | null = null;
+      try {
+        entry = file ? parseResetsFile(fs.readFileSync(file, "utf8")) : null;
+      } catch {
+        entry = null; // no file yet
+      }
+      const cur = resetsByAccount.get(a.id);
+      if (entry && (!cur || entry.ts > cur.ts)) {
+        resetsByAccount.set(a.id, entry);
+        changed = true;
+      }
     }
-    const wait = resetsCallAt + 1000 - Date.now();
-    if (wait > 0) await sleep(wait);
-    resetsCallAt = Date.now();
-    const r = await fetchResets(creds.token, ua, resetsFetch);
-    const now = Date.now();
-    if (r.ok) {
-      resetsByAccount.set(id, { fetchedAt: now, status: r.status });
-      const kinds = summarize(r.status, now).map((k) => `${k.kind}=${k.count}${k.usable ? "" : " (not usable)"}`).join(" ");
-      log(`resets: ${email} ${r.status.eligible ? kinds || "none" : `ineligible (${r.status.ineligibleReason ?? "?"})`}${r.status.atLimit ? " · at limit" : ""}`);
-      return;
-    }
-    const b = nextBackoffSec(r.kind, r.retryAfterSec);
-    resetsByAccount.set(id, { ...prev, error: { kind: r.kind, ...(r.httpStatus ? { httpStatus: r.httpStatus } : {}) }, backoffUntil: now + b * 1000 });
-    log(`resets: ${email} ${r.kind}${r.httpStatus ? ` (HTTP ${r.httpStatus})` : ""}, next try in ${b}s`);
+    return changed;
   }
+  if (resetsOn()) loadResetsFiles();
 
   /**
-   * Token and organization for one account's reset calls, never refreshed here: the keychain for the
-   * active login (read fresh for a claim, with the login re-checked after the read), else the
-   * claude-switch vault (decidePassiveSource; the extension's own vault when the CLI has no file for it).
+   * Token and organization for a claim, never refreshed here: the keychain for the active login (read
+   * fresh, with the login re-checked after the read), else the claude-switch vault (decidePassiveSource;
+   * the extension's own vault when the CLI has no file for it).
    */
-  async function resetsCreds(id: string, fresh: boolean): Promise<{ token?: string; orgUuid?: string; why: string }> {
+  async function resetsCreds(id: string): Promise<{ token?: string; orgUuid?: string; why: string }> {
     const activeIdent = async (): Promise<ActiveIdentity | undefined> => {
       const m = await claudeJsonMtimeMs();
       return m === undefined ? undefined : readIdentityFileAt(m);
@@ -1737,8 +1720,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     const expired = (at: unknown): boolean => typeof at === "number" && Date.now() > at - 60_000;
     const ident = await activeIdent();
     if (ident?.id === id) {
-      const creds = fresh ? await readClaudeCredentials() : await readClaudeCredentialsCached();
-      if (fresh && (await activeIdent())?.id !== id) return { why: "the active login changed meanwhile" };
+      const creds = await readClaudeCredentials();
+      if ((await activeIdent())?.id !== id) return { why: "the active login changed meanwhile" };
       if (!creds) return { why: "no keychain token" };
       if (expired(creds.expiresAt)) return { why: "token expired · Claude Code refreshes it" };
       return { token: creds.token, orgUuid: orgOf(ident.block), why: "" };
@@ -1767,12 +1750,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const id = c.accountId ?? accountsFile.activeId; // the single "Claude" card is the active login
       const email = accountsFile.accounts.find((a) => a.id === id)?.email;
       if (!id || !email) continue;
-      accounts.push({ id, name: c.hdr?.name ?? c.label.replace(/^Claude · /, ""), email, ...accountView(resetsByAccount.get(id), now) });
+      accounts.push({ id, name: c.hdr?.name ?? c.label.replace(/^Claude · /, ""), email, active: c.active, ...accountView(resetsByAccount.get(id), usageFail.get(id), now) });
     }
     return {
       open,
       total: resetsTotal(accounts.map((a) => resetsByAccount.get(a.id)), now),
-      ...(resetsUa === null ? { cliMissing: true } : {}),
+      ...(cliUa() === null ? { cliMissing: true } : {}),
       accounts,
       done: resetsDone,
     };
@@ -1815,8 +1798,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
       "Use reset",
     );
     if (pick !== "Use reset") return;
-    const ua = readCliUa();
-    const creds = await resetsCreds(id, true);
+    const ua = cliUa();
+    const creds = await resetsCreds(id);
     if (!ua || !creds.token || !creds.orgUuid) {
       const why = !ua ? "Claude Code CLI not found" : !creds.token ? creds.why : "its organization is unknown";
       log(`resets: claim ${email} ${grant.id} not sent: ${why}`);
@@ -1841,16 +1824,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
     if (!out.ok || out.reply.result !== "reset") {
       void vscode.window.showWarningMessage(describeClaim(out, label, email, Date.now()));
-      if (sent) requestResets(0, [id]); // the panel follows what the server holds now
       return;
     }
     const entry = resetsByAccount.get(id);
-    const after = entry?.status ? withResetsLeft(entry.status, grant.id, out.reply.resetsLeft ?? Math.max(0, grant.resetsLeft - 1)) : undefined;
-    if (entry && after) resetsByAccount.set(id, { ...entry, status: after });
+    const after = entry ? withResetsLeft(entry.status, grant.id, out.reply.resetsLeft ?? Math.max(0, grant.resetsLeft - 1)) : undefined;
+    if (entry && after) storeResets(id, entry.ts, after); // kept on disk too; the reading time stays the poll's
     const left = after ? summarize(after, Date.now()).find((r) => r.kind === kind)?.count ?? 0 : 0;
     vscode.window.setStatusBarMessage(`${label} used on ${email} · ${left} left`, 10_000);
-    requestResets(0, [id]);
-    void vscode.commands.executeCommand("claudeSessionMonitor.refreshUsage"); // gauges and claude-switch see the refilled limits
+    void vscode.commands.executeCommand("claudeSessionMonitor.refreshUsage"); // its polls bring the refilled limits and the resets
   }
 
   ctx.subscriptions.push(
@@ -2086,10 +2067,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (!force && snap?.gauges.length && snap.ts && snapAcct === activeId && (!officialUsage || officialUsageAcct !== snapAcct || snap.ts > officialUsage.ts)) {
       officialUsage = { gauges: snap.gauges, ts: snap.ts }; // another window fetched it for this login
       officialUsageAcct = snapAcct;
+      if (activeId) usageFail.delete(activeId);
     }
     const inBackoff = !force && !!snap?.backoffUntil && now < snap.backoffUntil;
     if (inBackoff) {
       usageNote = RATE_LIMITED_NOTE;
+      if (activeId) usageFail.set(activeId, { kind: "rate_limited", httpStatus: 429 });
     } else if (usageNote?.startsWith("usage API rate-limited")) {
       usageNote = null;
     }
@@ -2115,8 +2098,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
           usageNote = "not signed in to Claude Code on this Mac (no keychain credentials) — log in, then refresh";
         return;
       }
-      const r = await fetchOfficialUsage(creds.token);
-      if (!r.ok && (r.status === 401 || r.status === 403)) cachedCreds = undefined; // token rotated -> re-read keychain
+      const r = await fetchOfficialUsage(usageReq(creds.token));
+      if (!r.ok && (r.status === 401 || r.status === 403)) {
+        cachedCreds = undefined; // token rotated -> re-read keychain
+        if (activeId) usageFail.set(activeId, { kind: "auth", httpStatus: r.status });
+      }
       const nowSec = Date.now() / 1000;
       const cur = readOfficialSnapshot() ?? { gauges: [], ts: 0 };
       if (r.ok) {
@@ -2135,6 +2121,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
         writeAccountsFile(accountsFile);
         usageByAccount.set(ident.id, { usage: r.usage, stale: false });
         writeOfficialSnapshot({ gauges: r.usage.gauges, ts: r.usage.ts, attemptTs: nowSec }, officialUsageFileFor(ident.id));
+        usageFail.delete(ident.id);
+        if (r.resets) storeResets(ident.id, r.usage.ts, r.resets);
         if (await captureWanted(ident, creds)) captureRetry = true; // vaulted by captureActiveLogin (fresh reads + settle window)
         const g5 = r.usage.gauges.find((g) => g.key === "session");
         const g7 = r.usage.gauges.find((g) => g.key === "weekly");
@@ -2153,6 +2141,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         const b = nextUsageBackoffSec(r.retryAfterSec);
         writeOfficialSnapshot({ ...cur, attemptTs: nowSec, backoffUntil: nowSec + b, backoffSec: b });
         usageNote = RATE_LIMITED_NOTE;
+        if (activeId) usageFail.set(activeId, { kind: "rate_limited", httpStatus: 429 });
         log(`usage backoff ${b}s`);
       } else if (force) {
         // Manual refresh with no token / network / gauges: say so honestly.
@@ -2195,6 +2184,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         const known = usageByAccount.get(a.id);
         if (snap?.gauges.length && snap.ts && (!known?.usage || snap.ts > known.usage.ts)) {
           usageByAccount.set(a.id, { usage: { gauges: snap.gauges, ts: snap.ts }, stale: !!snap.tokenStale });
+          usageFail.delete(a.id);
           changed = true; // another window fetched it
         }
         let vault = await readVaultOauth(a.id);
@@ -2273,6 +2263,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
         const freshEnough = !force && !!snap && nowSec - snap.ts < cadence;
         const attempted = !force && !!snap?.attemptTs && nowSec - snap.attemptTs < Math.min(60, cadence);
         const inBackoff = !force && !!snap?.backoffUntil && nowSec < snap.backoffUntil;
+        if (inBackoff && !usageFail.has(a.id)) {
+          usageFail.set(a.id, snap?.tokenStale ? { kind: "auth" } : { kind: "rate_limited", httpStatus: 429 }); // this or another window's poll failed
+          changed = true;
+        }
         if (freshEnough || attempted || inBackoff) continue;
         let token: string | undefined = cliToken;
         try {
@@ -2289,17 +2283,19 @@ export function activate(ctx: vscode.ExtensionContext): void {
           continue;
         }
         writeOfficialSnapshot({ ...(snap ?? { gauges: [], ts: 0 }), attemptTs: nowSec }, file);
-        let r = await fetchOfficialUsage(token);
+        let r = await fetchOfficialUsage(usageReq(token));
         if (!r.ok && (r.status === 401 || r.status === 403) && !keeperOwns) {
           const v2 = await readVaultOauth(a.id);
           const t2 = v2 ? await refreshStoredAccount(a.id, v2, true) : undefined;
-          if (t2) r = await fetchOfficialUsage(t2);
+          if (t2) r = await fetchOfficialUsage(usageReq(t2));
         }
         const now2 = Date.now() / 1000;
         const cur2 = readOfficialSnapshot(file) ?? { gauges: [], ts: 0 };
         if (r.ok) {
           usageByAccount.set(a.id, { usage: r.usage, stale: false });
           writeOfficialSnapshot({ gauges: r.usage.gauges, ts: r.usage.ts, attemptTs: now2 }, file);
+          usageFail.delete(a.id);
+          if (r.resets) storeResets(a.id, r.usage.ts, r.resets);
           changed = true;
           log(`usage ok (acct ${a.id.slice(0, 8)}): ${r.usage.gauges.map((g) => `${g.key}=${Math.round(g.pct)}`).join(" ")}`);
         } else if (r.status === 401 || r.status === 403) {
@@ -2311,11 +2307,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
           );
           const cur = usageByAccount.get(a.id);
           usageByAccount.set(a.id, { usage: cur?.usage ?? null, stale: true });
+          usageFail.set(a.id, { kind: "auth", httpStatus: r.status });
           changed = true;
           log(`usage acct ${a.id.slice(0, 8)}: token rejected (${r.status})`);
         } else if (r.status === 429) {
           const b = nextUsageBackoffSec(r.retryAfterSec);
           writeOfficialSnapshot({ ...cur2, attemptTs: now2, backoffUntil: now2 + b, backoffSec: b }, file);
+          usageFail.set(a.id, { kind: "rate_limited", httpStatus: 429 });
+          changed = true;
         }
       }
     } catch (e) {
@@ -3116,12 +3115,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         }
       }
       void pollOtherAccounts(false);
-    }
-
-    // Limit resets (claude-switch only): a listing is refreshed once it is 30 min old.
-    if (claudeEnabled() && now - lastResetsCheck > 30) {
-      lastResetsCheck = now;
-      requestResets(1800);
+      if (resetsOn() && loadResetsFiles()) pushUsagePayload(); // Limit resets another window's polls saved
     }
 
     const wsOnly =
@@ -3675,7 +3669,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
           : Promise.resolve(),
         codexEnabled() ? pollCodex(true) : Promise.resolve(),
       ]);
-      requestResets(30); // Limit resets: every account listed more than 30 s ago and not in backoff
       try {
         if (switchInstalled()) {
           const launch = switchRunner.start(["tick", "--fresh"]);

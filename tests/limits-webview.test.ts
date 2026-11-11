@@ -458,9 +458,9 @@ describe("Usage Limits webview: Limit resets", () => {
         { kind: "full", label: "Full reset", count: 1, until: "11 Dec", tip: "Refills your 5-hour limit, weekly limit and Fable allowance", usable: true },
         { kind: "weekly", label: "Weekly reset", count: 1, until: "11 Dec", tip: "Refills your weekly limit and Fable allowance", usable: false, why: "needs a limit hit first" },
       ] },
-      { id: "s", name: "soft", email: "soft@x.com", ...accountView({ fetchedAt: now, status: spent ?? undefined }, now) },
-      { id: "n", name: "none", email: "none@x.com", atLimit: false, state: "ok", kinds: [] },
-      { id: "t", name: "team", email: "team@x.com", atLimit: false, state: "rate_limited", note: "usage API rate-limited · next try at 14:05", kinds: [] },
+      { id: "s", name: "soft", email: "soft@x.com", active: false, ...accountView(spent ? { ts: now / 1000, status: spent } : undefined, undefined, now) },
+      { id: "n", name: "none", email: "none@x.com", active: false, atLimit: false, state: "ok", ts: now / 1000, kinds: [] },
+      { id: "t", name: "team", email: "team@x.com", active: false, atLimit: false, state: "waiting", ts: null, note: "waiting for the next usage reading · usage API rate-limited", kinds: [] },
     ],
     ...over,
   });
@@ -514,8 +514,9 @@ describe("Usage Limits webview: Limit resets", () => {
 
     expect(acct(h, "none")).toContain('<div class="rsnone">no resets</div>');
     const team = acct(h, "team");
-    expect(team).toContain('<span class="rsnote" title="usage API rate-limited · next try at 14:05">usage API rate-limited · next try at 14:05</span>');
+    expect(team).toContain('<span class="rsnote" title="waiting for the next usage reading · usage API rate-limited">waiting for the next usage reading · usage API rate-limited</span>');
     expect(team).not.toContain("no resets");
+    expect(h.root.innerHTML).not.toContain("csm-resets-asof"); // every reading here is fresh
     expect(h.root.innerHTML.match(/<span class="chip">at limit<\/span>/g)).toHaveLength(1);
   });
 
@@ -562,8 +563,8 @@ describe("Usage Limits webview: Limit resets", () => {
     }
   });
 
-  it("plain header until any listing; Claude Code CLI not found replaces the accounts; checking… while loading", () => {
-    const loading = [{ id: "m", name: "max", email: "max@x.com", atLimit: false, state: "loading", note: "checking…", kinds: [] }];
+  it("plain header until any reading; Claude Code CLI not found replaces the accounts; waiting for the first reading", () => {
+    const loading = [{ id: "m", name: "max", email: "max@x.com", active: true, atLimit: false, state: "waiting", ts: null, note: "waiting for the next usage reading", kinds: [] }];
     const h = mount();
     h.send({ ...base, ...opened, resets: { open: true, total: null, cliMissing: true, accounts: loading, done: null } });
     expect(h.root.innerHTML).toContain('<span class="chev">▾</span> Limit resets</div>');
@@ -571,7 +572,37 @@ describe("Usage Limits webview: Limit resets", () => {
     expect(h.root.innerHTML).not.toContain("csm-resets-account");
     const l = mount();
     l.send({ ...base, ...opened, resets: { open: true, total: null, accounts: loading, done: null } });
-    expect(acct(l, "max")).toContain('<span class="rsnote" title="checking…">checking…</span>');
+    expect(acct(l, "max")).toContain('<span class="rsnote" title="waiting for the next usage reading">waiting for the next usage reading</span>');
     expect(acct(l, "max")).not.toContain("no resets");
+  });
+
+  it("an old reading shows its time (active login after 10 min, others after 20 min) and a failed poll keeps the rows with its note", () => {
+    const noon = new Date(2026, 10, 11, 12, 0).getTime();
+    const ago = (min: number) => noon / 1000 - min * 60;
+    const fable = { kind: "fable", label: "Fable reset", count: 1, until: "9 Mar 2027", tip: "T", usable: true };
+    const row = (id: string, active: boolean, ts: number, note?: string) => ({
+      id, name: id, email: `${id}@x.com`, active, atLimit: false, state: "ok", ts, ...(note ? { note } : {}), kinds: [fable],
+    });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(noon);
+    try {
+      const h = mount();
+      h.send({ ...base, ...opened, resets: { open: true, total: 6, done: null, accounts: [
+        row("live", true, ago(9)), row("act", true, ago(11)), row("calm", false, ago(19)),
+        row("kept", false, ago(25), "usage API rate-limited"), row("old", false, new Date(2026, 10, 10, 14, 5).getTime() / 1000),
+      ] } });
+      expect(acct(h, "live")).not.toContain("as of");
+      expect(acct(h, "act")).toContain('<span class="rsnote" data-testid="csm-resets-asof">as of 11:49</span>');
+      expect(acct(h, "calm")).not.toContain("as of");
+      const kept = acct(h, "kept");
+      expect(kept).toContain('<span class="ctitle" title="kept@x.com">kept</span><span class="rsnote" data-testid="csm-resets-asof">as of 11:35</span><span class="rsnote" title="usage API rate-limited">usage API rate-limited</span></div>');
+      expect(kept).toContain('<span class="rsk">Fable reset · 1</span><span class="rsd">use by 9 Mar 2027</span><button type="button" class="useacct" data-use-reset="kept|fable" data-testid="csm-reset-use">Use</button>');
+      expect(acct(h, "old")).toContain("as of 10 Nov 14:05");
+
+      clock.mockReturnValue(noon + 2 * 60_000); // two minutes on, the same reading is past 10 min: the next render shows its time
+      h.send({ ...base, ...opened, resets: { open: true, total: 6, done: null, accounts: [row("live", true, ago(9))] } });
+      expect(acct(h, "live")).toContain("as of 11:51");
+    } finally {
+      clock.mockRestore();
+    }
   });
 });

@@ -17,7 +17,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, excludedEmails, excludedOf, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, headerGauges, switchInstalled, useTargets, type CardHeader } from "./switchPanel";
+import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, excludedEmails, excludedOf, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, renderSwitchActivity, headerGauges, switchInstalled, useTargets, type CardHeader } from "./switchPanel";
 import { gaugeColumn } from "./compact";
 import { calibrate } from "./burn";
 import { BURN_WINDOWS, DEFAULT_BURN_WINDOW_MS, buildBurnPayload, burnShares, gaugeSamplesFromHistory, resolveScale } from "./burnPayload";
@@ -597,17 +597,23 @@ interface LimitsPayload {
   accountNote: string | null; // honesty note when a non-active account is displayed
   usageNote: string | null; // honest status when the usage API is degraded
   providers: UsageProviderCard[];
-  switchHtml?: string; // claude-switch block, rendered host-side by switchPanel.ts
+  switchHtml?: string; // claude-switch status lines, rendered host-side by switchPanel.ts
+  switchActivity?: { count: number; html: string }; // Activity tab: claude-switch's latest events (fresh panel only)
   switchBadges?: Record<string, { rank?: number; loginNeeded?: string }>; // by account email
   showTokenStats?: boolean; // render the Tokens row + Models block (claudeSessionMonitor.showTokenStats)
   panelFresh?: boolean; // claude-switch owns switching: simplified cards, no Rotate
-  ui?: { switchActivityOpen: boolean; expandedAccounts: Record<string, boolean>; resetsOpen: boolean }; // persisted in workspaceState
+  ui?: { tab: LimitsTab; expandedAccounts: Record<string, boolean> }; // persisted in workspaceState
   useEmails?: string[]; // non-active accounts the panel can switch to
   usePending?: string; // email `claude-switch use` is switching to right now (until it exits or the 90 s UI timeout)
   useResult?: { email: string; at: number; ok: boolean; text: string; running?: boolean }; // last finished `use` (at = its click time), shown for a few seconds; running: past the UI timeout, until it exits
   skipFailed?: { email: string; at: number }; // last skip box change claude-switch did not apply (at = its click time): the webview drops its optimistic state
-  resets?: ResetsPayload; // Limit resets section (claude-switch installed only)
+  resets?: ResetsPayload; // Resets tab (claude-switch installed only)
 }
+
+/** The Usage Limits view's bottom tabs; Resets and Activity exist only with claude-switch. */
+const LIMITS_TABS = ["accounts", "resets", "activity"] as const;
+type LimitsTab = (typeof LIMITS_TABS)[number];
+const isLimitsTab = (v: unknown): v is LimitsTab => (LIMITS_TABS as readonly unknown[]).includes(v);
 
 // ---------------------------------------------------------------------------
 // Official account usage (5h / 7d) via api.anthropic.com/api/oauth/usage.
@@ -1031,12 +1037,9 @@ function limitsHtml(): string {
   .swline.sw-error, .swline.sw-needsLogin { color: var(--vscode-descriptionForeground); }
   .swrank { color: var(--vscode-descriptionForeground); font-size:11px; }
   .clogin { color: var(--vscode-charts-red, #f14c4c); font-size:10px; font-weight:600; }
-  }
-  .swtoggle { font-size:11px; cursor:pointer; margin-top:3px; color: var(--vscode-descriptionForeground); user-select:none; }
-  .swtoggle:hover { color: var(--vscode-foreground); }
   .swline.sw-muted { color: var(--vscode-descriptionForeground); opacity:.7; }
-  .swevents[hidden] { display:none; }
-  /* Limit resets: one toggle line under the claude-switch block; per account a line per kind only while open. */
+  .swevents { padding-top:4px; }
+  /* Resets tab: per account its name line, then a line per kind with Use or why not. */
   .rsblock { padding:0 0 4px; }
   .rsacct { margin-top:5px; }
   .rsname { display:flex; align-items:baseline; gap:6px; min-width:0; font-size:11px; }
@@ -1047,6 +1050,13 @@ function limitsHtml(): string {
   .rsrow .rsact, .rsrow .useacct { margin:0 0 0 auto; }
   .rsrow .useacct { flex:none; }
   .rsnone { margin:2px 0 0 10px; font-size:10px; color: var(--vscode-descriptionForeground); }
+  /* Section tabs pinned to the bottom of the view, in the Sessions filter's pill style; the spacer keeps the last line above them. */
+  .ltabs { position:fixed; left:0; right:0; bottom:0; display:flex; align-items:center; gap:4px; padding:4px 12px;
+    background: var(--vscode-sideBar-background, var(--vscode-editor-background)); border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
+  .ltab { border:0; background:transparent; color:var(--vscode-descriptionForeground); border-radius:999px; padding:2px 8px; font:inherit; font-size:11px; cursor:pointer; }
+  .ltab:hover { color:var(--vscode-foreground); }
+  .ltab.active { color:var(--vscode-foreground); background:var(--vscode-badge-background, rgba(127,127,127,.25)); }
+  .ltabspace { height:30px; }
   /* Collapsed card = one 16px line + 4px padding top and bottom + 1px separator = 25px. */
   .card.ccard { padding:4px 0; }
   .card.ccard:first-child { padding-top:0; }
@@ -1302,31 +1312,34 @@ function asOfNote(a){
   const day = d.toDateString()===new Date(Date.now()).toDateString() ? '' : d.getDate()+' '+MONTHS[d.getMonth()]+' ';
   return '<span class="rsnote" data-testid="csm-resets-asof">as of '+day+hm+'</span>';
 }
-// Limit resets (claude-switch only): collapsed to its header line unless opened; accounts in card order.
-function resetsSection(){
+// Resets tab (claude-switch only): every account in card order, a line per kind with Use or why not.
+function resetsList(){
   const r = last.resets;
-  if(!r) return '';
-  const open = !!ui.resetsOpen;
-  let h = '<div class="rsblock" data-testid="csm-resets"><div class="swtoggle" role="button" tabindex="0" data-rstoggle="1" aria-expanded="'+open+'" data-testid="csm-resets-toggle"><span class="chev">'+(open?'▾':'▸')+'</span> Limit resets'+(r.total!=null?' ('+r.total+')':'')+'</div>';
-  if(open){
-    if(r.cliMissing) h += '<div class="rsnone">Claude Code CLI not found</div>';
-    else for(const a of (r.accounts||[])){
-      h += '<div class="rsacct" data-testid="csm-resets-account"><div class="rsname"><span class="ctitle" title="'+esc(a.email)+'">'+esc(a.name)+'</span>'
-        + (a.atLimit ? '<span class="chip">at limit</span>' : '')
-        + asOfNote(a)
-        + (a.note ? '<span class="rsnote" title="'+esc(a.note)+'">'+esc(a.note)+'</span>' : '') + '</div>';
-      const kinds = a.kinds || [];
-      if(kinds.length) h += kinds.map(k=>resetRow(a, k)).join('');
-      else if(a.state==='ok') h += '<div class="rsnone">no resets</div>';
-      h += '</div>';
-    }
+  let h = '<div class="rsblock" data-testid="csm-resets">';
+  if(r.cliMissing) h += '<div class="rsnone">Claude Code CLI not found</div>';
+  else for(const a of (r.accounts||[])){
+    h += '<div class="rsacct" data-testid="csm-resets-account"><div class="rsname"><span class="ctitle" title="'+esc(a.email)+'">'+esc(a.name)+'</span>'
+      + (a.atLimit ? '<span class="chip">at limit</span>' : '')
+      + asOfNote(a)
+      + (a.note ? '<span class="rsnote" title="'+esc(a.note)+'">'+esc(a.note)+'</span>' : '') + '</div>';
+    const kinds = a.kinds || [];
+    if(kinds.length) h += kinds.map(k=>resetRow(a, k)).join('');
+    else if(a.state==='ok') h += '<div class="rsnone">no resets</div>';
+    h += '</div>';
   }
   return h + '</div>';
 }
-function switchBlock(){
-  let h = last.switchHtml || '';
-  if(ui && ui.switchActivityOpen) h = h.replace('data-swtoggle="1" aria-expanded="false"','data-swtoggle="1" aria-expanded="true"').replace('<span class="chev">▸</span>','<span class="chev">▾</span>').replace(' data-testid="csm-switch-activity" hidden',' data-testid="csm-switch-activity"');
-  return h;
+// Section tabs pinned to the bottom of the view: Accounts, plus Resets and Activity when claude-switch provides them.
+function tabList(){
+  const t = [{ id:'accounts', label:'Accounts', n:null }];
+  if(last.resets) t.push({ id:'resets', label:'Resets', n:last.resets.total });
+  if(last.switchActivity) t.push({ id:'activity', label:'Activity', n:last.switchActivity.count });
+  return t;
+}
+function tabBar(tabs, cur){
+  return '<div class="ltabspace"></div><div class="ltabs" role="tablist" aria-label="Usage Limits sections" data-testid="csm-limits-tabs">'
+    + tabs.map(t=>'<button type="button" role="tab" class="ltab'+(t.id===cur?' active':'')+'" aria-selected="'+(t.id===cur)+'" data-tab="'+t.id+'" data-testid="csm-tab-'+t.id+'">'+t.label+(t.n!=null?' '+t.n:'')+'</button>').join('')
+    + '</div>';
 }
 function setUi(key, value){
   ui[key] = value;
@@ -1336,11 +1349,21 @@ function setUi(key, value){
 function render(){
   const root = document.getElementById('root');
   if(!last){ return; }
-  if(!ui) ui = last.ui || { switchActivityOpen:false, expandedAccounts:{} };
+  if(!ui) ui = last.ui || { tab:'accounts', expandedAccounts:{} };
   if(pendingUse && Date.now() - pendingUse.at > 90000) pendingUse = null; // the host answers within its 90 s UI timeout (the result, or that the run goes on)
   for(const e in pendingSkip) if(Date.now() - pendingSkip[e].at > 20000) delete pendingSkip[e];
   if(pendingReset && Date.now() - pendingReset.at > 60000) pendingReset = null; // the host answers when its modal closes; 60 s caps a lost answer
-  let h = switchBlock() + resetsSection() + useResultLine();
+  const tabs = tabList(), tab = tabs.some(t=>t.id===ui.tab) ? ui.tab : 'accounts';
+  let h = last.switchHtml || '';
+  if(tab==='resets') h += resetsList();
+  else if(tab==='activity') h += last.switchActivity.html;
+  else h += accountsHtml();
+  if(tabs.length > 1) h += tabBar(tabs, tab);
+  root.innerHTML = h;
+}
+// Accounts tab (the whole view without claude-switch): the cards, then the token, model and limit-hit lines.
+function accountsHtml(){
+  let h = useResultLine();
   const cards = (last.providers && last.providers.length) ? last.providers : [{
     id:'claude', provider:'claude', label:'Claude', active:true, ts:last.ts, official:last.official, gauges:last.gauges||[],
     note:last.usageNote||last.accountNote||null, sevenDayTokens:null, lifetimeTokens:null
@@ -1363,7 +1386,7 @@ function render(){
       h += '<div class="hit"><span class="hitt">'+prov+esc(l.title)+'</span> <span class="note">'+esc(l.sub)+reset+'</span></div>';
     }
   }
-  root.innerHTML = h;
+  return h;
 }
 function toggleAccount(id){
   const card = ((last && last.providers) || []).find(c=>c.id===id);
@@ -1377,8 +1400,6 @@ document.getElementById('root').addEventListener('keydown', (ev) => {
   if(!d) return;
   if(d.switch){ vscodeApi.postMessage({ type:'switchAccount', id: d.switch }); ev.preventDefault(); }
   else if(d.toggle){ toggleAccount(d.toggle); ev.preventDefault(); }
-  else if(d.swtoggle){ setUi('switchActivityOpen', !ui.switchActivityOpen); ev.preventDefault(); }
-  else if(d.rstoggle){ setUi('resetsOpen', !ui.resetsOpen); ev.preventDefault(); }
 });
 document.getElementById('root').addEventListener('click', (ev) => {
   let el = ev.target;
@@ -1402,8 +1423,7 @@ document.getElementById('root').addEventListener('click', (ev) => {
       return;
     }
     if(el.dataset && el.dataset.toggle){ toggleAccount(el.dataset.toggle); return; }
-    if(el.dataset && el.dataset.swtoggle){ setUi('switchActivityOpen', !ui.switchActivityOpen); return; }
-    if(el.dataset && el.dataset.rstoggle){ setUi('resetsOpen', !ui.resetsOpen); return; }
+    if(el.dataset && el.dataset.tab){ setUi('tab', el.dataset.tab); return; }
     if(el.dataset && el.dataset.rotate){ vscodeApi.postMessage({ type:'rotateBest' }); return; }
     if(el.classList && el.classList.contains('sech') && el.dataset.sec){
       collapsed[el.dataset.sec] = !collapsed[el.dataset.sec];
@@ -1515,9 +1535,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     () => void vscode.commands.executeCommand("claudeSessionMonitor.switchToBestAccount"),
     (email, clickedAt) => useAccountViaCli(email, clickedAt),
     (key, value) => {
-      if (key === "switchActivityOpen") void ctx.workspaceState.update("csm.switchActivityOpen", value === true);
+      if (key === "tab" && isLimitsTab(value)) void ctx.workspaceState.update("csm.limitsTab", value);
       else if (key === "expandedAccounts" && value && typeof value === "object") void ctx.workspaceState.update("csm.expandedAccounts", value);
-      else if (key === "resetsOpen") void ctx.workspaceState.update("csm.resetsOpen", value === true);
     },
     (email, excluded, clickedAt) => setExcludedViaCli(email, excluded, clickedAt),
     (key, clickedAt) => void useResetFromPanel(key, clickedAt),
@@ -1742,7 +1761,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   }
 
   /** The section's payload: every Claude account the cards list, in card order, with its card's display name. */
-  function resetsPayload(cards: UsageProviderCard[], open: boolean): ResetsPayload {
+  function resetsPayload(cards: UsageProviderCard[]): ResetsPayload {
     const now = Date.now();
     const accounts: ResetsPayload["accounts"] = [];
     for (const c of cards) {
@@ -1753,7 +1772,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
       accounts.push({ id, name: c.hdr?.name ?? c.label.replace(/^Claude · /, ""), email, active: c.active, ...accountView(resetsByAccount.get(id), usageFail.get(id), now) });
     }
     return {
-      open,
       total: resetsTotal(accounts.map((a) => resetsByAccount.get(a.id)), now),
       ...(cliUa() === null ? { cliMissing: true } : {}),
       accounts,
@@ -2989,8 +3007,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const installed = switchInstalled(); // without claude-switch: no block, no badges, the generic cards
       const panel = installed ? readPanel() : null;
       const fresh = panelFresh(panel, Date.now());
-      const open = ctx.workspaceState.get<boolean>("csm.switchActivityOpen", false);
-      const resetsOpen = ctx.workspaceState.get<boolean>("csm.resetsOpen", false);
+      const savedTab = ctx.workspaceState.get<unknown>("csm.limitsTab");
       const emailById = new Map(payload.accounts.map((a) => [a.id, a.email] as const));
       let providers = decorateCards(payload.providers).map((p) => ({ ...p, email: p.accountId ? emailById.get(p.accountId) ?? p.label.replace(/^Claude · /, "") : p.label.replace(/^(Claude|Codex) · /, "") }));
       if (fresh) {
@@ -3013,16 +3030,17 @@ export function activate(ctx: vscode.ExtensionContext): void {
       limitsView.update({
         ...payload,
         providers,
-        switchHtml: installed ? renderSwitchBlock(panel, Date.now(), open) : undefined,
+        switchHtml: installed ? renderSwitchBlock(panel, Date.now()) : undefined,
+        switchActivity: renderSwitchActivity(panel, Date.now()) ?? undefined, // panel is null without claude-switch
         switchBadges: allBadges(panel),
         panelFresh: fresh,
         showTokenStats: showTokenStats(),
-        ui: { switchActivityOpen: open, expandedAccounts: ctx.workspaceState.get<Record<string, boolean>>("csm.expandedAccounts", {}), resetsOpen },
+        ui: { tab: isLimitsTab(savedTab) ? savedTab : "accounts", expandedAccounts: ctx.workspaceState.get<Record<string, boolean>>("csm.expandedAccounts", {}) },
         useEmails: fresh ? useTargets(panel) : [],
         usePending: usePending?.email,
         useResult: useDone && Date.now() < useDone.until ? { email: useDone.email, at: useDone.at, ok: useDone.ok, text: useDone.text, ...(useDone.running ? { running: true } : {}) } : undefined,
         skipFailed: skipFailed && Date.now() < skipFailed.until ? { email: skipFailed.email, at: skipFailed.at } : undefined,
-        ...(installed && claudeEnabled() ? { resets: resetsPayload(providers, resetsOpen) } : {}),
+        ...(installed && claudeEnabled() ? { resets: resetsPayload(providers) } : {}),
       });
       renderStatusBar();
     } catch {

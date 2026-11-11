@@ -695,7 +695,7 @@ describe("active login and Use this account", () => {
     expect(debugLog()).toContain("from panel.json");
   });
 
-  it("Limit resets: with claude-switch the payload carries the closed section in card order; without the Claude Code CLI it says so and nothing is called", async () => {
+  it("Limit resets: with claude-switch the payload carries the Resets tab in card order and remembers the chosen tab; without the Claude Code CLI it says so and nothing is called", async () => {
     installSwitchCli();
     seedRegistryOnA();
     writeLogin(UA, "a@x.com");
@@ -703,15 +703,19 @@ describe("active login and Use this account", () => {
     const fetchMock = (globalThis as any).fetch as ReturnType<typeof vi.fn>;
     fetchMock.mockClear();
     const { posted, send } = activateWithLimitsView();
+    const saved = new Map<string, unknown>(); // this test checks the chosen tab is kept, so its workspaceState keeps what is stored
+    lastCtx.workspaceState = { get: (k: string, def?: unknown) => (saved.has(k) ? saved.get(k) : def), update: (k: string, v: unknown) => { saved.set(k, v); return Promise.resolve(); } };
     await vi.waitFor(() => expect(posted[posted.length - 1]?.resets?.cliMissing).toBe(true));
     const last = posted[posted.length - 1];
-    expect(last.ui.resetsOpen).toBe(false);
-    expect(last.resets.open).toBe(false);
+    expect(last.ui.tab).toBe("accounts");
     expect(last.resets.total).toBeNull();
     expect(last.resets.accounts.map((a: { id: string; email: string; name: string }) => [a.id, a.email, a.name])).toEqual([[UA, "a@x.com", "a"], [UB, "b@x.com", "b"]]);
-    send({ type: "setUi", key: "resetsOpen", value: true });
+    send({ type: "setUi", key: "tab", value: "bogus" });
+    send({ type: "setUi", key: "tab", value: "resets" });
+    expect([...saved]).toEqual([["csm.limitsTab", "resets"]]); // the unknown tab was not stored
     send({ type: "useReset", key: `${UA}|full`, at: 5 });
     await vi.waitFor(() => expect(posted[posted.length - 1].resets.done).toEqual({ at: 5 }));
+    expect(posted[posted.length - 1].ui.tab).toBe("resets");
     expect(fetchMock.mock.calls.filter((c: unknown[]) => /cedar_ember|reset_rate_limits/.test(String(c[0])))).toEqual([]);
     expect(debugLog()).toContain("resets: Claude Code CLI not found, usage polls carry no reset data");
   });
@@ -749,7 +753,7 @@ describe("active login and Use this account", () => {
       expect(card(posted[posted.length - 1], UB).gauges[0].pct).toBe(37); // gauges parsed as before (the seed had 12)
       expect(debugLog()).toContain("resets: b@x.com fable=1");
 
-      // Reload: the saved reading is in the section before any poll, and opening the section calls nothing.
+      // Reload: the saved reading is on the Resets tab before any poll, and opening the tab calls nothing.
       disposeCtx(lastCtx);
       fetchMock.mockClear();
       fetchMock.mockImplementation(() => Promise.reject(new Error("mocked")));
@@ -758,7 +762,7 @@ describe("active login and Use this account", () => {
       const r = again.posted[again.posted.length - 1].resets;
       expect(r.total).toBe(1);
       expect(r.accounts.find((x: { id: string }) => x.id === UB).kinds[0]).toMatchObject({ kind: "fable", count: 1, usable: true });
-      again.send({ type: "setUi", key: "resetsOpen", value: true });
+      again.send({ type: "setUi", key: "tab", value: "resets" });
       expect(fetchMock.mock.calls).toEqual([]);
     } finally {
       ((globalThis as any).fetch as ReturnType<typeof vi.fn>).mockImplementation(() => Promise.reject(new Error("mocked")));

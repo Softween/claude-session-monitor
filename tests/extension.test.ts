@@ -653,18 +653,19 @@ describe("active login and Use this account", () => {
     fs.writeFileSync(snapFile(UB), JSON.stringify({ gauges: session(12), ts: Date.now() / 1000 - 120 }));
     fs.writeFileSync(`${MON}/official-usage.json`, JSON.stringify({ gauges: session(100), ts: Date.now() / 1000 - 30 }));
   }
-  function activateWithLimitsView(secrets?: Record<string, string>): { posted: any[]; send: (m: any) => void } {
+  function activateWithLimitsView(secrets?: Record<string, string>): { posted: any[]; burnPosted: any[]; send: (m: any) => void } {
     const ctx = mkCtx();
     ctx.workspaceState = { get: (_k: string, def?: unknown) => def, update: () => Promise.resolve() };
     if (secrets) ctx.secrets.get = (k: string) => Promise.resolve(secrets[k]);
     lastCtx = ctx;
     ext.activate(ctx);
     const posted: any[] = [];
+    const burnPosted: any[] = []; // Burn tab rankings, kept apart so posted[posted.length - 1] stays the limits payload
     let onMessage: (m: any) => void = () => undefined;
     rec.webviews.find((w) => w.id === "claudeSessionMonitor.limits")!.p.resolveWebviewView({
-      webview: { options: {}, html: "", onDidReceiveMessage: (fn: (m: any) => void) => { onMessage = fn; }, postMessage: (m: any) => { posted.push(m); } },
+      webview: { options: {}, html: "", onDidReceiveMessage: (fn: (m: any) => void) => { onMessage = fn; }, postMessage: (m: any) => { (m?.type === "burn" ? burnPosted : posted).push(m); } },
     });
-    return { posted, send: (m) => onMessage(m) };
+    return { posted, burnPosted, send: (m) => onMessage(m) };
   }
   const card = (payload: any, id: string) => payload.providers.find((p: any) => p.accountId === id);
 
@@ -718,6 +719,18 @@ describe("active login and Use this account", () => {
     expect(posted[posted.length - 1].ui.tab).toBe("resets");
     expect(fetchMock.mock.calls.filter((c: unknown[]) => /cedar_ember|reset_rate_limits/.test(String(c[0])))).toEqual([]);
     expect(debugLog()).toContain("resets: Claude Code CLI not found, usage polls carry no reset data");
+  });
+
+  it("Burn tab: the ranking goes to the Usage limits view (no Limit burn view); a listed window changes it, anything else does nothing", async () => {
+    const { posted, burnPosted, send } = activateWithLimitsView();
+    expect(rec.webviews.map((w: { id: string }) => w.id)).not.toContain("claudeSessionMonitor.burn");
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
+    expect(posted[posted.length - 1].burnOn).toBe(true);
+    for (const m of [{ type: "burnWindow" }, { type: "burnWindow", ms: "3600000" }, { type: "burnWindow", ms: Number.NaN }, { type: "burnWindow", ms: -1 },
+      { type: "burnWindow", ms: 12_345 }, { type: "openSession" }, { type: "openSession", id: "" }, { type: "openSession", id: 7 }]) send(m);
+    send({ type: "burnWindow", ms: 3_600_000 });
+    await vi.waitFor(() => expect(burnPosted[burnPosted.length - 1]).toMatchObject({ type: "burn", windowMs: 3_600_000 }));
+    expect(burnPosted.every((p) => p.windowMs === 15 * 60_000 || p.windowMs === 3_600_000)).toBe(true);
   });
 
   // Limit resets ride on the usage polls: a passive account with a fresh token (claude-switch installed).

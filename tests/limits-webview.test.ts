@@ -114,7 +114,7 @@ describe("Usage Limits webview", () => {
     const html = h.root.innerHTML;
     expect(html.indexOf("claude-switch")).toBeLessThan(html.indexOf("one@example.com</span>"));
     expect(html).not.toContain("a -&gt; b (auto)"); // on the Activity tab
-    expect(html).toContain('data-testid="csm-tab-activity">Activity 1</button>');
+    expect(html).toContain('data-testid="csm-tab-activity"><span class="tl">Activity</span><span class="tn">1</span></button>');
     expect(html).toContain("#2</span>");
     expect(html).toContain("login needed (refresh revoked)");
   });
@@ -484,7 +484,7 @@ describe("Usage Limits webview: Limit resets", () => {
     const h = mount();
     h.send({ ...base, resets: resets() });
     let html = h.root.innerHTML;
-    expect(html).toContain('<div class="ltabs" role="tablist" aria-label="Usage Limits sections" data-testid="csm-limits-tabs"><button type="button" role="tab" class="ltab active" aria-selected="true" data-tab="accounts" data-testid="csm-tab-accounts">Accounts</button><button type="button" role="tab" class="ltab" aria-selected="false" data-tab="resets" data-testid="csm-tab-resets">Resets 6</button></div>');
+    expect(html).toContain('<div class="ltabs" role="tablist" aria-label="Usage Limits sections" data-testid="csm-limits-tabs"><button type="button" role="tab" class="ltab active" aria-selected="true" data-tab="accounts" data-testid="csm-tab-accounts"><span class="tl">Accounts</span></button><button type="button" role="tab" class="ltab" aria-selected="false" data-tab="resets" data-testid="csm-tab-resets"><span class="tl">Resets</span><span class="tn">6</span></button></div>');
     expect(html.indexOf('data-testid="csm-account-row"')).toBeLessThan(html.indexOf("csm-limits-tabs"));
     expect(html).not.toContain("csm-resets-account");
     expect(html).not.toContain("csm-reset-row");
@@ -492,7 +492,7 @@ describe("Usage Limits webview: Limit resets", () => {
     h.click("tab", "resets");
     expect(h.posted).toEqual([{ type: "setUi", key: "tab", value: "resets" }]);
     html = h.root.innerHTML;
-    expect(html).toContain('class="ltab active" aria-selected="true" data-tab="resets" data-testid="csm-tab-resets">Resets 6</button>');
+    expect(html).toContain('class="ltab active" aria-selected="true" data-tab="resets" data-testid="csm-tab-resets"><span class="tl">Resets</span><span class="tn">6</span></button>');
     expect(html.match(/data-testid="csm-resets-account"/g)).toHaveLength(4);
     expect(html.indexOf("csm-switch-block")).toBeLessThan(html.indexOf('data-testid="csm-resets"'));
     expect(html).not.toContain('data-testid="csm-account-row"');
@@ -573,7 +573,7 @@ describe("Usage Limits webview: Limit resets", () => {
     const loading = [{ id: "m", name: "max", email: "max@x.com", active: true, atLimit: false, state: "waiting", ts: null, note: "waiting for the next usage reading", kinds: [] }];
     const h = mount();
     h.send({ ...base, ...opened, resets: { total: null, cliMissing: true, accounts: loading, done: null } });
-    expect(h.root.innerHTML).toContain('data-testid="csm-tab-resets">Resets</button>');
+    expect(h.root.innerHTML).toContain('data-testid="csm-tab-resets"><span class="tl">Resets</span></button>');
     expect(h.root.innerHTML).toContain('<div class="rsnone">Claude Code CLI not found</div>');
     expect(h.root.innerHTML).not.toContain("csm-resets-account");
     const l = mount();
@@ -610,5 +610,142 @@ describe("Usage Limits webview: Limit resets", () => {
     } finally {
       clock.mockRestore();
     }
+  });
+});
+
+describe("Usage Limits webview: Burn tab", () => {
+  const MIN = 60_000;
+  const now = Date.now();
+  const limits = (over: Record<string, unknown> = {}) => ({
+    type: "update", ts: now / 1000, official: true, accounts: [], eta: null, tokens: null, models: [], burnOn: true, ui: { tab: "burn", expandedAccounts: {} },
+    providers: [{ id: "claude", provider: "claude", label: "Claude", active: true, official: true, ts: now / 1000, note: null, gauges: [gauge("session", "Session (5h)", 20)] }],
+    ...over,
+  });
+  const row = (over: Record<string, unknown> = {}) => ({
+    sessionId: "s1", openId: "open-1", rank: 1, title: "Fix the login flow", meta: "52% of burn · opus-5-5 · subagents 78%",
+    sharePct: 52, barPct: 100, used: "≈ 23%", rate: "+18%/h", live: true, ended: false, tip: "Fix the login flow\n52% of burn", ...over,
+  });
+  const burn = (over: Record<string, unknown> = {}) => ({
+    type: "burn", windowMs: 15 * MIN, scaled: true,
+    windows: [{ ms: 5 * MIN, label: "5m" }, { ms: 15 * MIN, label: "15m" }, { ms: 60 * MIN, label: "1h" }, { ms: 300 * MIN, label: "5h" }],
+    headline: "$226/h · ≈ +118%/h of the 5h limit · full in ~24 min",
+    note: "Estimate: token cost scaled by the measured 5h-limit rate.",
+    rows: [row(), row({ sessionId: "s2", openId: "", rank: 2, title: "Old refactor", meta: "20% of burn · fable-5-2", sharePct: 20, barPct: 37.5, used: "≈ 9%", rate: "idle", live: false, ended: true, tip: "Old refactor" })],
+    more: 3, empty: "No Claude Code usage in this window yet.", ...over,
+  });
+  const rowsOf = (html: string) => html.split('<div class="brow').slice(1);
+  const winsOf = (html: string) => html.match(/<button type="button" class="bwin"[^>]*>[^<]*<\/button>/g) ?? [];
+  const stub = (dataset: Record<string, string>, parentElement: unknown = null) => ({ dataset, classList: { contains: () => false }, parentElement });
+
+  it("a Burn tab right after Accounts while Claude is on, Collecting usage… until the first ranking; none without it", () => {
+    const h = mount();
+    h.send(limits({ ui: { expandedAccounts: {} } }));
+    expect(h.root.innerHTML).toContain('<button type="button" role="tab" class="ltab active" aria-selected="true" data-tab="accounts" data-testid="csm-tab-accounts"><span class="tl">Accounts</span></button><button type="button" role="tab" class="ltab" aria-selected="false" data-tab="burn" data-testid="csm-tab-burn"><span class="tl">Burn</span></button></div>');
+    h.click("tab", "burn");
+    expect(h.posted).toEqual([{ type: "setUi", key: "tab", value: "burn" }]);
+    expect(h.root.innerHTML).toContain('<div class="bempty">Collecting usage…</div>');
+    expect(h.root.innerHTML).not.toContain('data-testid="csm-account-row"');
+    const off = mount();
+    off.send(limits({ burnOn: false }));
+    expect(off.root.innerHTML).not.toContain("csm-limits-tabs");
+    expect(off.root.innerHTML).toContain('data-testid="csm-account-row"');
+  });
+
+  it("renders one two-line entry per row with rank, title, rate, used, meta and the bar, between the picker and the note", () => {
+    const h = mount();
+    h.send(limits());
+    h.send(burn());
+    const html = h.root.innerHTML;
+    const [first, second] = rowsOf(html);
+    expect(rowsOf(html)).toHaveLength(2);
+    expect(first).toContain('title="Fix the login flow\n52% of burn"');
+    expect(first).toContain('<span class="num brank">1</span>');
+    expect(first).toContain('class="bdot live"');
+    expect(first).toContain('<span class="btitle">Fix the login flow</span>');
+    expect(first).toContain('<span class="num brate">+18%/h</span>');
+    expect(first).toContain('<span class="num bused">≈ 23%</span>');
+    expect(first).toContain('<span class="bmeta">52% of burn · opus-5-5 · subagents 78%</span>');
+    expect(first).toContain('style="width:100%"');
+    expect(second.startsWith(' ended"')).toBe(true);
+    expect(second).toContain('class="bdot"');
+    expect(second).toContain('style="width:37.5%"');
+    expect(html).toContain('<div class="bhead">$226/h · ≈ +118%/h of the 5h limit · full in ~24 min</div>');
+    expect(html).toContain('<div class="bnote">Estimate: token cost scaled by the measured 5h-limit rate.</div>');
+    expect(html.indexOf('class="bwins"')).toBeLessThan(html.indexOf('class="brow'));
+    expect(html.indexOf('class="bnote"')).toBeLessThan(html.indexOf("csm-limits-tabs"));
+  });
+
+  it("marks only the selected window as pressed", () => {
+    const h = mount();
+    h.send(limits());
+    h.send(burn());
+    const pressed = () => winsOf(h.root.innerHTML).filter((b) => b.includes('aria-pressed="true"'));
+    expect(winsOf(h.root.innerHTML)).toHaveLength(4);
+    expect(pressed()).toEqual([expect.stringContaining(">15m<")]);
+    h.send(burn({ windowMs: 5 * MIN }));
+    expect(pressed()).toEqual([expect.stringContaining(">5m<")]);
+    expect(winsOf(h.root.innerHTML).filter((b) => b.includes('aria-pressed="false"'))).toHaveLength(3);
+  });
+
+  it("escapes payload strings in text and in attributes", () => {
+    const h = mount();
+    h.send(limits());
+    h.send(burn({ headline: "<b>hot</b>", rows: [row({ title: "<img src=x onerror=1>", openId: 'a"b><script>', tip: '"><img src=y>', meta: "<i>m</i>" })] }));
+    const html = h.root.innerHTML;
+    expect(html).not.toMatch(/<img|<script|<b>|<i>/);
+    expect(html).toContain("&lt;img src=x onerror=1&gt;");
+    expect(html).toContain('data-open="a&quot;b&gt;&lt;script&gt;"');
+    expect(html).toContain('title="&quot;&gt;&lt;img src=y&gt;"');
+    expect(html).toContain("&lt;b&gt;hot&lt;/b&gt;");
+  });
+
+  it("shows the more line only when ranked sessions are hidden", () => {
+    const h = mount();
+    h.send(limits());
+    h.send(burn());
+    expect(h.root.innerHTML).toContain('<div class="bmore">+ 3 more sessions</div>');
+    h.send(burn({ more: 1 }));
+    expect(h.root.innerHTML).toContain('<div class="bmore">+ 1 more session</div>');
+    h.send(burn({ more: 0 }));
+    expect(h.root.innerHTML).not.toContain('class="bmore"');
+  });
+
+  it("shows the empty message instead of the list and keeps the picker, headline and note", () => {
+    const h = mount();
+    h.send(limits());
+    h.send(burn({ rows: [], more: 0 }));
+    const html = h.root.innerHTML;
+    expect(html).toContain('<div class="bempty">No Claude Code usage in this window yet.</div>');
+    expect(rowsOf(html)).toHaveLength(0);
+    expect(winsOf(html)).toHaveLength(4);
+    expect(html).toContain('class="bhead"');
+    expect(html).toContain('class="bnote"');
+  });
+
+  it("a ranking that comes before the limits payload shows once that arrives", () => {
+    const h = mount();
+    h.send(burn());
+    expect(h.root.innerHTML).toBe("");
+    h.send(limits());
+    expect(rowsOf(h.root.innerHTML)).toHaveLength(2);
+  });
+
+  it("posts burnWindow for a window button and openSession for a row (click, click inside, Enter, Space); a row without openId is inert", () => {
+    const h = mount();
+    h.send(limits());
+    h.send(burn());
+    expect(h.root.innerHTML).toContain('data-ms="300000"');
+    h.click("ms", "300000");
+    const [first, second] = rowsOf(h.root.innerHTML);
+    expect(first).toContain('data-open="open-1" tabindex="0" role="button"');
+    expect(second).not.toMatch(/data-open|tabindex|role="button"/);
+    const target = stub({ open: "open-1" });
+    h.clickOn(target);
+    h.clickOn(stub({}, target));
+    h.key("open", "open-1", "Enter");
+    h.key("open", "open-1", " ");
+    h.key("open", "open-1", "a");
+    h.clickOn(stub({}, stub({})));
+    expect(h.posted).toEqual([{ type: "burnWindow", ms: 300000 }, ...Array(4).fill({ type: "openSession", id: "open-1" })]);
   });
 });

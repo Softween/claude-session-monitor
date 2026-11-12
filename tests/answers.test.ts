@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { FREE_TEXT_MAX, checkAnswers, liveMarkers, parseMarker, readMarker, submitAnswer, type WaitingMarker } from "../src/answers";
+import { FREE_TEXT_MAX, SHOWN_QUESTION_MAX, checkAnswers, liveMarkers, parseMarker, readMarker, sameText, submitAnswer, type WaitingMarker } from "../src/answers";
 
 const NOW = 1_800_000_000;
 const alive = (pid?: number) => pid === 4242;
@@ -64,6 +64,36 @@ describe("answers: checkAnswers", () => {
       answers: { "Which fruit?": "Kiwi please", "Toppings?": "Jam, homemade" },
     });
     expect(checkAnswers(m, { "Which fruit?": "é".repeat(FREE_TEXT_MAX), "Toppings?": "Nuts" }).ok).toBe(true);
+  });
+
+  it("maps the tailer's redacted and capped texts back to the questions and labels as asked", () => {
+    const long = "Q".repeat(480) + " about ayse@example.com and more";
+    const mm = marker({
+      questions: [
+        { question: "Send the report to ayse@example.com?", header: "Report", multiSelect: false, options: ["Yes, to ayse@example.com", "No"] },
+        { question: long, header: "Long", multiSelect: true, options: ["Commit 0123456789abcdef0123456789abcdef01234567", "Skip"] },
+      ],
+    });
+    const shownLong = "Q".repeat(480) + " about [email] and";
+    expect([...shownLong].length).toBeLessThan(SHOWN_QUESTION_MAX);
+    const cut = long.slice(0, SHOWN_QUESTION_MAX);
+    expect(checkAnswers(mm, { "Send the report to [email]?": "Yes, to [email]", [cut]: "Commit [redacted], Skip" })).toEqual({
+      ok: true,
+      answers: {
+        "Send the report to ayse@example.com?": "Yes, to ayse@example.com",
+        [long]: "Commit 0123456789abcdef0123456789abcdef01234567, Skip",
+      },
+    });
+    expect(sameText(shownLong, long, SHOWN_QUESTION_MAX)).toBe(false); // not cut, so it must match to the end
+    expect(sameText("Send the report to [email]?", "Send the report to x?", SHOWN_QUESTION_MAX)).toBe(true);
+    const twin = marker({
+      questions: [
+        { question: "Mail a@x.io?", header: "A", multiSelect: false, options: ["Yes"] },
+        { question: "Mail b@y.io?", header: "B", multiSelect: false, options: ["Yes"] },
+      ],
+    });
+    expect(checkAnswers(twin, { "Mail [email]?": "Yes" })).toMatchObject({ ok: false, reason: expect.stringMatching(/eşleşmiyor/) });
+    expect(checkAnswers(m, { "Which fruit?": "Apple", "Toppings?": "Nuts", "Which fruit? ": "x" })).toMatchObject({ ok: false });
   });
 
   it("refuses in Turkish: missing, extra, empty, too long or control characters", () => {

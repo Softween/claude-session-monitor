@@ -110,29 +110,60 @@ export function liveMarkers(
 
 const labelOf = (q: MarkerQuestion): string => q.header || (q.question.length > 40 ? q.question.slice(0, 39) + "…" : q.question);
 
-/** The answer as Claude Code writes it: an option label, labels joined with ", " (multi-select), else free text. */
-function normalized(q: MarkerQuestion, value: string): string | null {
-  const v = value.trim();
-  if (q.options.includes(v)) return v;
-  const parts = v.split(",").map((p) => p.trim());
-  if (q.multiSelect && parts.every((p) => q.options.includes(p))) return parts.join(", ");
-  return null;
+// The phone's card comes from the chat tailer, which redacts every question text and label
+// (tools/agent-fleet/chat_privacy.py placeholders) and caps them (chat_tailer.py QUESTION_MAX, LABEL_MAX).
+const PLACEHOLDER_RE = /\[(?:redacted|email|phone|id|iban|card)\]/;
+export const SHOWN_QUESTION_MAX = 500;
+export const SHOWN_LABEL_MAX = 120;
+
+/** `shown` is `original` as the tailer shows it: each placeholder stands for a redacted run, a capped text is a prefix. */
+export function sameText(shown: string, original: string, cap: number): boolean {
+  if (shown === original) return true;
+  const capped = [...shown].length >= cap;
+  if (!PLACEHOLDER_RE.test(shown) && !capped) return false;
+  const body = shown
+    .split(new RegExp(PLACEHOLDER_RE.source, "g"))
+    .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("[\\s\\S]+?");
+  return new RegExp(`^${body}${capped ? "" : "$"}`).test(original);
 }
 
-/** Every marker question answered with its option label(s) or a short free text ("Diğer"); the reason otherwise. */
+/** The one entry of `originals` that `shown` stands for (exact match first), else null. */
+function resolveShown(shown: string, originals: string[], cap: number): string | null {
+  if (originals.includes(shown)) return shown;
+  const hits = originals.filter((o) => sameText(shown, o, cap));
+  return hits.length === 1 ? hits[0] : null;
+}
+
+/** The answer as Claude Code writes it: an option label, labels joined with ", " (multi-select), else null (free text). */
+function normalized(q: MarkerQuestion, value: string): string | null {
+  const v = value.trim();
+  const one = resolveShown(v, q.options, SHOWN_LABEL_MAX);
+  if (one) return one;
+  if (!q.multiSelect) return null;
+  const parts = v.split(",").map((p) => resolveShown(p.trim(), q.options, SHOWN_LABEL_MAX));
+  return parts.every((p) => p) ? parts.join(", ") : null;
+}
+
+/**
+ * Every marker question answered with its option label(s) or a short free text ("Diğer"), keyed by
+ * the question text as asked or as the tailer showed it; the answers keyed as asked, or the reason.
+ */
 export function checkAnswers(
   m: WaitingMarker,
   answers: unknown,
 ): { ok: true; answers: Record<string, string> } | { ok: false; reason: string } {
   if (!answers || typeof answers !== "object" || Array.isArray(answers)) return { ok: false, reason: "Cevaplar eksik" };
-  const given = answers as Record<string, unknown>;
-  const texts = new Set(m.questions.map((q) => q.question));
-  if (Object.keys(given).some((k) => !texts.has(k))) {
-    return { ok: false, reason: "Soru Mac'teki soruyla eşleşmiyor; kartı yenileyip tekrar dene" };
+  const byQuestion = new Map<string, unknown>();
+  const texts = m.questions.map((q) => q.question);
+  for (const [key, value] of Object.entries(answers as Record<string, unknown>)) {
+    const text = resolveShown(key, texts, SHOWN_QUESTION_MAX);
+    if (!text || byQuestion.has(text)) return { ok: false, reason: "Soru Mac'teki soruyla eşleşmiyor; kartı yenileyip tekrar dene" };
+    byQuestion.set(text, value);
   }
   const out: Record<string, string> = {};
   for (const q of m.questions) {
-    const value = given[q.question];
+    const value = byQuestion.get(q.question);
     if (value === undefined) return { ok: false, reason: `"${labelOf(q)}" sorusu cevaplanmadı` };
     if (typeof value !== "string" || !value.trim()) return { ok: false, reason: `"${labelOf(q)}" için cevap boş` };
     const label = normalized(q, value);

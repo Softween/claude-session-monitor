@@ -9,6 +9,7 @@
 import { execFile } from "child_process";
 import * as os from "os";
 import * as vscode from "vscode";
+import { GitInfo } from "./gitInfo";
 import type { PeerSendResult } from "./peerSend";
 import type { SessionView } from "./providers/types";
 import {
@@ -26,6 +27,7 @@ import {
   shouldPush,
   snapshotHash,
   withTimeout,
+  type FleetAutoResume,
   type SnapshotAccountInput,
 } from "./remote";
 
@@ -44,6 +46,7 @@ export interface FleetCommand {
   text?: string | null;
   account?: string | null;
   cwd?: string | null;
+  enabled?: boolean | null;
   createdAt?: number;
 }
 
@@ -108,6 +111,8 @@ export interface RemoteBridgeDeps {
   execute: (cmd: FleetCommand) => Promise<CommandOutcome>;
   /** folders a remote newSession may use (remoteCwds.ts), sent with every snapshot */
   allowedCwds?: () => string[];
+  /** a limited row's auto-resume state (autoResume.ts), sent on limited rows */
+  autoResume?: (v: SessionView) => FleetAutoResume | null;
 }
 
 interface BridgeCfg { url: string; host: string; token: string }
@@ -145,6 +150,7 @@ export class RemoteBridge implements vscode.Disposable {
   private lastPressureSample = 0;
   private restartSeq = 0;
   private warnedOrigin = ""; // url whose origin mismatch was already shown once
+  private readonly gitInfo = new GitInfo(); // per-cwd branch / changes / PR, only asked while the bridge runs
 
   private readonly userAgent: string;
 
@@ -216,6 +222,8 @@ export class RemoteBridge implements vscode.Disposable {
         machine: await sampleMachine(this.pressure, rows.length),
         allowedCwds: this.deps.allowedCwds?.(),
         now,
+        git: (cwd) => this.gitInfo.get(cwd),
+        autoResume: this.deps.autoResume,
       });
     } catch (e) {
       this.fail("snapshot failed: " + String(e));
@@ -336,7 +344,8 @@ export class RemoteBridge implements vscode.Disposable {
       }
     }
     this.deps.log(`remote: command ${cmd.type} ${cmd.id.slice(0, 8)} -> ${out.ok ? "ok" : "failed"}: ${out.message}`);
-    if (cmd.type === "newSession" && out.ok) await this.flushSnapshot(signal);
+    // The phone reads the state after the result: let it list the new session or the new auto-resume state.
+    if ((cmd.type === "newSession" || cmd.type === "autoResume") && out.ok) await this.flushSnapshot(signal);
     try {
       await this.request(
         cfg,

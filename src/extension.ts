@@ -38,6 +38,7 @@ import { allowedCwds, mergeSeen, withoutPaths } from "./remoteCwds";
 import { startNewSession } from "./remoteNewSession";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import { TabWaker, nodeProbes, summaryText } from "./wakeTabs";
+import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
 import {
   KIND_LABEL,
   RESET_KINDS,
@@ -2068,22 +2069,27 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let focusCursor = "";
 
   // Auto-resume: when sessions are limited (or the 5h window is pinned at 99%+),
-  // schedule one staggered resume sweep for just after the window resets.
+  // schedule one staggered resume sweep for just after the window resets. A limited
+  // session's own choice (remote `autoResume`, autoResume.ts) overrides the setting.
   function clearAutoResume(): void {
     if (autoResumeTimer) clearTimeout(autoResumeTimer);
     autoResumeTimer = undefined;
     autoResumeAt = 0;
   }
 
+  const autoResumeAll = () => cfg().get<boolean>("autoResumeAfterReset", false);
+  const autoResumeOverrides = () => readOverrides(ctx.globalState.get(OVERRIDES_KEY), Date.now());
+
   function maybeScheduleAutoResume(views: SessionView[]): void {
-    if (!claudeEnabled() || !cfg().get<boolean>("autoResumeAfterReset", false)) {
+    const all = autoResumeAll();
+    const limitedViews = claudeEnabled() ? limitedToResume(views, autoResumeOverrides(), all) : [];
+    if (!claudeEnabled() || (!all && !limitedViews.length)) {
       clearAutoResume();
       return;
     }
     const nowMs = Date.now();
     const g5 = activeUsage()?.gauges.find((g) => g.key === "session");
     let target = 0;
-    const limitedViews = views.filter((v) => v.provider === "claude" && groupOf(v) === "limited");
     if (limitedViews.length) {
       for (const v of limitedViews) {
         const e = v.resetText ? parseResetToEpoch(v.resetText, nowMs / 1000) : undefined;
@@ -2106,16 +2112,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     autoResumeTimer = setTimeout(() => {
       autoResumeTimer = undefined;
       autoResumeAt = 0;
-      if (
-        disposed ||
-        !claudeEnabled() ||
-        !cfg().get<boolean>("autoResumeAfterReset", false) ||
-        resumeActive
-      ) {
-        return;
-      }
+      if (disposed || !claudeEnabled() || resumeActive) return;
+      const queue = sweepQueue(lastAllViews, autoResumeOverrides(), autoResumeAll());
+      if (!queue.length) return;
       vscode.window.showInformationMessage("Claude Sessions: limit reset — starting auto resume sweep.");
-      vscode.commands.executeCommand("claudeSessionMonitor.resumeAll");
+      startResumeSweep(queue);
     }, delay);
   }
 
@@ -3269,6 +3270,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (dismissalsChanged) void persistDismissals();
     if (dismissed.size) allViews = allViews.filter((v) => !dismissed.has(v.key));
     lastAllViews = allViews;
+    const settled = settledOverrides(autoResumeOverrides(), allViews); // a session's auto-resume choice ends with its limit
+    if (settled) void ctx.globalState.update(OVERRIDES_KEY, settled);
 
     let views = filterProvider(allViews, providerFilter);
     if (needsYouOnly) views = views.filter((v) => NEEDS_YOU.includes(groupOf(v)));
@@ -3461,6 +3464,19 @@ export function activate(ctx: vscode.ExtensionContext): void {
    * re-verification right before each keystroke, and self-chained scheduling
    * (never overlaps, never double-types).
    */
+  /** The resume sweep over `queue`: resumePrompt typed into each session, staggered (resumeAll, auto-resume). */
+  function startResumeSweep(queue: SessionView[]): void {
+    const c = cfg();
+    // Collapse newlines so a single resumePrompt value can never encode more
+    // than one Return keystroke (osascript `keystroke` submits on each \n).
+    const prompt = c.get<string>("resumePrompt", "resume").replace(/[\r\n]+/g, " ").slice(0, 500);
+    startTypingSweep(queue, prompt, {
+      staggerSec: Math.max(5, c.get<number>("resumeStaggerSeconds", 60)),
+      doneLabel: "resume",
+      autoType: c.get<boolean>("resumeAutoType", true),
+    });
+  }
+
   function startTypingSweep(
     queue: SessionView[],
     text: string,
@@ -3687,18 +3703,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
       stopResume("Claude Sessions: resume sweep stopped."),
     ),
     vscode.commands.registerCommand("claudeSessionMonitor.resumeAll", () => {
-      const queue = lastAllViews.filter(
-        (v) => v.provider === "claude" && v.capabilities.bulkInput && groupOf(v) !== "ended",
+      startResumeSweep(
+        lastAllViews.filter((v) => v.provider === "claude" && v.capabilities.bulkInput && groupOf(v) !== "ended"),
       );
-      const c = cfg();
-      // Collapse newlines so a single resumePrompt value can never encode more
-      // than one Return keystroke (osascript `keystroke` submits on each \n).
-      const prompt = c.get<string>("resumePrompt", "resume").replace(/[\r\n]+/g, " ").slice(0, 500);
-      startTypingSweep(queue, prompt, {
-        staggerSec: Math.max(5, c.get<number>("resumeStaggerSeconds", 60)),
-        doneLabel: "resume",
-        autoType: c.get<boolean>("resumeAutoType", true),
-      });
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.wakeDeadTabsNow", async () => {
       if (tabWaker) vscode.window.showInformationMessage(summaryText(await tabWaker.runNow()));
@@ -4140,6 +4147,18 @@ export function activate(ctx: vscode.ExtensionContext): void {
           monitorDir: MONITOR_DIR,
           sleep,
         });
+      case "autoResume": {
+        // One limited session in or out of the auto-resume sweep (autoResume.ts).
+        const v = find();
+        if (!v) return { ok: false, message: `unknown session ${cmd.sessionId}` };
+        if (v.provider !== "claude") return { ok: false, message: "auto-resume is supported for Claude sessions only" };
+        if (typeof cmd.enabled !== "boolean") return { ok: false, message: "enabled (true or false) is required" };
+        if (groupOf(v) !== "limited") return { ok: false, message: "the session is not stopped by a limit" };
+        await ctx.globalState.update(OVERRIDES_KEY, withOverride(autoResumeOverrides(), v.sessionId, cmd.enabled, Date.now()));
+        maybeScheduleAutoResume(lastAllViews);
+        const when = cmd.enabled && autoResumeAt ? `; the resume sweep runs at ${new Date(autoResumeAt).toLocaleTimeString()}` : "";
+        return { ok: true, message: `auto-resume ${cmd.enabled ? "on" : "off"} for "${truncate(v.title, 40)}"${when}` };
+      }
       case "send": {
         if (!cmd.sessionId || typeof cmd.text !== "string" || !cmd.text) {
           return { ok: false, message: "sessionId and text are required" };
@@ -4176,7 +4195,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // A closed resume terminal is no longer the session's.
   ctx.subscriptions.push(vscode.window.onDidCloseTerminal((t) => resumeTerminals.forget(t)));
 
-  remoteBridge = registerRemoteBridge(ctx, { log, accounts: remoteAccounts, execute: executeRemote, allowedCwds: () => remoteCwds() });
+  remoteBridge = registerRemoteBridge(ctx, {
+    log,
+    accounts: remoteAccounts,
+    execute: executeRemote,
+    allowedCwds: () => remoteCwds(),
+    autoResume: (v) => rowAutoResume(v, autoResumeOverrides(), autoResumeAll(), autoResumeAt),
+  });
 
   // After a restart, show each limit-stopped Claude Code tab once so its process runs
   // again (wakeTabs.ts). Started before the first refresh, which updates its registry.

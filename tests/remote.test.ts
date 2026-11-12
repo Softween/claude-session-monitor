@@ -126,7 +126,29 @@ describe("buildSnapshot", () => {
       tokens: { ctxPct: null, total: 1234 },
       account: "a@example.com",
       waitReason: null,
+      git: null,
+      autoResume: null,
     });
+  });
+
+  it("asks the git provider per cwd and the auto-resume provider for limited rows only", () => {
+    const git = { branch: "feat/x", dirty: 3, pr: null };
+    const seen: (string | null)[] = [];
+    const b = buildSnapshot({
+      host: "mac",
+      rows: [row({ bucket: "limited", resetText: "9pm" }), row({ sessionId: "s2", cwd: undefined }), row({ sessionId: "s3" })],
+      accounts,
+      machine,
+      now: 1,
+      git: (cwd) => (seen.push(cwd), cwd ? git : null),
+      autoResume: (v) => ({ enabled: v.sessionId === "s1", at: 1_800_000_090 }),
+    });
+    expect(seen).toEqual(["/Users/x/repo", null, "/Users/x/repo"]);
+    expect(b.sessions.map((s) => [s.id, s.git, s.autoResume])).toEqual([
+      ["s1", git, { enabled: true, at: 1_800_000_090 }],
+      ["s2", null, null],
+      ["s3", git, null],
+    ]);
   });
 
   it("gives waiting and yourTurn rows a waitReason: question, permission, else idle; null elsewhere", () => {

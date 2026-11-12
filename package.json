@@ -450,7 +450,7 @@
         "claudeSessionMonitor.autoResumeAfterReset": {
           "type": "boolean",
           "default": false,
-          "description": "When Claude sessions hit the usage limit (or the Claude 5h window is at 99%+), automatically run the staggered resume sweep ~90s after the window resets."
+          "description": "When Claude sessions hit the usage limit (or the Claude 5h window is at 99%+), automatically run the staggered resume sweep ~90s after the window resets. A remote `autoResume` command can switch a single limited session in or out of the sweep."
         },
         "claudeSessionMonitor.wakeDeadTabs": {
           "type": "boolean",
@@ -479,7 +479,7 @@
           "type": "boolean",
           "scope": "application",
           "default": true,
-          "markdownDescription": "Run the commands the remote bridge receives (`resume`, `send`, `kill`, `resumeAll`, `switchAccount`). Off is a kill switch: the session snapshot is still uploaded, but every command is answered with `remote commands disabled on this Mac` and nothing runs."
+          "markdownDescription": "Run the commands the remote bridge receives (`resume`, `send`, `kill`, `resumeAll`, `switchAccount`, `autoResume`). Off is a kill switch: the session snapshot is still uploaded, but every command is answered with `remote commands disabled on this Mac` and nothing runs."
         },
         "claudeSessionMonitor.remote.typeFallback": {
           "type": "boolean",

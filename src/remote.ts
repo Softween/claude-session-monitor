@@ -7,6 +7,7 @@ import { execFile } from "child_process";
 import { createHash } from "crypto";
 import * as os from "os";
 import { parseResetToEpoch } from "./core";
+import type { FleetGit } from "./gitInfo";
 import type { SessionView } from "./providers/types";
 import { ALLOWED_CWDS_MAX } from "./remoteCwds";
 import { groupOf, type GroupKey } from "./view";
@@ -15,6 +16,12 @@ export type FleetBucket = "waiting" | "yourTurn" | "working" | "idle" | "limited
 
 /** Why a waiting / yourTurn row waits (waitReasonOf). */
 export type WaitReason = "question" | "permission" | "idle";
+
+/** A limited row's auto-resume: on or off for this session, and when the resume sweep runs (epoch seconds). */
+export interface FleetAutoResume {
+  enabled: boolean;
+  at: number | null;
+}
 
 /**
  * Panel group (view.ts GroupKey) -> contract bucket:
@@ -71,6 +78,10 @@ export interface FleetSession {
   background?: { dueTs: number | null };
   /** waiting / yourTurn rows only (waitReasonOf), null on every other row. */
   waitReason: WaitReason | null;
+  /** The cwd's branch, changed files and pull request (gitInfo.ts); null without a repo or a provider. */
+  git: FleetGit | null;
+  /** Limited rows only; null on every other row. */
+  autoResume: FleetAutoResume | null;
 }
 
 export interface FleetAccount {
@@ -119,6 +130,10 @@ export interface SnapshotInput {
   machine: FleetMachine;
   allowedCwds?: string[];
   now?: number; // epoch ms
+  /** git info for a session cwd (gitInfo.ts GitInfo.get); rows carry git: null without it. */
+  git?: (cwd: string | null) => FleetGit | null;
+  /** auto-resume state of a limited row; limited rows carry autoResume: null without it. */
+  autoResume?: (v: SessionView) => FleetAutoResume | null;
 }
 
 /** Cut a string to at most `maxBytes` UTF-8 bytes without splitting a character. */
@@ -169,7 +184,7 @@ export function waitReasonOf(v: SessionView, bucket: FleetBucket): WaitReason | 
   return v.notifType === "permission_prompt" ? "permission" : "idle";
 }
 
-function sessionOf(v: SessionView, nowSec: number, activeEmail: string | null): FleetSession {
+function sessionOf(v: SessionView, nowSec: number, activeEmail: string | null, input: SnapshotInput): FleetSession {
   const group = groupOf(v);
   const bucket = BUCKET_MAP[group];
   // The row keeps no assistant reply text; the most recent human-readable line it has
@@ -198,6 +213,8 @@ function sessionOf(v: SessionView, nowSec: number, activeEmail: string | null): 
       ? { background: { dueTs: v.closingTiming?.dueMs != null ? Math.floor(v.closingTiming.dueMs / 1000) : null } }
       : {}),
     waitReason: waitReasonOf(v, bucket),
+    git: input.git?.(v.cwd ?? null) ?? null,
+    autoResume: bucket === "limited" ? input.autoResume?.(v) ?? null : null,
   };
 }
 
@@ -237,7 +254,7 @@ export function buildSnapshot(input: SnapshotInput): IngestBody {
     v: 1,
     host: input.host.slice(0, 64),
     sentAt: now,
-    sessions: input.rows.slice(0, MAX_SESSIONS).map((v) => sessionOf(v, now / 1000, activeEmail)),
+    sessions: input.rows.slice(0, MAX_SESSIONS).map((v) => sessionOf(v, now / 1000, activeEmail, input)),
     accounts: input.accounts.map((a) => accountOf(a, input.bestAccountId ?? null)),
     machine: coarseMachine({ ...input.machine, sessions: input.rows.length }),
     ...(input.allowedCwds ? { allowedCwds: input.allowedCwds.slice(0, ALLOWED_CWDS_MAX) } : {}),

@@ -9,6 +9,7 @@
 import { execFile } from "child_process";
 import * as os from "os";
 import * as vscode from "vscode";
+import { liveMarkers } from "./answers";
 import { GitInfo } from "./gitInfo";
 import type { PeerSendResult } from "./peerSend";
 import type { SessionView } from "./providers/types";
@@ -47,6 +48,8 @@ export interface FleetCommand {
   account?: string | null;
   cwd?: string | null;
   enabled?: boolean | null;
+  toolUseId?: string | null;
+  answers?: unknown;
   createdAt?: number;
 }
 
@@ -214,6 +217,7 @@ export class RemoteBridge implements vscode.Disposable {
     let body;
     try {
       const { accounts, bestId } = this.deps.accounts();
+      const markers = liveMarkers(now / 1000); // AskUserQuestion hooks waiting for the phone
       body = buildSnapshot({
         host: cfg.host,
         rows,
@@ -224,6 +228,10 @@ export class RemoteBridge implements vscode.Disposable {
         now,
         git: (cwd) => this.gitInfo.get(cwd),
         autoResume: this.deps.autoResume,
+        answerable: (v) => {
+          const m = v.provider === "claude" && v.askPending ? markers.get(v.sessionId) : undefined;
+          return m ? { deadline: Math.floor(m.deadline) } : null;
+        },
       });
     } catch (e) {
       this.fail("snapshot failed: " + String(e));

@@ -128,7 +128,20 @@ describe("buildSnapshot", () => {
       waitReason: null,
       git: null,
       autoResume: null,
+      answerable: null,
     });
+  });
+
+  it("marks a row answerable from the provider", () => {
+    const b = buildSnapshot({
+      host: "mac",
+      rows: [row({ askPending: true }), row({ sessionId: "s2" })],
+      accounts,
+      machine,
+      now: 1,
+      answerable: (v) => (v.askPending ? { deadline: 1_800_000_600 } : null),
+    });
+    expect(b.sessions.map((s) => s.answerable)).toEqual([{ deadline: 1_800_000_600 }, null]);
   });
 
   it("asks the git provider per cwd and the auto-resume provider for limited rows only", () => {

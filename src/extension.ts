@@ -39,6 +39,7 @@ import { startNewSession } from "./remoteNewSession";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import { TabWaker, nodeProbes, summaryText } from "./wakeTabs";
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
+import { submitAnswer } from "./answers";
 import {
   KIND_LABEL,
   RESET_KINDS,
@@ -4147,6 +4148,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
           monitorDir: MONITOR_DIR,
           sleep,
         });
+      case "answer": {
+        // An AskUserQuestion answer from the phone, handed to the waiting PermissionRequest hook (answers.ts).
+        return submitAnswer(cmd, { nowSec: Date.now() / 1000, askPending: !!find()?.askPending });
+      }
       case "autoResume": {
         // One limited session in or out of the auto-resume sweep (autoResume.ts).
         const v = find();

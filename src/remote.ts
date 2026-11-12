@@ -82,6 +82,8 @@ export interface FleetSession {
   git: FleetGit | null;
   /** Limited rows only; null on every other row. */
   autoResume: FleetAutoResume | null;
+  /** Set while the session's AskUserQuestion waits for a phone answer (answers.ts); deadline in epoch seconds. */
+  answerable: { deadline: number } | null;
 }
 
 export interface FleetAccount {
@@ -134,6 +136,8 @@ export interface SnapshotInput {
   git?: (cwd: string | null) => FleetGit | null;
   /** auto-resume state of a limited row; limited rows carry autoResume: null without it. */
   autoResume?: (v: SessionView) => FleetAutoResume | null;
+  /** whether the row's question can be answered from the phone; rows carry answerable: null without it. */
+  answerable?: (v: SessionView) => { deadline: number } | null;
 }
 
 /** Cut a string to at most `maxBytes` UTF-8 bytes without splitting a character. */
@@ -215,6 +219,7 @@ function sessionOf(v: SessionView, nowSec: number, activeEmail: string | null, i
     waitReason: waitReasonOf(v, bucket),
     git: input.git?.(v.cwd ?? null) ?? null,
     autoResume: bucket === "limited" ? input.autoResume?.(v) ?? null : null,
+    answerable: input.answerable?.(v) ?? null,
   };
 }
 

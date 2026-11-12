@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.34.0",
+  "version": "2.35.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -479,7 +479,7 @@
           "type": "boolean",
           "scope": "application",
           "default": true,
-          "markdownDescription": "Run the commands the remote bridge receives (`resume`, `send`, `kill`, `resumeAll`, `switchAccount`, `autoResume`). Off is a kill switch: the session snapshot is still uploaded, but every command is answered with `remote commands disabled on this Mac` and nothing runs."
+          "markdownDescription": "Run the commands the remote bridge receives (`resume`, `send`, `kill`, `resumeAll`, `switchAccount`, `autoResume`, `answer`). Off is a kill switch: the session snapshot is still uploaded, but every command is answered with `remote commands disabled on this Mac` and nothing runs."
         },
         "claudeSessionMonitor.remote.typeFallback": {
           "type": "boolean",

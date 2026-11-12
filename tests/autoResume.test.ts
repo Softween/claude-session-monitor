@@ -44,10 +44,10 @@ describe("auto-resume overrides", () => {
   });
 
   it("sets one session and keeps the newest 500", () => {
-    let o = {};
-    for (let i = 0; i < 505; i++) o = withOverride(o, `s${i}`, i % 2 === 0, NOW + i);
+    const full = Object.fromEntries(Array.from({ length: 504 }, (_, i) => [`s${i}`, { enabled: i % 2 === 0, setAt: NOW + i }]));
+    const o = withOverride(full, "s504", true, NOW + 504);
     expect(Object.keys(o)).toHaveLength(500);
-    expect((o as Record<string, unknown>).s0).toBeUndefined();
+    expect([o.s0, o.s4, o.s5]).toEqual([undefined, undefined, { enabled: false, setAt: NOW + 5 }]);
     expect(withOverride(o, "s504", false, NOW + 999).s504).toEqual({ enabled: false, setAt: NOW + 999 });
   });
 

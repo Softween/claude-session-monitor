@@ -31,6 +31,7 @@ import {
   type HookStatus,
   type RecentTranscript,
 } from "../src/core";
+import { groupOf } from "../src/view";
 
 // --- helpers ----------------------------------------------------------------
 
@@ -892,6 +893,59 @@ describe("closing status line from transcripts", () => {
     const hook: HookStatus = { session_id: "cg", state: "idle", ts: NOW - 35, cwd: "/repo", transcript_path: p };
     expect(collect([hook]).find((x) => x.sessionId === "cg")?.closing).toBeUndefined();
     expect(collect([hook], true).find((x) => x.sessionId === "cg")?.closing).toEqual({ kind: "done", text: "All tests pass" });
+  });
+
+  // A ⏳ reply written 30 s before NOW; its finish time is named in local time, like the house rule's line.
+  const hhmm = (sec: number) => {
+    const d = new Date(sec * 1000);
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  };
+  const pendingSession = (sid: string, line: string): HookStatus => {
+    const p = writeTranscript(`${sid}.jsonl`, [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "ship it" }] }, timestamp: iso(NOW - 40) },
+      { type: "assistant", message: { id: `m_${sid}`, content: [{ type: "text", text: `Pushed.\n\n⏳ ${line}` }], stop_reason: "end_turn" }, timestamp: iso(NOW - 30) },
+    ]);
+    return { session_id: sid, state: "idle", ts: NOW - 29, cwd: "/repo", transcript_path: p };
+  };
+  const collectAt = (now: number, hook: HookStatus, closingMarkers?: boolean) =>
+    collectSessions({
+      now,
+      hookStatuses: new Map([[hook.session_id, hook]]),
+      extraTranscripts: [],
+      maxAgeSec: 24 * 3600,
+      hideEndedOlderThanSec: 24 * 3600,
+      closingMarkers,
+    }).find((x) => x.sessionId === hook.session_id)!;
+
+  it("closingMarkers on: a ⏳ row with a finish time is in background until 5 min past it, then your turn and flagged", () => {
+    const due = NOW + 3600;
+    const hook = pendingSession("cb", `Kapatma: CI ve deploy · bitiş ~${hhmm(due)}`);
+    const onTime = collectAt(NOW, hook, true);
+    expect(onTime.closingTiming).toEqual({ dueMs: due * 1000, overdue: false });
+    expect(groupOf(onTime)).toBe("background");
+    expect(onTime.tooltip).toContain(`finish: ~${hhmm(due)}`);
+    expect(groupOf(collectAt(due + 300, hook, true))).toBe("background");
+    const late = collectAt(due + 301, hook, true);
+    expect(late.closingTiming).toEqual({ dueMs: due * 1000, overdue: true });
+    expect(groupOf(late)).toBe("done");
+    expect(late.tooltip).toContain(`past its finish time (~${hhmm(due)}); may be stuck`);
+  });
+
+  it("closingMarkers on: a ⏳ row without a finish time returns to your turn after 90 min idle", () => {
+    const hook = pendingSession("cn", "Kapatma: CI bitince (~10 dk)");
+    expect(groupOf(collectAt(NOW, hook, true))).toBe("background");
+    const late = collectAt(NOW - 30 + 90 * 60, hook, true);
+    expect(late.closingTiming).toEqual({ dueMs: null, overdue: true });
+    expect(groupOf(late)).toBe("done");
+    expect(late.tooltip).toContain("no finish time and idle 90+ min; may be stuck");
+  });
+
+  it("closingMarkers off: a ⏳ row stays in your turn with no timing", () => {
+    const hook = pendingSession("cf", `Kapatma: CI · bitiş ~${hhmm(NOW + 3600)}`);
+    const v = collectAt(NOW, hook);
+    expect(v.closingTiming).toBeUndefined();
+    expect(groupOf(v)).toBe("done");
+    expect(v.tooltip).not.toContain("finish:");
   });
 });
 

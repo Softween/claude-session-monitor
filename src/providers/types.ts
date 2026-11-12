@@ -4,6 +4,8 @@ export type SessionBucket = "limited" | "attention" | "working" | "ended" | "unk
 
 export type ClosingKind = "done" | "pending" | "blocked";
 export interface ClosingStatus { kind: ClosingKind; text: string }
+/** Finish time of a ⏳ closing line (epoch ms, null when it names none) and whether it is overdue (closingBuckets.ts). */
+export interface ClosingTiming { dueMs: number | null; overdue: boolean }
 
 export interface SessionCapabilities {
   focus: boolean;
@@ -56,6 +58,8 @@ export interface SessionView {
   stale: boolean;
   /** Closing status line of the final assistant message; set only for idle "your turn" sessions while closingStatusMarkers is on. */
   closing?: ClosingStatus;
+  /** Set with a ⏳ (pending) closing status only; re-evaluated on every refresh. */
+  closingTiming?: ClosingTiming;
   model?: string;
   effort?: string;
   tokens?: number;

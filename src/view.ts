@@ -4,8 +4,9 @@
  * is unit-testable without a VS Code host.
  */
 import type { SessionView, ModelStat } from "./core";
+import { isBackground } from "./closingBuckets";
 
-export type GroupKey = "limited" | "waiting" | "done" | "working" | "ended" | "unknown";
+export type GroupKey = "limited" | "waiting" | "done" | "background" | "working" | "ended" | "unknown";
 
 export interface GroupMeta {
   key: GroupKey;
@@ -18,6 +19,7 @@ export const GROUPS: GroupMeta[] = [
   { key: "limited", label: "Limited", icon: "error", color: "charts.red" },
   { key: "waiting", label: "Waiting for you", icon: "bell-dot", color: "charts.yellow" },
   { key: "done", label: "Your turn", icon: "comment", color: "charts.blue" },
+  { key: "background", label: "In background", icon: "watch", color: "charts.purple" },
   { key: "working", label: "Working", icon: "sync", color: "charts.green" },
   { key: "ended", label: "Ended", icon: "circle-slash", color: "disabledForeground" },
   { key: "unknown", label: "Unknown", icon: "question", color: "disabledForeground" },
@@ -29,7 +31,7 @@ export function groupOf(v: SessionView): GroupKey {
   if (v.bucket === "limited") return "limited";
   if (v.bucket === "working") return "working";
   if (v.bucket === "ended") return "ended";
-  if (v.bucket === "attention") return v.sub === "waiting for you" ? "waiting" : "done";
+  if (v.bucket === "attention") return v.sub === "waiting for you" ? "waiting" : isBackground(v) ? "background" : "done";
   return "unknown";
 }
 

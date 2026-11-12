@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.32.0",
+  "version": "2.33.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -337,7 +337,7 @@
         "claudeSessionMonitor.closingStatusMarkers": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Show a closing status marker instead of the plain dot on **Your turn** rows when the final assistant message ends with a line starting with ✅ (done, safe to close), ⏳ (waiting on a background job) or 🟡 (needs your decision); the row tooltip gains a `closing:` line. Turn on only if you ask your assistant to end every turn with such a line: otherwise an ordinary reply ending in, say, \"✅ All tests pass\" would read as done."
+          "markdownDescription": "Show a closing status marker instead of the plain dot on **Your turn** rows when the final assistant message ends with a line starting with ✅ (done, safe to close), ⏳ (waiting on a background job) or 🟡 (needs your decision); the row tooltip gains a `closing:` line. Turn on only if you ask your assistant to end every turn with such a line: otherwise an ordinary reply ending in, say, \"✅ All tests pass\" would read as done. A ⏳ row moves to an **In background** group right after **Your turn**, soonest finish first (the finish time is read from `bitiş ~HH:MM`, `finish ~HH:MM` or `due HH:MM` in the line), and returns to **Your turn** flagged late 5 minutes past that time, or after 90 minutes idle when the line names none."
         },
         "claudeSessionMonitor.usagePollSeconds": {
           "type": "number",

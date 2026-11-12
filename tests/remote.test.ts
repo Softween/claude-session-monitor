@@ -78,7 +78,31 @@ describe("buildSnapshot", () => {
       const b = buildSnapshot({ host: "mac", rows: [row(over)], accounts, machine, now: 1 });
       expect(b.sessions[0].bucket).toBe(want);
     }
-    expect(Object.keys(BUCKET_MAP).sort()).toEqual(["done", "ended", "limited", "unknown", "waiting", "working"]);
+    expect(Object.keys(BUCKET_MAP).sort()).toEqual(["background", "done", "ended", "limited", "unknown", "waiting", "working"]);
+  });
+
+  it("sends an in-background ⏳ row as yourTurn with its finish time in the optional background field", () => {
+    const yourTurn = { bucket: "attention", sub: "your turn" } as const;
+    const pending = { kind: "pending", text: "Kapatma: CI · bitiş ~06:15" } as const;
+    const b = buildSnapshot({
+      host: "mac",
+      rows: [
+        row({ ...yourTurn, sessionId: "bg", closing: pending, closingTiming: { dueMs: 1_700_000_900_500, overdue: false } }),
+        row({ ...yourTurn, sessionId: "nodue", closing: pending, closingTiming: { dueMs: null, overdue: false } }),
+        row({ ...yourTurn, sessionId: "late", closing: pending, closingTiming: { dueMs: 1_700_000_900_500, overdue: true } }),
+        row({ ...yourTurn, sessionId: "plain" }),
+      ],
+      accounts,
+      machine,
+      now: 1,
+    });
+    expect(b.sessions.map((s) => [s.id, s.bucket, s.background])).toEqual([
+      ["bg", "yourTurn", { dueTs: 1_700_000_900 }],
+      ["nodue", "yourTurn", { dueTs: null }],
+      ["late", "yourTurn", undefined],
+      ["plain", "yourTurn", undefined],
+    ]);
+    expect("background" in b.sessions[3]).toBe(false);
   });
 
   it("maps the row fields to the session object", () => {

@@ -1149,6 +1149,76 @@ describe("closingStatusMarkers setting", () => {
     expect(row.closingText).toBe("All tests pass");
     expect(row.tip).toContain("closing: ✅ All tests pass");
   });
+
+  // A ⏳ session whose final reply was written `agoSec` ago and names `dueSec` (epoch) as its finish time.
+  function seedPending(id: string, agoSec: number, dueSec: number): string {
+    const now = Date.now() / 1000;
+    const iso = (s: number) => new Date(s * 1000).toISOString();
+    const d = new Date(dueSec * 1000);
+    const hhmm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    const dir = `${HOME}/.claude/projects/-repo`;
+    const mon = `${HOME}/.claude/session-monitor`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(mon, { recursive: true });
+    const tx = `${dir}/${id}.jsonl`;
+    const lines = [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "ship it" }] }, timestamp: iso(now - agoSec - 10) },
+      { type: "assistant", message: { id: `m-${id}`, content: [{ type: "text", text: `Pushed.\n\n⏳ Kapatma: CI ve deploy · bitiş ~${hhmm}` }], stop_reason: "end_turn" }, timestamp: iso(now - agoSec) },
+    ];
+    fs.writeFileSync(tx, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    fs.writeFileSync(`${mon}/${id}.json`, JSON.stringify({ session_id: id, provider: "claude", state: "idle", ts: now - agoSec + 1, cwd: "/repo", transcript_path: tx }));
+    return hhmm;
+  }
+  function sessionsPayload(): any {
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    const posted: any[] = [];
+    rec.webviews.find((w) => w.id === "claudeSessionMonitor.view")!.p.resolveWebviewView({
+      webview: { options: {}, html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: (m: any) => { posted.push(m); } },
+    });
+    return posted[posted.length - 1];
+  }
+
+  it("on: an on-time ⏳ row moves to In background, right after Your turn, soonest finish first", () => {
+    rec.config.set("closingStatusMarkers", true);
+    seedYourTurn();
+    const now = Date.now() / 1000;
+    const later = seedPending("s-later", 30, now + 7200);
+    const sooner = seedPending("s-sooner", 30, now + 3600);
+    const p = sessionsPayload();
+    const keys = p.groups.map((g: { key: string }) => g.key);
+    expect(keys.indexOf("background")).toBe(keys.indexOf("done") + 1);
+    const done = p.groups.find((g: { key: string }) => g.key === "done");
+    const bg = p.groups.find((g: { key: string }) => g.key === "background");
+    expect(done.count).toBe(1);
+    expect(bg.label).toBe("In background");
+    expect(bg.count).toBe(2);
+    expect(bg.rows.map((r: { id: string }) => r.id)).toEqual(["claude:s-sooner", "claude:s-later"]);
+    expect(bg.rows.map((r: { due: string }) => r.due)).toEqual([sooner, later]);
+    expect(bg.rows[0]).toMatchObject({ closing: "pending", late: "" });
+    const bar = rec.statusBars.find((s) => String(s.tooltip).includes("your turn:"));
+    expect(bar.tooltip).toContain("your turn: 1\nin background: 2");
+  });
+
+  it("on: an overdue ⏳ row goes back to Your turn with the late warning", () => {
+    rec.config.set("closingStatusMarkers", true);
+    const now = Date.now() / 1000;
+    const due = seedPending("s-late", 7200, now - 3600);
+    const p = sessionsPayload();
+    expect(p.groups.find((g: { key: string }) => g.key === "background")).toBeUndefined();
+    const row = p.groups.find((g: { key: string }) => g.key === "done").rows.find((r: { id: string }) => r.id === "claude:s-late");
+    expect(row).toMatchObject({ closing: "pending", due, late: `past its finish time (~${due}); may be stuck` });
+    expect(row.tip).toContain(`past its finish time (~${due}); may be stuck`);
+  });
+
+  it("off: a ⏳ session stays a plain Your turn row with no In background group", () => {
+    seedPending("s-off", 30, Date.now() / 1000 + 3600);
+    const p = sessionsPayload();
+    expect(p.groups.map((g: { key: string }) => g.key)).toEqual(["done"]);
+    const row = p.groups[0].rows.find((r: { id: string }) => r.id === "claude:s-off");
+    expect(row).toMatchObject({ closing: "", closingText: "", due: "", late: "" });
+    expect(row.tip).not.toContain("finish:");
+  });
 });
 
 describe("resume terminals: reuse, and remote resume / send / kill without a hook pid", () => {

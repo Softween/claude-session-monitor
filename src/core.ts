@@ -27,6 +27,7 @@ import {
   type SessionHookStatus,
   type SessionView,
 } from "./providers/types";
+import { pendingTiming, timingNote } from "./closingBuckets";
 
 export type { AgentProvider, ClosingKind, ClosingStatus, SessionView } from "./providers/types";
 
@@ -653,6 +654,7 @@ function resolve(
   }
 
   const closing = opts.closingMarkers && bucket === "attention" && sub === "your turn" ? tx?.closing : undefined;
+  const closingTiming = closing?.kind === "pending" ? pendingTiming(closing.text, convTs, now) : undefined;
   const ageStr = lastActivity ? humanizeAge(now - lastActivity) : "";
   const parts: string[] = [];
   if (resetText) parts.push(`reset ${formatReset(resetText, now)}`);
@@ -665,6 +667,7 @@ function resolve(
     "provider: Claude",
     `status: ${sub}`,
     closing ? `closing: ${closingEmoji(closing.kind)} ${closing.text}` : "",
+    closingTiming ? timingNote(closingTiming) : "",
     model ? `model: ${model}` : "",
     effort ? `effort: ${effort}` : "",
     cwd ? `cwd: ${cwd}` : "",
@@ -700,6 +703,7 @@ function resolve(
     pid: hook?.pid,
     stale,
     closing,
+    closingTiming,
     model,
     effort,
     matchLabels,

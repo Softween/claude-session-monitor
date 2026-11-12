@@ -25,6 +25,7 @@ import { BurnTracker } from "./burnTracker";
 import { TYPED_REASON, deliverText, registerRemoteBridge, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt, type RemoteBridge } from "./remoteBridge";
 import { runTool } from "./remote";
 import { sanitizeRemoteLine } from "./remoteInput";
+import { backgroundByDue, fmtClock, timingNote } from "./closingBuckets";
 import { resolveClaudeBinary } from "./claudeBinary";
 import { sendToSession } from "./peerSend";
 import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, type ActiveCandidate } from "./activeAccount";
@@ -285,6 +286,8 @@ interface SessionRow {
   stale: boolean; // "working" but silent — warning tint on the state dot
   closing: "" | ClosingKind; // "your turn" closing status line, replaces the dot ("" when none)
   closingText: string; // text after the closing emoji ("" when none)
+  due: string; // ⏳ finish clock, e.g. "06:15" ("" when none)
+  late: string; // ⏳ past its finish time: the warning ("" when on time)
   ended: boolean;
   canTranscript: boolean;
   canKill: boolean;
@@ -371,6 +374,7 @@ function sessionsHtml(): string {
   .dot { grid-row:1; justify-self:center; width:7px; height:7px; border-radius:50%; }
   .dot.stale { box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-charts-yellow, #e6b800) 35%, transparent); }
   .mark { grid-row:1; justify-self:center; font-size:11px; line-height:1; }
+  .mark.late { border-radius:50%; box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-charts-red, #f14c4c) 60%, transparent); }
   .title { grid-row:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .right { grid-row:1; display:flex; align-items:center; gap:2px; color: var(--vscode-descriptionForeground); }
   .meta { font-size:11px; color: var(--vscode-descriptionForeground); }
@@ -399,6 +403,7 @@ const GCOLOR = {
   limited: 'var(--vscode-charts-red, #f14c4c)',
   waiting: 'var(--vscode-charts-yellow, #e6b800)',
   done: 'var(--vscode-charts-blue, #3794ff)',
+  background: 'var(--vscode-charts-purple, #b180d7)',
   working: 'var(--vscode-charts-green, #4caf50)',
   ended: 'var(--vscode-disabledForeground, #888)',
   unknown: 'var(--vscode-disabledForeground, #888)'
@@ -422,7 +427,9 @@ function fmtAge(ms){
 function fmtMb(mb){ return mb >= 1024 ? (mb/1024).toFixed(1)+'GB' : mb+'MB'; }
 function metaLine(r){
   const bits = [];
-  const extra = [r.sub, r.reset ? ('reset '+r.reset) : ''].filter(Boolean).join(' · ');
+  const due = r.due ? 'bitiş '+r.due : '';
+  if(r.late) bits.push('<span class="hot">'+esc(due ? 'late · '+due : 'late')+'</span>');
+  const extra = [r.late ? '' : due, r.sub, r.reset ? ('reset '+r.reset) : ''].filter(Boolean).join(' · ');
   if(extra) bits.push('<span class="sub">'+esc(extra)+'</span>');
   if(r.model) bits.push(esc(r.model)+(r.effort?' · '+esc(r.effort):''));
   else bits.push(esc(r.providerLabel));
@@ -441,7 +448,7 @@ function rowHtml(r, gkey){
             : (r.canResume?'<button class="act" data-act="resume" title="Resume in terminal" aria-label="Resume in terminal">↻</button>':'')));
   return '<div class="row'+(r.ended?' ended':'')+'" role="row" tabindex="0" data-id="'+esc(r.id)+'" title="'+esc(r.tip)+'">'
     + (r.closing
-        ? '<span class="mark" role="img" aria-label="'+MARK_LABEL[r.closing]+'" title="'+esc(MARK[r.closing]+' '+r.closingText)+'">'+MARK[r.closing]+'</span>'
+        ? '<span class="mark'+(r.late?' late':'')+'" role="img" aria-label="'+(r.late?esc(r.late):MARK_LABEL[r.closing])+'" title="'+esc((r.late?r.late+' · ':'')+MARK[r.closing]+' '+r.closingText)+'">'+MARK[r.closing]+'</span>'
         : '<span class="dot'+(r.stale?' stale':'')+'" style="background:'+GCOLOR[gkey]+'"></span>')
     + '<span class="title">'+esc(r.title)+(meta?' <span class="meta">· '+meta+'</span>':'')+'</span>'
     + '<span class="tok num">'+(r.tokens ? '<b>'+esc(r.tokens)+'</b>'+(r.share>=1?' · '+r.share+'%':'') : '')+'</span>'
@@ -4288,10 +4295,12 @@ function updateStatusBar(
   const counts = countBuckets(views);
   let waiting = 0;
   let done = 0;
+  let background = 0;
   for (const v of views) {
     const g = groupOf(v);
     if (g === "waiting") waiting++;
     else if (g === "done") done++;
+    else if (g === "background") background++;
   }
   const segs: string[] = [];
   if (counts.working) segs.push(`$(sync) ${counts.working}`);
@@ -4321,7 +4330,7 @@ function updateStatusBar(
     (account ? `\nClaude account: ${account.email} (active)` : "") +
     (usage?.gauges.length ? `\nClaude usage: ${usage.gauges.map((g) => `${g.label} ${Math.round(g.pct)}%`).join(" · ")}` : "");
   const providers = countProviders(views);
-  item.tooltip = `Agent sessions\nClaude: ${providers.claude} · Codex: ${providers.codex}\nworking: ${counts.working}\nwaiting: ${waiting}\nyour turn: ${done}\nlimited: ${counts.limited}${resLine}${usageLine}\n(click to open the panel)`;
+  item.tooltip = `Agent sessions\nClaude: ${providers.claude} · Codex: ${providers.codex}\nworking: ${counts.working}\nwaiting: ${waiting}\nyour turn: ${done}${background ? `\nin background: ${background}` : ""}\nlimited: ${counts.limited}${resLine}${usageLine}\n(click to open the panel)`;
 
   if (counts.limited > 0) {
     item.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
@@ -4352,7 +4361,8 @@ function buildSessionsPayload(
   let anyRes = false;
   const tokOf = (v: SessionView): number =>
     v.tokens ?? (v.provider === "claude" ? (tokens?.bySession5h?.[v.sessionId] ?? 0) : 0);
-  for (const v of sortByTokens(views, tokOf)) {
+  // In background lists the soonest finish time first; the other groups keep the token order.
+  for (const v of backgroundByDue(sortByTokens(views, tokOf))) {
     const g = groupOf(v);
     const res = freshRes(v, resCache);
     if (res) {
@@ -4394,8 +4404,10 @@ function buildSessionsPayload(
       rssMb: res ? res.rssMb : null,
       cpuHog: !!res && res.cpu >= cpuHogThreshold,
       stale: g === "working" && v.stale,
-      closing: g === "done" && v.closing ? v.closing.kind : "",
-      closingText: g === "done" && v.closing ? v.closing.text : "",
+      closing: (g === "done" || g === "background") && v.closing ? v.closing.kind : "",
+      closingText: (g === "done" || g === "background") && v.closing ? v.closing.text : "",
+      due: v.closingTiming?.dueMs != null ? fmtClock(v.closingTiming.dueMs) : "",
+      late: v.closingTiming?.overdue ? timingNote(v.closingTiming) : "",
       ended: g === "ended",
       canTranscript: v.capabilities.transcript,
       canKill: v.capabilities.kill,

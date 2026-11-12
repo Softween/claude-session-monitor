@@ -193,7 +193,7 @@ All settings are under `claudeSessionMonitor.*`:
 | `notifyOnWaiting` | `true` | Notify when a session starts waiting for you |
 | `notifyOnLimited` | `true` | Notify when a session hits a limit |
 | `notifyOnDone` | `false` | Notify when a session finishes its turn |
-| `closingStatusMarkers` | `false` | On a Your turn row, show ✅ / ⏳ / 🟡 instead of the dot when the final reply ends with a line starting with that marker (done, waiting on a background job, needs your decision). Turn on only if your assistant is told to end every turn with such a line |
+| `closingStatusMarkers` | `false` | On a Your turn row, show ✅ / ⏳ / 🟡 instead of the dot when the final reply ends with a line starting with that marker (done, waiting on a background job, needs your decision). A ⏳ row moves to an **In background** group right after Your turn, soonest finish first (finish time read from `bitiş ~HH:MM`, also `finish` / `due`), and returns to Your turn flagged late 5 min past that time, or after 90 min idle without one. Turn on only if your assistant is told to end every turn with such a line |
 | `nativeNotifications` | `true` | Native macOS notification on limit/waiting |
 | `stuckAlertMinutes` | `5` | Alert when a working session is silent this long (0 = off) |
 | `cpuHogThreshold` | `60` | CPU% above which a session is flagged 🔥 |

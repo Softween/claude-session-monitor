@@ -18,6 +18,7 @@ export type FleetBucket = "waiting" | "yourTurn" | "working" | "idle" | "limited
  *   limited -> limited     (session / API limit hit)
  *   waiting -> waiting     (permission prompt or question: "Waiting for you")
  *   done    -> yourTurn    (turn finished: "Your turn")
+ *   background -> yourTurn (an on-time ⏳ row: "In background"; marked by the optional `background` field)
  *   working -> working
  *   ended   -> ended
  *   unknown -> idle        (no hook state and no conversation signal yet)
@@ -26,6 +27,7 @@ export const BUCKET_MAP: Record<GroupKey, FleetBucket> = {
   limited: "limited",
   waiting: "waiting",
   done: "yourTurn",
+  background: "yourTurn",
   working: "working",
   ended: "ended",
   unknown: "idle",
@@ -62,6 +64,8 @@ export interface FleetSession {
   canResume: boolean;
   tokens: { ctxPct: number | null; total: number | null } | null;
   account: string | null;
+  /** Only on an "In background" row: its ⏳ finish time (epoch seconds, null when the line names none). */
+  background?: { dueTs: number | null };
 }
 
 export interface FleetAccount {
@@ -150,7 +154,8 @@ export function redactSecrets(s: string): string {
 }
 
 function sessionOf(v: SessionView, nowSec: number, activeEmail: string | null): FleetSession {
-  const bucket = BUCKET_MAP[groupOf(v)];
+  const group = groupOf(v);
+  const bucket = BUCKET_MAP[group];
   // The row keeps no assistant reply text; the most recent human-readable line it has
   // is the hook notification, then the closing status line, then the status detail.
   const text = v.notifMessage || v.closing?.text || v.detail || "";
@@ -173,6 +178,9 @@ function sessionOf(v: SessionView, nowSec: number, activeEmail: string | null): 
     tokens: typeof v.tokens === "number" ? { ctxPct: null, total: v.tokens } : null,
     // Running Claude sessions follow the machine's active login at their next token refresh.
     account: v.provider === "claude" ? activeEmail : null,
+    ...(group === "background"
+      ? { background: { dueTs: v.closingTiming?.dueMs != null ? Math.floor(v.closingTiming.dueMs / 1000) : null } }
+      : {}),
   };
 }
 

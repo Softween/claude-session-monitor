@@ -13,6 +13,9 @@ import { groupOf, type GroupKey } from "./view";
 
 export type FleetBucket = "waiting" | "yourTurn" | "working" | "idle" | "limited" | "ended";
 
+/** Why a waiting / yourTurn row waits (waitReasonOf). */
+export type WaitReason = "question" | "permission" | "idle";
+
 /**
  * Panel group (view.ts GroupKey) -> contract bucket:
  *   limited -> limited     (session / API limit hit)
@@ -66,6 +69,8 @@ export interface FleetSession {
   account: string | null;
   /** Only on an "In background" row: its ⏳ finish time (epoch seconds, null when the line names none). */
   background?: { dueTs: number | null };
+  /** waiting / yourTurn rows only (waitReasonOf), null on every other row. */
+  waitReason: WaitReason | null;
 }
 
 export interface FleetAccount {
@@ -153,6 +158,17 @@ export function redactSecrets(s: string): string {
   return out.replace(BASE64_RUN, (m) => (/\d/.test(m) && /[a-z]/.test(m) && /[A-Z]/.test(m) ? "[redacted]" : m));
 }
 
+/**
+ * Why a waiting or yourTurn row waits: `question` while the newest transcript tool_use is
+ * AskUserQuestion without a result, `permission` while the newest signal is a permission_prompt
+ * notification, `idle` otherwise (a finished turn, the 60 s idle notification). null on other buckets.
+ */
+export function waitReasonOf(v: SessionView, bucket: FleetBucket): WaitReason | null {
+  if (bucket !== "waiting" && bucket !== "yourTurn") return null;
+  if (v.askPending) return "question";
+  return v.notifType === "permission_prompt" ? "permission" : "idle";
+}
+
 function sessionOf(v: SessionView, nowSec: number, activeEmail: string | null): FleetSession {
   const group = groupOf(v);
   const bucket = BUCKET_MAP[group];
@@ -181,6 +197,7 @@ function sessionOf(v: SessionView, nowSec: number, activeEmail: string | null): 
     ...(group === "background"
       ? { background: { dueTs: v.closingTiming?.dueMs != null ? Math.floor(v.closingTiming.dueMs / 1000) : null } }
       : {}),
+    waitReason: waitReasonOf(v, bucket),
   };
 }
 

@@ -65,6 +65,10 @@ export interface SessionView {
   tokens?: number;
   tokenScope?: "rolling-5h" | "thread-total";
   matchLabels: string[];
+  /** The newest transcript tool_use is AskUserQuestion and no tool_result answered it yet. */
+  askPending?: boolean;
+  /** notification_type of the hook's Notification event while that event is the session's newest signal. */
+  notifType?: string;
 }
 
 export interface ProviderGauge {

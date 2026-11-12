@@ -119,6 +119,51 @@ describe("humanizeAge", () => {
 
 // --- parseTranscriptTail ----------------------------------------------------
 
+describe("pending AskUserQuestion (askPending) and the notification type (notifType)", () => {
+  const ask = (id: string, sec: number, name = "AskUserQuestion") => ({
+    type: "assistant",
+    entrypoint: "claude-vscode",
+    cwd: "/repo",
+    message: { content: [{ type: "text", text: "one question" }, { type: "tool_use", id, name, input: {} }], stop_reason: "tool_use" },
+    timestamp: iso(sec),
+  });
+  const answer = (id: string, sec: number) => ({
+    type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: id, content: "answered" }] },
+    timestamp: iso(sec),
+  });
+
+  it("is set while the newest tool_use is AskUserQuestion without a result", () => {
+    const pending = writeTranscript("p.jsonl", [answer("old", NOW - 30), ask("q1", NOW - 20), { type: "attachment", timestamp: iso(NOW - 19) }]);
+    expect(parseTranscriptTail(pending).askPending).toBe(true);
+    const answered = writeTranscript("a.jsonl", [ask("q1", NOW - 20), answer("q1", NOW - 10)]);
+    expect(parseTranscriptTail(answered).askPending).toBeUndefined();
+    const otherTool = writeTranscript("o.jsonl", [ask("q1", NOW - 20), ask("b1", NOW - 15, "Bash")]);
+    expect(parseTranscriptTail(otherTool).askPending).toBeUndefined();
+    const unrelated = writeTranscript("u.jsonl", [ask("q1", NOW - 20), answer("someone-else", NOW - 10)]);
+    expect(parseTranscriptTail(unrelated).askPending).toBe(true);
+  });
+
+  it("reaches the row, with the notification type only while the Notification is the newest signal", () => {
+    const pending = writeTranscript("p.jsonl", [ask("q1", NOW - 20)]);
+    const done = writeTranscript("d.jsonl", [
+      { type: "assistant", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "ok" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 5) },
+    ]);
+    const hooks = new Map<string, HookStatus>([
+      ["q", { session_id: "q", state: "waiting", event: "Notification", notif_type: "permission_prompt", ts: NOW - 14, transcript_path: pending }],
+      ["p", { session_id: "p", state: "waiting", event: "Notification", notif_type: "permission_prompt", ts: NOW - 4, transcript_path: done }],
+      ["old", { session_id: "old", state: "waiting", event: "Notification", notif_type: "permission_prompt", ts: NOW - 30, transcript_path: done }],
+      ["s", { session_id: "s", state: "idle", event: "Stop", ts: NOW - 4, transcript_path: done }],
+    ]);
+    const views = collectSessions({ now: NOW, hookStatuses: hooks, maxAgeSec: 3600, pidAlive: () => true });
+    const by = (id: string) => views.find((v) => v.sessionId === id)!;
+    expect([by("q").askPending, by("q").notifType, by("q").sub]).toEqual([true, "permission_prompt", "waiting for you"]);
+    expect([by("p").askPending, by("p").notifType]).toEqual([undefined, "permission_prompt"]);
+    expect(by("old").notifType).toBeUndefined(); // the end_turn line is newer than the notification
+    expect(by("s").notifType).toBeUndefined();
+  });
+});
+
 describe("parseTranscriptTail", () => {
   it("extracts title, entrypoint, cwd, and end_turn state (ignoring trailing meta)", () => {
     const p = writeTranscript("s1.jsonl", [

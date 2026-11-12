@@ -97,6 +97,20 @@ describe("scripts/hook.py provider routing", () => {
     expect(read("codex", "codex-session")).not.toHaveProperty("prompt");
   });
 
+  it("records a Notification's notification_type as notif_type", () => {
+    run(
+      {
+        session_id: "notif-session",
+        cwd: "/workspace",
+        transcript_path: `${tmp}/.claude/projects/notif.jsonl`,
+        message: "Claude needs your permission to use Bash",
+        notification_type: "permission_prompt",
+      },
+      "Notification",
+    );
+    expect(read("claude", "notif-session")).toMatchObject({ state: "waiting", notif_type: "permission_prompt" });
+  });
+
   it("uses hook_event_name when no argv event is provided and recognizes Codex model metadata", () => {
     run({
       session_id: "codex-payload-event",

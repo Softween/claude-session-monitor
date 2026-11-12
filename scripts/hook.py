@@ -180,7 +180,8 @@ def main() -> None:
         msg = data.get("message")
         if isinstance(msg, str):
             record["message"] = msg[:300]
-        record["notif_type"] = data.get("type")
+        # Claude Code names the field notification_type (permission_prompt, idle_prompt, ...).
+        record["notif_type"] = data.get("notification_type") or data.get("type")
     elif event == "PermissionRequest":
         tool = data.get("tool_name")
         if isinstance(tool, str):

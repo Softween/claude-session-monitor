@@ -78,6 +78,7 @@ export interface TxInfo {
   model?: string; // model id of the newest assistant line (message.model)
   effort?: string; // reasoning effort of the newest real assistant line (top-level `effort`)
   closing?: ClosingStatus; // closing status line of the newest end_turn text
+  askPending?: boolean; // the newest tool_use is AskUserQuestion and no tool_result answered it yet
 }
 
 export const BUCKET_ORDER: Record<Bucket, number> = {
@@ -341,6 +342,7 @@ function parseWindow(file: string, stat: fs.Stats, maxBytes: number): TxInfo {
 
   const lines = text.split("\n");
   if (partialFirst && lines.length) lines.shift(); // drop incomplete leading line
+  let lastUse: { id: unknown; name: unknown; answered: boolean } | undefined; // newest tool_use block
 
   for (const ln of lines) {
     const s = ln.trim();
@@ -352,6 +354,12 @@ function parseWindow(file: string, stat: fs.Stats, maxBytes: number): TxInfo {
       continue;
     }
     const type = obj.type;
+    const blocks = Array.isArray(obj.message?.content) ? obj.message.content : [];
+    if (type === "assistant") {
+      for (const b of blocks) if (b?.type === "tool_use") lastUse = { id: b.id, name: b.name, answered: false };
+    } else if (type === "user" && lastUse && !lastUse.answered) {
+      lastUse.answered = blocks.some((b: any) => b?.type === "tool_result" && b.tool_use_id === lastUse!.id);
+    }
 
     if (type === "ai-title" && typeof obj.aiTitle === "string" && obj.aiTitle.trim()) {
       info.title = obj.aiTitle.trim();
@@ -401,6 +409,7 @@ function parseWindow(file: string, stat: fs.Stats, maxBytes: number): TxInfo {
     }
   }
 
+  if (lastUse?.name === "AskUserQuestion" && !lastUse.answered) info.askPending = true;
   return info;
 }
 
@@ -707,6 +716,8 @@ function resolve(
     model,
     effort,
     matchLabels,
+    ...(tx?.askPending ? { askPending: true } : {}),
+    ...(hook?.event === "Notification" && hookTs >= convTs && hook.notif_type ? { notifType: hook.notif_type } : {}),
   };
 }
 

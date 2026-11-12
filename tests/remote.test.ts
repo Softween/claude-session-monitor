@@ -125,7 +125,30 @@ describe("buildSnapshot", () => {
       canResume: true,
       tokens: { ctxPct: null, total: 1234 },
       account: "a@example.com",
+      waitReason: null,
     });
+  });
+
+  it("gives waiting and yourTurn rows a waitReason: question, permission, else idle; null elsewhere", () => {
+    const waiting = { bucket: "attention", sub: "waiting for you" } as const;
+    const yourTurn = { bucket: "attention", sub: "your turn" } as const;
+    const cases: [Partial<SessionView>, string | null][] = [
+      [{ ...waiting, askPending: true, notifType: "permission_prompt" }, "question"],
+      [{ ...waiting, notifType: "permission_prompt" }, "permission"],
+      [{ ...waiting, notifType: "idle_prompt" }, "idle"],
+      [{ ...waiting }, "idle"],
+      [{ ...yourTurn }, "idle"],
+      [{ ...yourTurn, askPending: true }, "question"],
+      [{ ...yourTurn, closing: { kind: "pending", text: "CI · bitiş ~06:15" }, closingTiming: { dueMs: 1, overdue: false } }, "idle"],
+      [{ bucket: "working", askPending: true }, null],
+      [{ bucket: "limited", notifType: "permission_prompt" }, null],
+      [{ bucket: "ended" }, null],
+      [{ bucket: "unknown" }, null],
+    ];
+    for (const [over, want] of cases) {
+      const b = buildSnapshot({ host: "mac", rows: [row(over)], accounts, machine, now: 1 });
+      expect([over, b.sessions[0].waitReason]).toEqual([over, want]);
+    }
   });
 
   it("adds limit info only to limited rows and no account to codex rows", () => {

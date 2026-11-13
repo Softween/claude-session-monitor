@@ -12,6 +12,7 @@ import {
   collectSessions,
   isPhantom,
   pidAlive,
+  readHookStatuses,
   cleanupEndedMonitorFiles,
   readEffortSettings,
   effectiveEffort,
@@ -1419,6 +1420,61 @@ describe("phantom hook records", () => {
     expect(fs.existsSync(path.join(tmp, "phantom.json"))).toBe(false);
     expect(fs.existsSync(path.join(tmp, "live.json"))).toBe(true);
     expect(fs.existsSync(path.join(tmp, "withtx.json"))).toBe(true);
+  });
+});
+
+// --- a remote new session before its first prompt ---------------------------
+
+describe("a remote new session before its first prompt", () => {
+  const NOW_S = 1_800_000_000;
+  const sid = "63f908d4-1308-4f5f-a58e-2d5badd0c438";
+  const record = (over: Partial<HookStatus> = {}): HookStatus =>
+    ({
+      session_id: sid,
+      provider: "claude",
+      state: "idle",
+      event: "SessionStart",
+      source: "startup",
+      ts: NOW_S - 30,
+      cwd: "/Users/x/REPOS",
+      transcript_path: path.join(tmp, `${sid}.jsonl`), // written on the first prompt
+      pid: 4242,
+      ...over,
+    }) as HookStatus;
+  // This window started the session's terminal (resumeRegistry livePids).
+  const collect = (hooks: Map<string, HookStatus>, alive: boolean) =>
+    collectSessions({
+      now: NOW_S,
+      hookStatuses: hooks,
+      extraTranscripts: [],
+      effortSettings: { level: "high" },
+      pidAlive: () => alive,
+      resumePids: new Map([[sid, 4242]]),
+    });
+
+  it("is listed from its hook record; a status-line payload with its id is no record", () => {
+    const dir = path.join(tmp, "monitor");
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, `${sid}.json`), JSON.stringify(record()));
+    // statusline.sh saves every render's payload: the session id, but no state, time or pid.
+    fs.writeFileSync(
+      path.join(dir, "statusline-last-raw.json"),
+      JSON.stringify({ session_id: sid, transcript_path: record().transcript_path, cwd: "/Users/x/REPOS", model: { id: "claude-opus-5-5" } }),
+    );
+    fs.writeFileSync(path.join(dir, "tabs-debug.json"), JSON.stringify({ session_id: "other-session" }));
+    const hooks = readHookStatuses(dir);
+    expect([...hooks.keys()]).toEqual([sid]);
+    expect(hooks.get(sid)).toMatchObject({ state: "idle", ts: NOW_S - 30, pid: 4242 });
+    const views = collect(hooks, true);
+    expect(views).toHaveLength(1);
+    expect(views[0]).toMatchObject({ sessionId: sid, bucket: "attention", sub: "your turn", title: "session 63f908d4", pid: 4242 });
+    expect(groupOf(views[0])).toBe("done"); // the remote snapshot's yourTurn
+  });
+
+  it("stays listed past the 10-minute phantom grace while its process runs, and goes once it ends", () => {
+    const hooks = new Map([[sid, record({ ts: NOW_S - 1200 })]]);
+    expect(collect(hooks, true).map((v) => v.sessionId)).toEqual([sid]);
+    expect(collect(hooks, false)).toHaveLength(0);
   });
 });
 

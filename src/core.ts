@@ -108,7 +108,9 @@ export function readHookStatuses(dir = MONITOR_DIR): Map<string, HookStatus> {
       const obj = JSON.parse(raw) as HookStatus;
       const transcript = typeof obj?.transcript_path === "string" ? obj.transcript_path : "";
       const belongsToCodex = obj?.provider === "codex" || /[/\\]\.codex[/\\]/.test(transcript);
-      if (obj && obj.session_id && !belongsToCodex) {
+      // hook.py names a record `<session_id>.json`. Other files here may carry a
+      // session id too (statusline.sh's statusline-last-raw.json) but are no record.
+      if (obj && obj.session_id && f === `${obj.session_id}.json` && !belongsToCodex) {
         map.set(obj.session_id, { ...obj, provider: "claude" });
       }
     } catch {
@@ -922,13 +924,16 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
     }
     const hook = hooks.get(sid);
     const hasTranscript = !!(txPath && fs.existsSync(txPath));
+    // A session this window started in a terminal (a remote new session waiting for
+    // its first prompt) is no probe and no phantom while that terminal's process runs.
+    const resumedPid = opts.resumePids?.get(sid);
+    const ownRunning = resumedPid !== undefined && (opts.pidAlive ?? pidAlive)(resumedPid) === true;
 
     // Drop phantom hook records (account-switch tab bursts that never got a transcript).
-    if (hook && !hasTranscript && isPhantom(hook, now, { graceSec: opts.phantomGraceSec, alive: opts.pidAlive }))
+    if (hook && !hasTranscript && !ownRunning && isPhantom(hook, now, { graceSec: opts.phantomGraceSec, alive: opts.pidAlive }))
       continue;
-    // Hold back a just-started session without a transcript (see isUnsettledStart),
-    // except one this window started itself (a remote new session): it is no probe.
-    if (hook && !hasTranscript && !opts.resumePids?.has(sid) && isUnsettledStart(hook, now, { alive: opts.pidAlive })) continue;
+    // Hold back a just-started session without a transcript (see isUnsettledStart).
+    if (hook && !hasTranscript && !ownRunning && isUnsettledStart(hook, now, { alive: opts.pidAlive })) continue;
 
     // Filter out observer / SDK-subagent sessions.
     if (!entrypointAllowed(tx?.entrypoint, allowed)) continue;
@@ -937,7 +942,6 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
 
     // A session this window resumed in a terminal runs there even when its hook
     // record has no pid and still says "ended" (no hook event since the resume).
-    const resumedPid = opts.resumePids?.get(sid);
     const status =
       hook && hook.pid === undefined && resumedPid
         ? { ...hook, pid: resumedPid, state: hook.state === "ended" ? "idle" : hook.state }

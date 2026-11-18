@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.37.0",
+  "version": "2.38.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -462,6 +462,12 @@
           "default": false,
           "scope": "application",
           "markdownDescription": "After VS Code restarts, start the process of restored Claude Code tabs whose session had stopped on a usage limit (its last reply is a 429 API error from the last 24 hours), so the paths that resume running sessions reach them too. A restored tab gets its process only once it is shown, so the monitor briefly activates each such tab (one per step, 60 s after the window starts, then every 30 s while you are idle, at least 10 s apart), waits for its process and puts your tabs and focus back. Nothing is typed or sent into a session. Relies on the Claude Code extension's internal `claude-vscode.editor.open` command; after two failed wakes in a row it stops until the window starts again. **Agent Sessions: Wake limit-stopped tabs now** runs it at once."
+        },
+        "claudeSessionMonitor.continuityChannel": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "markdownDescription": "Show the dormant Claude Code tabs that the `continuity` daemon asks this window for, so their process runs again. After VS Code restarts, a restored Claude Code tab gets its process only once it is shown; the daemon (part of the `~/.claude` tooling, not of this extension) decides which of them are owed a resume and in which order, and writes requests to `~/.claude/state/continuity/requests.json`. Every 10 s the monitor reads the ones addressed to this window and, from 60 s after the window starts, makes each session's existing tab (the Claude Code tab whose label is the request's title) the active tab of its group, waits for the process and puts your tabs and focus back unless you moved or are typing in the meantime. It never creates a tab: a request whose tab is gone gets `no-tab`. One tab per step, at least 10 s apart, only while this window is unfocused or input has been idle for 20 s and not under critical memory pressure, ahead of the limit-stopped tabs of `wakeDeadTabs`; at most two tries per request. A heartbeat with each result goes to `~/.claude/state/continuity/ext/`. Nothing is typed or sent into a session. Independent of `wakeDeadTabs`; without the daemon nothing is shown."
         },
         "claudeSessionMonitor.restartGuard": {
           "type": "boolean",

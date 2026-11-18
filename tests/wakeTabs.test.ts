@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
+import { ContinuityServer, readText, writeTextAtomic } from "../src/continuity";
 import { lastAssistantStop } from "../src/core";
 import {
   OPEN_COMMAND,
@@ -365,5 +366,99 @@ describe("machine probes and the command message", () => {
       "Agent Sessions: woke 0 limit-stopped tabs, 2 failed, stopped after two failed wakes in a row, 1 still pending.",
     );
     expect(summaryText({ result: "off", woken: 0, failed: 0, pending: 0 })).toContain("claudeSessionMonitor.wakeDeadTabs");
+  });
+});
+
+describe("continuity requests (continuity.ts)", () => {
+  const STORAGE = "/ws/storage";
+  const SID = "0b563428-5f1e-4c7a-9d2b-3e4f5a6b7c8d";
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "csm-wake-continuity-"));
+    const r1 = { id: "r1", sid: SID, storage: STORAGE, title: "Fix the build", action: "open", ts: NOW / 1000, expires: NOW / 1000 + 900 };
+    fs.writeFileSync(path.join(dir, "requests.json"), JSON.stringify({ v: 1, ts: NOW / 1000, requests: [r1] }));
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  /** The waker and a continuity server wired as extension.ts wires them; the request's tab gets its process 3 s after it is shown. */
+  function wired(wakeOn: boolean) {
+    const timeline: string[] = [];
+    const at = () => ((Date.now() - NOW) / 1000).toFixed(1);
+    let server: ContinuityServer<string, string> | undefined;
+    const h = harness({ enabled: () => wakeOn, yieldTo: () => server?.pending() === true }, { [REGISTRY_KEY]: [reg("a")] });
+    const wake = h.executeCommand.getMockImplementation();
+    h.executeCommand.mockImplementation(async (id: string, ...args: unknown[]) => {
+      timeline.push(`${at()} wake ${String(args[0])}`);
+      await wake?.(id, ...args);
+    });
+    let active = "editor";
+    server = new ContinuityServer<string, string>({
+      enabled: () => true,
+      storage: STORAGE,
+      version: "2.38.0",
+      pid: 1,
+      dir,
+      now: () => Date.now(),
+      log: (m) => {
+        if (m.includes(", request ")) timeline.push(`${at()} ${m}`);
+      },
+      read: readText,
+      write: writeTextAtomic,
+      liveSessions: () => h.state.live,
+      windowFocused: () => false,
+      idleMs: async () => 60_000,
+      pressureLevel: async () => 1,
+      othersBusy: () => h.waker.isBusy(),
+      tabs: () =>
+        ["editor", "c1"].map((tab) => ({ group: "g0", tab, label: tab === "c1" ? "Fix the build" : "notes.md", claude: tab === "c1", active: active === tab })),
+      activeGroup: () => "g0",
+      activeTabOf: () => active,
+      reveal: async (_group, tab) => {
+        active = tab;
+        if (tab !== "c1") return;
+        timeline.push(`${at()} show c1`);
+        setTimeout(() => h.state.live.push({ sessionId: SID, pid: 7 }), 3_000);
+      },
+      focusGroup: async () => undefined,
+    });
+    return { h, server, timeline };
+  }
+
+  it("a request and a limit-stopped tab both due: the request goes first, the wake follows in a later step", async () => {
+    const { h, server, timeline } = wired(true);
+    h.waker.start(); // a is limit-stopped: its first sweep runs at 60 s, the request's first step too
+    await vi.advanceTimersByTimeAsync(58_500);
+    for (let t = 0; t < 30; t++) {
+      server.observe();
+      h.waker.observe();
+      await vi.advanceTimersByTimeAsync(1_500);
+    }
+    expect(timeline).toEqual(["60.0 show c1", "63.0 continuity: 0b563428 opened after 3.0s pid=7, try 1/2, request r1", "90.0 wake a"]);
+    expect(h.logs).toContain("wake: postponed (continuity request first), 1 pending");
+    expect(JSON.stringify(h.writes)).not.toContain(SID); // never in csm.wake.pending or csm.wake.registry
+  });
+
+  it("a request is served with wakeDeadTabs off; the waker reads and writes nothing", async () => {
+    const { h, server, timeline } = wired(false);
+    h.waker.start();
+    for (let t = 0; t < 43; t++) {
+      server.observe();
+      await vi.advanceTimersByTimeAsync(1_500);
+    }
+    expect(timeline).toEqual(["60.0 show c1", "63.0 continuity: 0b563428 opened after 3.0s pid=7, try 1/2, request r1"]);
+    expect(h.writes).toEqual([]);
+    expect(h.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("the waker postpones its wake while a request is served or waits", async () => {
+    let first = true;
+    const h = harness({ yieldTo: () => first }, { [REGISTRY_KEY]: [reg("a")] });
+    h.waker.start();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.executeCommand).not.toHaveBeenCalled();
+    expect(h.logs).toContain("wake: postponed (continuity request first), 1 pending");
+    first = false;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(h.executeCommand).toHaveBeenCalledTimes(1);
   });
 });

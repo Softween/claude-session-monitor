@@ -11,6 +11,8 @@
  * entry is a 429 API error at most 24 h old become pending; a sweep shows them one
  * at a time through Claude Code's `claude-vscode.editor.open`, waits for the
  * process, then puts the tabs and focus back. Nothing is ever sent to a session.
+ * A continuity request (continuity.ts) goes first: no tab is woken while one is
+ * served or waits.
  *
  * No `vscode` import: extension.ts injects the editor side (WakeDeps).
  */
@@ -29,13 +31,13 @@ export const PENDING_KEY = "csm.wake.pending";
 const OBSERVE_EVERY_MS = 10_000; // registry cadence (refresh runs every 1.5 s and on transcript writes)
 const DROP_AFTER_MISSES = 2; // a session leaves the registry after 2 observations without it...
 const DROP_AFTER_MS = 60_000; // ...and 60 s, so the mass exit at shutdown never empties it
-const FIRST_SWEEP_MS = 60_000;
+export const FIRST_SWEEP_MS = 60_000;
 const SWEEP_EVERY_MS = 30_000;
-const MIN_GAP_MS = 10_000; // between two wakes
-const IDLE_MIN_MS = 20_000;
-const PRESSURE_CRITICAL = 4; // kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical
-const WAIT_LIVE_MS = 20_000;
-const POLL_MS = 500;
+export const MIN_GAP_MS = 10_000; // between two wakes
+export const IDLE_MIN_MS = 20_000;
+export const PRESSURE_CRITICAL = 4; // kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical
+export const WAIT_LIVE_MS = 20_000;
+export const POLL_MS = 500;
 const MAX_ATTEMPTS = 2; // failed wakes per session
 const MAX_FAILS_IN_ROW = 2; // then the sweep stops until the next activation
 const STOP_MAX_AGE_MS = 24 * 3600_000;
@@ -87,6 +89,7 @@ export interface WakeDeps<M> {
   snapshotTabs(): M; // each group's active tab and the active group
   activeTab(): unknown;
   restoreTabs(snapshot: M): Promise<void>;
+  yieldTo?(): boolean; // a continuity request (continuity.ts) is served or waits: it goes first
 }
 
 export type StepResult = "off" | "stopped" | "empty" | "postponed" | "woken" | "failed";
@@ -267,6 +270,11 @@ export class TabWaker<M> {
     this.timer = undefined;
   }
 
+  /** A sweep step or wakeDeadTabsNow is running (continuity.ts waits for it). */
+  isBusy(): boolean {
+    return this.busy;
+  }
+
   private on(): boolean {
     return !this.disposed && this.deps.enabled();
   }
@@ -348,6 +356,7 @@ export class TabWaker<M> {
     const level = await this.deps.pressureLevel();
     if (level !== undefined && level >= PRESSURE_CRITICAL) return `memory pressure ${level}`;
     if (!(await this.deps.commandExists(OPEN_COMMAND))) return `no ${OPEN_COMMAND} command`;
+    if (this.deps.yieldTo?.()) return "continuity request first"; // last: nothing awaits between it and the wake
     return undefined;
   }
 

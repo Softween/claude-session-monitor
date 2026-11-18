@@ -38,6 +38,7 @@ import { allowedCwds, mergeSeen, withoutPaths } from "./remoteCwds";
 import { startNewSession } from "./remoteNewSession";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import { TabWaker, nodeProbes, summaryText } from "./wakeTabs";
+import { ContinuityServer, continuityDir, focusBySlot, readText, storageDir, writeTextAtomic } from "./continuity";
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
 import { submitAnswer } from "./answers";
 import { activateRestartGuard } from "./restartGuard";
@@ -1986,6 +1987,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastAllViews: SessionView[] = [];
   let remoteBridge: RemoteBridge | undefined; // optional remote bridge (remoteBridge.ts), off unless url + token are set
   let tabWaker: TabWaker<TabMemo> | undefined; // wakeTabs.ts, inert unless claudeSessionMonitor.wakeDeadTabs is on
+  let continuity: ContinuityServer<vscode.TabGroup, vscode.Tab> | undefined; // continuity.ts, inert unless claudeSessionMonitor.continuityChannel is on
   let lastRecentScan = 0;
   let lastCleanup = 0;
   let lastResourceSample = 0;
@@ -3291,6 +3293,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     remoteBridge?.onRows(allViews);
 
     maybeScheduleAutoResume(allViews);
+    continuity?.observe();
     tabWaker?.observe();
 
     // Idle RAM advisory: waiting/your-turn sessions silent >1h holding real memory.
@@ -4211,8 +4214,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   // After a restart, show each limit-stopped Claude Code tab once so its process runs
   // again (wakeTabs.ts). Started before the first refresh, which updates its registry.
+  const probes = nodeProbes();
   tabWaker = new TabWaker<TabMemo>({
-    ...nodeProbes(),
+    ...probes,
     enabled: () => claudeEnabled() && cfg().get<boolean>("wakeDeadTabs", false) === true,
     store: ctx.workspaceState,
     log,
@@ -4225,6 +4229,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     snapshotTabs,
     activeTab: () => vscode.window.tabGroups.activeTabGroup.activeTab,
     restoreTabs,
+    yieldTo: () => continuity?.pending() === true,
   });
   tabWaker.start();
   ctx.subscriptions.push(
@@ -4233,6 +4238,32 @@ export function activate(ctx: vscode.ExtensionContext): void {
       for (const t of e.closed) if (isClaudePanelTab(t)) tabWaker?.tabClosed(t.label);
     }),
   );
+
+  // Show the dormant Claude Code tabs the continuity daemon asks this window for
+  // (continuity.ts), each in its existing tab, ahead of the limit-stopped tab wakes.
+  continuity = new ContinuityServer<vscode.TabGroup, vscode.Tab>({
+    ...probes,
+    enabled: () => claudeEnabled() && cfg().get<boolean>("continuityChannel", false) === true,
+    storage: storageDir(ctx.storageUri?.fsPath),
+    version: (ctx.extension?.packageJSON as { version?: string } | undefined)?.version ?? "0.0.0",
+    pid: process.pid,
+    dir: continuityDir(),
+    now: () => Date.now(),
+    log,
+    read: readText,
+    write: writeTextAtomic,
+    windowFocused,
+    othersBusy: () => tabWaker?.isBusy() === true,
+    tabs: () =>
+      vscode.window.tabGroups.all.flatMap((group) =>
+        group.tabs.map((tab) => ({ group, tab, label: tab.label, claude: isClaudePanelTab(tab), active: tab.isActive })),
+      ),
+    activeGroup: () => vscode.window.tabGroups.activeTabGroup,
+    activeTabOf: (group) => group.activeTab,
+    reveal: revealTab,
+    focusGroup: focusTabGroup,
+  });
+  ctx.subscriptions.push({ dispose: () => continuity?.dispose() });
 
   // Ask before an extension restart stops every session in this window (restartGuard.ts).
   activateRestartGuard(ctx, {
@@ -4697,6 +4728,24 @@ async function restoreTabs(memo: TabMemo): Promise<void> {
   if (ai >= 0 && ai < FOCUS_GROUP_CMDS.length && vscode.window.tabGroups.activeTabGroup !== memo.group) {
     await vscode.commands.executeCommand(FOCUS_GROUP_CMDS[ai]);
   }
+}
+
+/**
+ * Make `tab` its group's active tab and focus the group (continuity.ts): the group's
+ * screen-slot focus command, confirmed (focusTabGroup), then the openEditorAtIndex
+ * handler with the index as argument, so a tab past the ninth is reached without
+ * showing the tabs before it.
+ */
+async function revealTab(group: vscode.TabGroup, tab: vscode.Tab): Promise<void> {
+  const ti = group.tabs.indexOf(tab);
+  if (ti < 0) return; // closed meanwhile
+  await focusTabGroup(group);
+  await vscode.commands.executeCommand("workbench.action.openEditorAtIndex", ti);
+}
+
+/** Focus `group` by its screen slot (viewColumn); throws unless it became the active group. */
+function focusTabGroup(group: vscode.TabGroup): Promise<void> {
+  return focusBySlot(group, FOCUS_GROUP_CMDS, (cmd) => vscode.commands.executeCommand(cmd), () => vscode.window.tabGroups.activeTabGroup);
 }
 
 /** A Claude Code editor tab (the anthropic.claude-code `claudeVSCodePanel` webview). */

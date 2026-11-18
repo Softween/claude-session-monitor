@@ -20,3 +20,4 @@ tsconfig.json
 *.vsix
 CONTRIBUTING.md
 PUBLISHING.md
+.impeccable/**

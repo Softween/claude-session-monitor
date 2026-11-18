@@ -108,6 +108,7 @@ vi.mock("vscode", () => {
         rec.webviews.push({ id, p });
         return { dispose() {} };
       },
+      registerCustomEditorProvider: () => ({ dispose() {} }),
       createStatusBarItem: () => {
         const s: any = { text: "", tooltip: "", command: "", backgroundColor: undefined, show() {}, dispose() {} };
         rec.statusBars.push(s);
@@ -204,6 +205,7 @@ beforeEach(() => {
   fs.mkdirSync(`${HOME}/.claude/projects`, { recursive: true });
   rec.config.clear();
   rec.config.set("enableCodex", false);
+  rec.config.set("restartGuard", false); // the guard's tab flow has its own tests (restartGuard.test.ts)
 });
 afterAll(() => {
   try {

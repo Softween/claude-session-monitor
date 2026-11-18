@@ -201,6 +201,7 @@ All settings are under `claudeSessionMonitor.*`:
 | `resumePrompt` | `"resume"` | Text typed during a resume sweep |
 | `resumeStaggerSeconds` | `60` | Seconds between sessions in a resume sweep |
 | `wakeDeadTabs` | `false` | After a restart, briefly activate each restored Claude Code tab whose session stopped on a usage limit (last reply a 429 API error, at most 24 h old) so its process runs again, then restore your tabs and focus. Uses Claude Code's `claude-vscode.editor.open`; user settings only. **Wake limit-stopped tabs now** runs it at once |
+| `restartGuard` | `false` | When on, keep a small **Claude restart guard** tab (`Restart stops Claude sessions.claudeguard`) open in the first editor group. While it is open, VS Code asks **Please confirm restart of extensions.** before it restarts extensions (to apply an extension update, say), because that restart stops every Claude Code session in the window. Window reloads and VS Code restarts are not covered. When a window opens the guard tab is shown once, so VS Code loads it, and the tab you had open comes back |
 | `resourceSampleMs` | `3000` | CPU/RAM sampling interval |
 | `pollIntervalMs` | `1500` | Status refresh interval |
 | `recentScanMaxAgeHours` | `6` | Show sessions active within the last N hours |

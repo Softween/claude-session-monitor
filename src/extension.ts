@@ -40,6 +40,7 @@ import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, should
 import { TabWaker, nodeProbes, summaryText } from "./wakeTabs";
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
 import { submitAnswer } from "./answers";
+import { activateRestartGuard } from "./restartGuard";
 import {
   KIND_LABEL,
   RESET_KINDS,
@@ -4232,6 +4233,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
       for (const t of e.closed) if (isClaudePanelTab(t)) tabWaker?.tabClosed(t.label);
     }),
   );
+
+  // Ask before an extension restart stops every session in this window (restartGuard.ts).
+  activateRestartGuard(ctx, {
+    log,
+    focusGroup: (i) => (i >= 0 && i < FOCUS_GROUP_CMDS.length ? vscode.commands.executeCommand(FOCUS_GROUP_CMDS[i]) : Promise.resolve()),
+  });
 
   refresh();
 }

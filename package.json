@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.36.0",
+  "version": "2.37.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -153,6 +153,11 @@
         "command": "claudeSessionMonitor.wakeDeadTabsNow",
         "title": "Agent Sessions: Wake limit-stopped tabs now",
         "shortTitle": "Wake Limit-Stopped Tabs"
+      },
+      {
+        "command": "claudeSessionMonitor.openRestartGuard",
+        "title": "Agent Sessions: Open Claude restart guard",
+        "shortTitle": "Open Restart Guard"
       },
       {
         "command": "claudeSessionMonitor.setModelAll",
@@ -458,6 +463,11 @@
           "scope": "application",
           "markdownDescription": "After VS Code restarts, start the process of restored Claude Code tabs whose session had stopped on a usage limit (its last reply is a 429 API error from the last 24 hours), so the paths that resume running sessions reach them too. A restored tab gets its process only once it is shown, so the monitor briefly activates each such tab (one per step, 60 s after the window starts, then every 30 s while you are idle, at least 10 s apart), waits for its process and puts your tabs and focus back. Nothing is typed or sent into a session. Relies on the Claude Code extension's internal `claude-vscode.editor.open` command; after two failed wakes in a row it stops until the window starts again. **Agent Sessions: Wake limit-stopped tabs now** runs it at once."
         },
+        "claudeSessionMonitor.restartGuard": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Keep a small **Claude restart guard** tab open in the first editor group, so VS Code asks (**Please confirm restart of extensions.**) before it restarts extensions, for example to apply an extension update. Restarting extensions stops every Claude Code session in the window, because each session's process runs inside the extension host. Updates still install and take effect at the next window reload; window reloads themselves are not guarded. The tab is shown once when the window starts and your previous tab comes back right away; a tab you close stays closed until the window starts again. Off closes the tab. **Agent Sessions: Open Claude restart guard** opens it again."
+        },
         "claudeSessionMonitor.idleRamWarnMb": {
           "type": "number",
           "default": 2000,
@@ -489,6 +499,18 @@
         }
       }
     },
+    "customEditors": [
+      {
+        "viewType": "claudeSessionMonitor.restartGuard",
+        "displayName": "Claude Restart Guard",
+        "selector": [
+          {
+            "filenamePattern": "*.claudeguard"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
     "keybindings": [
       {
         "command": "claudeSessionMonitor.focusNextNeedsYou",

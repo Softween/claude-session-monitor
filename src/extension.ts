@@ -3439,15 +3439,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
     let term: vscode.Terminal | undefined;
     try {
-      const terms = vscode.window.terminals;
-      const pids = await Promise.all(terms.map((t) => Promise.resolve(t.processId).catch(() => undefined)));
-      const candidates = terms.map((t, i) => ({ name: t.name, pid: pids[i] ?? undefined }));
-      const pidChain = v.pid ? [v.pid, ...(await ancestorPids(v.pid))] : [];
-      term = terms[pickSessionTerminal(candidates, matchCandidates(v), pidChain, rivalLabels(v))];
+      term = await findSessionTerminal(v, matchCandidates(v), rivalLabels(v));
     } catch (e) {
       return { ok: false, skip: true, reason: "terminal lookup failed", detail: String(e) };
     }
-    if (!term) term = resumeTerminals.liveTerminalFor(v.sessionId);
     if (!term) return { ok: false, skip: true, reason: "no terminal for this session in this window" };
     const s = sanitizeRemoteLine(text);
     if (!s.ok) return { ok: false, skip: false, reason: s.reason };
@@ -4661,6 +4656,26 @@ async function ancestorPids(pid: number | undefined): Promise<number[]> {
   return out;
 }
 
+/**
+ * The terminal in this window that hosts the session: the one whose shell pid is
+ * the session's process or an ancestor of it, else the one terminal named
+ * strictly like a `labels` entry (no name match when `labels` is empty), else the
+ * live terminal this window started or resumed the session in (its hook record
+ * may have no pid yet). Rejects when the terminal lookup itself fails.
+ */
+async function findSessionTerminal(
+  v: SessionView,
+  labels: string[] = [],
+  rivals: string[] = [],
+): Promise<vscode.Terminal | undefined> {
+  const terms = vscode.window.terminals;
+  const pids = await Promise.all(terms.map((t) => Promise.resolve(t.processId).catch(() => undefined)));
+  const candidates = terms.map((t, i) => ({ name: t.name, pid: pids[i] ?? undefined }));
+  const pidChain = v.pid ? [v.pid, ...(await ancestorPids(v.pid))] : [];
+  const hit = terms[pickSessionTerminal(candidates, labels, pidChain, rivals)];
+  return hit ?? resumeTerminals.liveTerminalFor(v.sessionId);
+}
+
 /** Answer of a remote command whose session has no tab (or several same-titled ones) in this window. */
 const NO_TAB_MESSAGE = "no tab for this session in this window";
 
@@ -4789,6 +4804,15 @@ async function jumpToSession(v: SessionView): Promise<void> {
         return;
       }
     }
+    // A session that runs in a terminal (a remote new session, Resume in Terminal,
+    // `claude` typed in a shell) has no editor tab: show its terminal instead.
+    const term = await findSessionTerminal(v);
+    if (term) {
+      term.show();
+      dbg.action = `terminal: ${term.name}`;
+      writeTabDebug(dbg);
+      return;
+    }
     dbg.action = "no-match -> prompt";
   } catch (e) {
     dbg.error = String(e);
@@ -4798,9 +4822,9 @@ async function jumpToSession(v: SessionView): Promise<void> {
 }
 
 /**
- * No open tab matched this session's title. Rather than silently opening the
- * (possibly huge) transcript file, ask what to do: open it anyway, resume the
- * session in a fresh terminal, or just copy its id.
+ * Neither an open tab nor a terminal in this window hosts this session. Rather
+ * than silently opening the (possibly huge) transcript file, ask what to do:
+ * open it anyway, resume the session in a fresh terminal, or just copy its id.
  */
 async function promptNoTabMatch(v: SessionView): Promise<void> {
   let canOpenCodex = false;
@@ -4821,7 +4845,7 @@ async function promptNoTabMatch(v: SessionView): Promise<void> {
         ]
       : ["Open Transcript", "Resume in Terminal", "Copy ID"];
   const choice = await vscode.window.showInformationMessage(
-    `Session "${truncate(v.title, 60)}" has no open tab in this window.`,
+    `Session "${truncate(v.title, 60)}" has no open tab or terminal in this window.`,
     ...choices,
   );
   if (choice === "Open Codex") {

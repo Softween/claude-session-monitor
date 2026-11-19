@@ -182,6 +182,10 @@ def main() -> None:
             record["message"] = msg[:300]
         # Claude Code names the field notification_type (permission_prompt, idle_prompt, ...).
         record["notif_type"] = data.get("notification_type") or data.get("type")
+        # idle_prompt is the CLI's reminder 60 s after a finished turn: the same
+        # Your turn that Stop recorded, not a request that needs the user now.
+        if record["notif_type"] == "idle_prompt":
+            record["state"] = "idle"
     elif event == "PermissionRequest":
         tool = data.get("tool_name")
         if isinstance(tool, str):

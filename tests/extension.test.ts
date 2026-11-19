@@ -405,6 +405,42 @@ describe("extension activate()", () => {
     expect(rec.statusBars[0].text).toContain("$(pulse)");
   });
 
+  it("openSession shows the terminal that hosts a session with no editor tab", async () => {
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    // A remote new session runs `claude --session-id` as the terminal's own shell:
+    // the terminal's pid is the session's pid and no editor tab carries its title.
+    const terminal = {
+      name: "Claude · REPOS",
+      shown: false,
+      exitStatus: undefined,
+      processId: Promise.resolve(990777),
+      sent: [] as string[],
+      show() {
+        terminal.shown = true;
+      },
+      sendText() {},
+    };
+    rec.terminals.push(terminal);
+    await rec.commands.get("claudeSessionMonitor.openSession")!({
+      key: "claude:terminal-session",
+      provider: "claude",
+      title: "Listing count gap",
+      sessionId: "terminal-session",
+      pid: 990777,
+      bucket: "attention",
+      sub: "your turn",
+      capabilities: { focus: true, transcript: true, resume: true, kill: true, bulkInput: true },
+      transcriptPath: `${HOME}/terminal-session.jsonl`,
+      tooltip: "",
+      detail: "",
+      lastActivityMs: Date.now(),
+      stale: false,
+      matchLabels: ["Listing count gap"],
+    });
+    await vi.waitFor(() => expect(terminal.shown).toBe(true));
+  });
+
   it("persists a hidden ended Codex dismissal across activation reloads", async () => {
     const sessionId = "ended-codex-hidden";
     const codexDir = `${HOME}/.codex/session-monitor`;

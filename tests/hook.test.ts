@@ -111,6 +111,24 @@ describe("scripts/hook.py provider routing", () => {
     expect(read("claude", "notif-session")).toMatchObject({ state: "waiting", notif_type: "permission_prompt" });
   });
 
+  it("keeps an idle_prompt Notification in Your turn: the CLI's 60 s idle reminder asks for nothing", () => {
+    run(
+      {
+        session_id: "idle-notif-session",
+        cwd: "/workspace",
+        transcript_path: `${tmp}/.claude/projects/idle-notif.jsonl`,
+        message: "Claude is waiting for your input",
+        notification_type: "idle_prompt",
+      },
+      "Notification",
+    );
+    expect(read("claude", "idle-notif-session")).toMatchObject({
+      state: "idle",
+      event: "Notification",
+      notif_type: "idle_prompt",
+    });
+  });
+
   it("uses hook_event_name when no argv event is provided and recognizes Codex model metadata", () => {
     run({
       session_id: "codex-payload-event",

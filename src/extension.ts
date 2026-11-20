@@ -39,7 +39,7 @@ import { startNewSession } from "./remoteNewSession";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import { TabWaker, nodeProbes, summaryText } from "./wakeTabs";
 import { ContinuityServer, continuityDir, readText, storageDir, writeTextAtomic } from "./continuity";
-import { FOCUS_GROUP_COMMANDS, focusGroupBySlot, revealTabByIndex, type TabFocusDeps } from "./tabFocus";
+import { focusGroupBySlot, revealTabByIndex, type TabFocusDeps } from "./tabFocus";
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
 import { submitAnswer } from "./answers";
 import { activateRestartGuard } from "./restartGuard";
@@ -4280,7 +4280,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // Ask before an extension restart stops every session in this window (restartGuard.ts).
   activateRestartGuard(ctx, {
     log,
-    focusGroup: (i) => (i >= 0 && i < FOCUS_GROUP_COMMANDS.length ? vscode.commands.executeCommand(FOCUS_GROUP_COMMANDS[i]) : Promise.resolve()),
+    focusGroup: focusTabGroup,
+    idleMs: probes.idleMs,
   });
 
   refresh();

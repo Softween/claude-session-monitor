@@ -11,8 +11,9 @@ vi.mock("vscode", () => ({
   window: { showWarningMessage: () => Promise.resolve(undefined) },
 }));
 
+import { nothingTyped } from "../src/keystrokeTyping";
 import type { PeerSendResult } from "../src/peerSend";
-import { RemoteBridge, deliverText, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt } from "../src/remoteBridge";
+import { RemoteBridge, TYPED_REASON, deliverText, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt } from "../src/remoteBridge";
 
 afterEach(() => {
   settings.clear();
@@ -93,6 +94,30 @@ describe("deliverText: one delivery path per command", () => {
     const thrown = paths({ terminal: new Error("boom") });
     expect(await thrown.run()).toEqual({ ok: false, message: "not delivered via terminal: error (Error: boom)" });
     expect(thrown.calls).toEqual(["terminal"]);
+  });
+
+  it("reports typing that stopped midway as a failure, so the inbox never gets the text a second time", async () => {
+    const stopped = paths({
+      typed: {
+        ok: false,
+        skip: nothingTyped("interrupted"),
+        reason: TYPED_REASON.interrupted,
+        detail: 'the keyboard focus is on AXTextArea "Terminal 1, zsh" (after 200 of 450 characters; Return not pressed)',
+      },
+    });
+    const out = await stopped.run();
+    expect(out.ok).toBe(false);
+    expect(out.message).toBe(
+      `not delivered via typed: ${TYPED_REASON.interrupted} (the keyboard focus is on AXTextArea "Terminal 1, zsh" (after 200 of 450 characters; Return not pressed))`,
+    );
+    expect(TYPED_REASON.interrupted).toMatch(/Return was not pressed/);
+    expect(stopped.calls).toEqual(["terminal", "typed"]);
+
+    // Focus elsewhere before the first keystroke typed nothing: the inbox may still deliver.
+    const before = paths({ typed: { ok: false, skip: nothingTyped("not-prompt"), reason: TYPED_REASON["not-prompt"] } });
+    expect(TYPED_REASON["not-prompt"]).toBeDefined();
+    expect(await before.run()).toEqual({ ok: true, message: "delivered via inbox (in-transcript, msg_id m1)" });
+    expect(before.calls).toEqual(["terminal", "typed", "uds"]);
   });
 
   it("names every skipped path when the inbox fails too", async () => {

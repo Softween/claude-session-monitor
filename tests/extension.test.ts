@@ -1336,9 +1336,12 @@ describe("a session's tab: shown by its index, typed into only when it is the on
     const typedInto: Array<string | undefined> = [];
     rec.execFileImpl = (args) => {
       if (args[0] !== "osascript") return false;
-      const keystroke = (args[1] as string[]).some((line) => line.startsWith("keystroke "));
+      const lines = args[1] as string[];
+      const keystroke = lines.some((line) => line.startsWith("keystroke "));
+      // The focus read before every chunk and before Enter (keystrokeTyping.ts): the Claude Code prompt input is focused.
+      const readsFocus = lines.some((line) => line.includes("AXFocusedUIElement"));
       if (keystroke) typedInto.push(e.activeLabel());
-      args[args.length - 1](null, keystroke ? "typed" : "", "");
+      args[args.length - 1](null, keystroke || lines.some((line) => line === "key code 36" || line.includes("key code 36")) ? "typed" : readsFocus ? "com.microsoft.VSCode\nAXTextArea\nMessage input" : "", "");
       return true;
     };
     return typedInto;

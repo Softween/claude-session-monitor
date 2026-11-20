@@ -3267,7 +3267,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
     // refresh their usage in the background on a slower cadence.
     if (claudeEnabled() && now - lastOthersCheck > 30) {
       lastOthersCheck = now;
-      setAccounts(readAccountsFile());
+      // Without registry writes (observer mode) the login applyActive followed lives in memory only: keep it.
+      const disk = readAccountsFile();
+      setAccounts(activeNow && !allowed("accountWrites") ? markActive(disk, activeNow, now) : disk);
       const panel0 = installedPanel();
       if (panelFresh(panel0, Date.now())) {
         const merged = mergePanelAccounts(accountsFile, panel0);

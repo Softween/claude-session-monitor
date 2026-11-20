@@ -24,8 +24,9 @@ import {
 
 const NOW = Date.UTC(2026, 10, 10, 6, 15, 0); // 08:15 Istanbul, the restart of 2026-11-10
 const none = (): undefined => undefined;
-const reg = (sid: string, title?: string): RegistryEntry => ({ sid, title, lastSeenMs: NOW - 3_600_000, missed: 2 });
 const titleOf = (sid: string): string => `Limit-stopped session ${sid}`;
+const reg = (sid: string, title: string = titleOf(sid)): RegistryEntry => ({ sid, title, lastSeenMs: NOW - 3_600_000, missed: 2 });
+const pend = (sid: string, attempts = 0) => ({ sid, title: titleOf(sid), attempts });
 const REVEAL_MS = 30; // Claude Code shows the tab after editor.open returns (two more command round trips)
 
 /** An automation gate that lets every wake through and counts them; abort() cancels the wake in progress (automationGate.test.ts tests the real one). */
@@ -57,7 +58,9 @@ function harness(over: Partial<WakeDeps<string>> = {}, stored: Record<string, un
   const store = new Map<string, unknown>(Object.entries(stored));
   const writes: Array<[string, unknown]> = [];
   const logs: string[] = [];
-  const state = { live: [] as LiveSession[], active: "editor-a", spawn: true };
+  // Every remembered session's Claude Code tab is open, labelled with its title, unless a test closes it.
+  const remembered = [REGISTRY_KEY, PENDING_KEY].flatMap((key) => (stored[key] as Array<{ sid: string; title?: string }> | undefined) ?? []);
+  const state = { live: [] as LiveSession[], active: "editor-a", spawn: true, tabs: remembered.map((e) => e.title ?? titleOf(e.sid)) };
   const executeCommand = vi.fn(async (_id: string, ...args: unknown[]) => {
     const sid = String(args[0]);
     setTimeout(() => (state.active = `claude-${sid}`), REVEAL_MS);
@@ -93,6 +96,7 @@ function harness(over: Partial<WakeDeps<string>> = {}, stored: Record<string, un
     activeTab: () => state.active,
     activeClaudeLabel: () => (state.active.startsWith("claude-") ? titleOf(state.active.slice("claude-".length)) : undefined),
     restoreTabs,
+    claudeTabLabels: () => state.tabs,
     gate: openGate(),
     ...over,
   };
@@ -157,12 +161,12 @@ describe("activation", () => {
     const stops: Record<string, boolean> = { a: true, c: true, d: true, e: false };
     const h = harness(
       { limitStop: (sid) => (stops[sid] ? { ts: NOW / 1000 - 600, apiError: true, status: 429 } : undefined) },
-      { [REGISTRY_KEY]: [reg("a"), reg("b"), reg("c"), reg("e")], [PENDING_KEY]: [{ sid: "d", attempts: 1 }] },
+      { [REGISTRY_KEY]: [reg("a"), reg("b"), reg("c"), reg("e")], [PENDING_KEY]: [pend("d", 1)] },
     );
     h.state.live.push({ sessionId: "b", pid: 7, entrypoint: "claude-vscode" });
     h.waker.start();
-    expect(h.store.get(PENDING_KEY)).toEqual([{ sid: "d", attempts: 1 }, { sid: "a", attempts: 0 }, { sid: "c", attempts: 0 }]);
-    expect(h.logs).toEqual(["wake: activation registry=4 pending=4 limit-stopped=3"]);
+    expect(h.store.get(PENDING_KEY)).toEqual([pend("d", 1), pend("a"), pend("c")]);
+    expect(h.logs).toEqual(["wake: activation registry=4 pending=4 with a tab=4 limit-stopped=3"]);
     await vi.advanceTimersByTimeAsync(59_999);
     expect(h.executeCommand).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
@@ -177,6 +181,36 @@ describe("activation", () => {
     expect(h.executeCommand).not.toHaveBeenCalled();
     expect(h.store.get(PENDING_KEY)).toEqual([]);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a start keeps only sessions whose Claude Code tab is open: one closed while the setting was off is never reopened", async () => {
+    let on = true;
+    const h = harness({ enabled: () => on }, { [REGISTRY_KEY]: [reg("a"), reg("b")] });
+    h.waker.start();
+    on = false; // wakeDeadTabs off: the waker no longer sees tabs close
+    h.waker.tabClosed(titleOf("a"));
+    h.state.tabs = [titleOf("b")];
+    on = true;
+    h.waker.start(true);
+    expect(h.store.get(PENDING_KEY)).toEqual([pend("b")]);
+    expect(h.logs).toContain("wake: activation registry=2 pending=2 with a tab=1 limit-stopped=1");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.executeCommand.mock.calls.map((c) => c[1])).toEqual(["b"]);
+  });
+
+  it("turning the setting on again lifts the stop after two failed wakes in a row", async () => {
+    const h = harness({}, { [REGISTRY_KEY]: [reg("a"), reg("b")] });
+    h.state.spawn = false;
+    h.waker.start();
+    await vi.advanceTimersByTimeAsync(130_000); // a fails at 80 s, b at 130 s
+    expect(h.logs).toContain("wake: stopped after 2 failed wakes in a row until the next activation, 2 pending");
+    h.waker.start(); // a start that is no turn-on keeps the stop
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.executeCommand).toHaveBeenCalledTimes(2);
+    h.state.spawn = true;
+    h.waker.start(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.executeCommand).toHaveBeenCalledTimes(3);
   });
 
   it("a closed Claude Code tab drops its pending session (Claude Code's truncated label)", () => {
@@ -310,7 +344,7 @@ describe("preconditions", () => {
   });
 
   it("gate off: nothing is read, written, scheduled or woken", async () => {
-    const h = harness({ enabled: () => false }, { [REGISTRY_KEY]: [reg("a")], [PENDING_KEY]: [{ sid: "b", attempts: 0 }] });
+    const h = harness({ enabled: () => false }, { [REGISTRY_KEY]: [reg("a")], [PENDING_KEY]: [pend("b")] });
     const get = vi.spyOn(h.deps.store, "get");
     h.waker.start();
     h.waker.observe();
@@ -432,12 +466,12 @@ describe("sweep step", () => {
     await vi.advanceTimersByTimeAsync(10 * 60_000);
     expect(h.executeCommand.mock.calls.map((c) => c[1])).toEqual(["a", "b"]);
     expect(vi.getTimerCount()).toBe(0);
-    expect(h.store.get(PENDING_KEY)).toEqual([{ sid: "c", attempts: 0 }, { sid: "a", attempts: 1 }, { sid: "b", attempts: 1 }]);
+    expect(h.store.get(PENDING_KEY)).toEqual([pend("c"), pend("a", 1), pend("b", 1)]);
     await expect(h.waker.runNow()).resolves.toMatchObject({ result: "stopped", woken: 0 });
   });
 
   it("a session is dropped after its second failed wake, also across a restart", async () => {
-    const h = harness({}, { [PENDING_KEY]: [{ sid: "a", attempts: 1 }] });
+    const h = harness({}, { [PENDING_KEY]: [pend("a", 1)] });
     h.state.spawn = false;
     h.waker.start();
     await vi.advanceTimersByTimeAsync(80_000);
@@ -445,12 +479,12 @@ describe("sweep step", () => {
     expect(h.store.get(PENDING_KEY)).toEqual([]);
   });
 
-  it("checks the gate again right before the restore: a hold leaves the tabs as they are", async () => {
-    const gate = openGate({ beforeRestore: async () => ({ kind: "memory", reason: "memory pressure 2" }) });
+  it("checks the gate again right before the restore: tab automation turned off leaves the tabs as they are", async () => {
+    const gate = openGate({ beforeRestore: async () => ({ kind: "off", reason: "tab automation is off" }) });
     const h = harness({ gate }, { [REGISTRY_KEY]: [reg("s1")] });
     h.waker.start();
     await vi.advanceTimersByTimeAsync(60_500);
-    expect(h.logs).toContain("wake: s1 tabs left as they are (memory pressure 2)");
+    expect(h.logs).toContain("wake: s1 tabs left as they are (tab automation is off)");
     expect(h.logs).toContain("wake: s1 live after 0.5s pid=4242");
     expect(h.restoreTabs).not.toHaveBeenCalled();
     expect(h.state.active).toBe("claude-s1");
@@ -468,10 +502,29 @@ describe("sweep step", () => {
     await vi.advanceTimersByTimeAsync(500);
     expect(h.logs).toContain("wake: a cancelled after 5.5s (wakeDeadTabs is off), tabs left as they are");
     expect(h.restoreTabs).not.toHaveBeenCalled();
-    expect(h.store.get(PENDING_KEY)).toEqual([{ sid: "a", attempts: 0 }, { sid: "b", attempts: 0 }]);
+    expect(h.store.get(PENDING_KEY)).toEqual([pend("a"), pend("b")]);
     await vi.advanceTimersByTimeAsync(10 * 60_000);
     expect(h.executeCommand).toHaveBeenCalledTimes(1);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a configuration change while the gate checks run cancels the wake before the show: nothing shown or spent", async () => {
+    const gate = openGate();
+    let first = true;
+    gate.admit = async () => {
+      if (first) gate.abort("tab automation is off"); // the change lands while the checks await sysctl and the rest
+      first = false;
+      return undefined;
+    };
+    const h = harness({ gate }, { [REGISTRY_KEY]: [reg("a")] });
+    h.waker.start();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.executeCommand).not.toHaveBeenCalled();
+    expect(gate.spent).toBe(0);
+    expect(h.logs).toContain("wake: a cancelled before the show (tab automation is off)");
+    expect(h.store.get(PENDING_KEY)).toEqual([pend("a")]); // no try used
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(h.executeCommand).toHaveBeenCalledTimes(1);
   });
 
   it("a command error counts as a failed wake", async () => {

@@ -146,6 +146,17 @@ describe("Claude Code compatibility", () => {
     expect(h.logs).toEqual([]);
   });
 
+  it("a command list that cannot be read keeps the automations off only until the next consult checks again", async () => {
+    const h = harness();
+    h.commands.mockRejectedValueOnce(new Error("extension host busy"));
+    await h.gate.checkCompat();
+    expect(h.gate.blocker("wake")).toBe("the command list could not be read"); // this consult starts the check again
+    await h.gate.checkCompat(); // the same check, still in flight
+    expect(h.commands).toHaveBeenCalledTimes(2);
+    expect(h.gate.blocker("wake")).toBeUndefined();
+    expect(h.logs).toEqual(["compat: tab automation off: the command list could not be read", "compat: Claude Code passed the check, tab automation on"]);
+  });
+
   it("a tab that shows a listed Claude session must be a Claude Code panel; with none open that half passes", async () => {
     const h = harness();
     await h.gate.checkCompat();
@@ -210,18 +221,22 @@ describe("memory", () => {
     expect(pulseStageOf(JSON.stringify({ stage: "RED", ts: NOW / 1000 - 120 }), NOW)).toBe("RED");
   });
 
-  it("right before a restore the switches, Claude Code and memory hold; the spent budget does not", async () => {
+  it("right before a restore the switches and Claude Code hold; memory and the spent budget do not (a restore starts no process)", async () => {
     const h = harness();
     await h.gate.checkCompat();
     const wake = h.gate.wakeGate("wake");
     for (let i = 0; i < 3; i++) wake.spend();
     expect((await wake.admit())?.kind).toBe("budget");
     expect(await wake.beforeRestore()).toBeUndefined();
+    h.env.pressure = 4;
     h.env.pulse = "RED";
-    expect(await wake.beforeRestore()).toEqual({ kind: "memory", reason: "pulse RED" });
-    h.env.pulse = undefined;
+    expect(await wake.beforeRestore()).toBeUndefined();
     h.env.features.delete("wake");
     expect(await wake.beforeRestore()).toEqual({ kind: "off", reason: "wakeDeadTabs is off" });
+    h.env.features.add("wake");
+    h.env.commands = [];
+    await h.gate.checkCompat();
+    expect(await wake.beforeRestore()).toEqual({ kind: "off", reason: MISSING });
   });
 });
 
@@ -271,9 +286,8 @@ describe("spawn budget", () => {
     await h.gate.checkCompat();
     h.env.pressure = 2;
     const live: LiveSession[] = [];
-    const store = new Map<string, unknown>([
-      [REGISTRY_KEY, ["a", "b", "c", "d", "e"].map((sid) => ({ sid, lastSeenMs: NOW - 3_600_000, missed: 2 }))],
-    ]);
+    const sids = ["a", "b", "c", "d", "e"];
+    const store = new Map<string, unknown>([[REGISTRY_KEY, sids.map((sid) => ({ sid, title: `Limit-stopped ${sid}`, lastSeenMs: NOW - 3_600_000, missed: 2 }))]]);
     const woken: string[] = [];
     const logs: string[] = [];
     const waker = new TabWaker<string>({
@@ -304,6 +318,7 @@ describe("spawn budget", () => {
       activeTab: () => "editor",
       activeClaudeLabel: () => undefined,
       restoreTabs: async () => undefined,
+      claudeTabLabels: () => sids.map((sid) => `Limit-stopped ${sid}`),
       gate: h.gate.wakeGate("wake"),
     });
     waker.start();

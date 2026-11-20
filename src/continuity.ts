@@ -13,10 +13,11 @@
  * back, and reports in ext/<key>.json: a heartbeat every 15 s with the gate that
  * would hold the next show back, and the newest 50 results. At most two tries per
  * request; a request goes before a limit-stopped tab wake (wakeTabs.ts) and the two
- * never show tabs at the same time. Every show and every restore passes the automation
- * gate (automationGate.ts: tab automation, memory, the spawn budget shared with the
- * tab wakes), and turning the setting or tab automation off cancels a show's wait and
- * restore. Nothing is typed or sent into a session.
+ * never show tabs at the same time. Every show passes the automation gate
+ * (automationGate.ts: tab automation, Claude Code, memory, the spawn budget shared
+ * with the tab wakes) and every restore its switches and Claude Code check; turning
+ * the setting or tab automation off cancels a show before the reveal, its wait and
+ * its restore. Nothing is typed or sent into a session.
  *
  * No `vscode` import: extension.ts injects the editor side (ServerDeps).
  */
@@ -392,12 +393,16 @@ export class ContinuityServer<G, T> {
 
   /** Try `attempt` of `req`: the gate, then make its tab active, wait for the process and put the tabs back. */
   private async show(req: OpenRequest, attempt: number): Promise<void> {
+    const signal = this.deps.gate.signal(); // taken before the checks: a change while they run still cancels the show
     if ((await this.beat(true)) !== "ok" || !(await this.userAway())) return; // postponed: the heartbeat names the gate
     const plan = pickTab(this.deps.tabs(), req.title, attempt); // the tabs may have changed meanwhile
     if (plan.kind !== "reveal" || !this.on()) return;
+    if (signal.aborted) {
+      this.deps.log(`continuity: ${req.sid.slice(0, 8)} cancelled before the show (${errText(signal.reason)}), request ${req.id}`);
+      return;
+    }
     const { group, tab } = plan.ref;
     const memo: RevealMemo<G, T> = { activeGroup: this.deps.activeGroup(), group, groupTab: this.deps.activeTabOf(group), tab };
-    const signal = this.deps.gate.signal();
     const started = this.deps.now();
     this.deps.gate.spend();
     let error: string | undefined;
@@ -439,7 +444,7 @@ export class ContinuityServer<G, T> {
 
   /**
    * Put the shown tab's group back on its former tab and refocus the former group, unless the user moved meanwhile
-   * or types in this window, the show was cancelled, or the gate holds right now (tab automation, the setting, Claude Code, memory).
+   * or types in this window, the show was cancelled, or the gate holds right now (tab automation, the setting, Claude Code).
    */
   private async restore(memo: RevealMemo<G, T>, signal: AbortSignal): Promise<void> {
     if (this.deps.windowFocused()) {

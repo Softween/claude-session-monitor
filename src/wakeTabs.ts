@@ -13,9 +13,11 @@
  * process, then puts the tabs and focus back unless the user works in the window
  * by then. Nothing is ever sent to a session.
  * A continuity request (continuity.ts) goes first: no tab is woken while one is
- * served or waits. Every wake and every restore passes the automation gate
- * (automationGate.ts: tab automation, memory, the spawn budget), and turning the
- * setting or tab automation off cancels a wake's wait and restore.
+ * served or waits. Every wake passes the automation gate (automationGate.ts: tab
+ * automation, Claude Code, memory, the spawn budget) and every restore its switches
+ * and Claude Code check; turning the setting or tab automation off cancels a wake
+ * before its show, its wait and its restore. A start keeps only the sessions whose
+ * Claude Code tab is open: tabs closed while the waker was off are never reopened.
  *
  * No `vscode` import: extension.ts injects the editor side (WakeDeps).
  */
@@ -94,6 +96,7 @@ export interface WakeDeps<M> {
   activeTab(): unknown;
   activeClaudeLabel(): string | undefined; // the active tab's label when it is a Claude Code tab
   restoreTabs(snapshot: M): Promise<void>;
+  claudeTabLabels(): string[]; // the labels of this window's Claude Code tabs
   yieldTo?(): boolean; // a continuity request (continuity.ts) is served or waits: it goes first
   gate: WakeGate; // automationGate.ts, consulted right before a wake and its restore
 }
@@ -207,17 +210,28 @@ export class TabWaker<M> {
 
   constructor(private readonly deps: WakeDeps<M>) {}
 
-  /** Activation, before the first refresh: pending = remembered minus running, limit stops only. */
-  start(): void {
+  /**
+   * Activation, before the first refresh, or the setting turned on (`explicit`: a stop after failed wakes is
+   * lifted): pending = remembered minus running, limit stops with an open Claude Code tab carrying their title only.
+   */
+  start(explicit = false): void {
     if (!this.deps.enabled()) return; // the gate first: nothing is read, written or scheduled
+    if (explicit) {
+      this.stopped = false;
+      this.failsInRow = 0;
+    }
     const reg = asRegistry(this.deps.store.get(REGISTRY_KEY));
     this.registry = reg;
     this.pending = asPending(this.deps.store.get(PENDING_KEY));
     const live = new Set(this.deps.liveSessions().map((s) => s.sessionId));
     const remembered = pendingAt(reg, this.pending, live);
+    const labels = this.deps.claudeTabLabels();
+    const withTab = remembered.filter((p) => p.title !== undefined && labels.some((label) => labelsMatchStrict(label, p.title as string)));
     const now = this.deps.now();
-    this.setPending(remembered.filter((p) => isLimitStop(this.deps.limitStop(p.sid), now)));
-    this.deps.log(`wake: activation registry=${reg.length} pending=${remembered.length} limit-stopped=${this.pending.length}`);
+    this.setPending(withTab.filter((p) => isLimitStop(this.deps.limitStop(p.sid), now)));
+    this.deps.log(
+      `wake: activation registry=${reg.length} pending=${remembered.length} with a tab=${withTab.length} limit-stopped=${this.pending.length}`,
+    );
     if (this.pending.length) this.schedule(FIRST_SWEEP_MS);
   }
 
@@ -333,13 +347,13 @@ export class TabWaker<M> {
     if (!this.on()) return "off";
     const next = this.nextCandidate();
     if (!next) return "empty";
+    const signal = this.deps.gate.signal(); // taken before the checks: a change while they run still cancels the wake
     const reason = await this.blocker(manual);
     if (reason) {
       this.postpone(reason);
       return "postponed";
     }
-    this.deps.gate.spend();
-    const result = await this.wake(next);
+    const result = await this.wake(next, signal);
     if (result === "cancelled") return "postponed"; // no try used: the setting or tab automation went off during the wake
     this.settle(next, result === "woken");
     return result;
@@ -393,8 +407,13 @@ export class TabWaker<M> {
    * woken tab is still active and the user does not work in this window. Turning the
    * setting or tab automation off ends the wait and leaves the tabs as they are.
    */
-  private async wake(p: PendingEntry): Promise<"woken" | "failed" | "cancelled"> {
-    const signal = this.deps.gate.signal();
+  private async wake(p: PendingEntry, signal: AbortSignal): Promise<"woken" | "failed" | "cancelled"> {
+    if (signal.aborted) {
+      this.lastReason = errText(signal.reason);
+      this.deps.log(`wake: ${short(p.sid)} cancelled before the show (${this.lastReason})`);
+      return "cancelled";
+    }
+    this.deps.gate.spend();
     const memo = this.deps.snapshotTabs();
     const started = this.deps.now();
     this.lastWakeMs = started;
@@ -445,7 +464,7 @@ export class TabWaker<M> {
     }
   }
 
-  /** Put the tabs back unless the wake was cancelled or the gate holds right now (tab automation, the setting, Claude Code, memory). */
+  /** Put the tabs back unless the wake was cancelled or the gate holds right now (tab automation, the setting, Claude Code). */
   private async restore(memo: M, p: PendingEntry, signal: AbortSignal): Promise<void> {
     const held = signal.aborted ? errText(signal.reason) : (await this.deps.gate.beforeRestore())?.reason;
     if (held !== undefined) {

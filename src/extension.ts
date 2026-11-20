@@ -4363,7 +4363,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       automationGate.configChanged((setting) => e.affectsConfiguration(setting));
       // Turning the wake on starts it without a restart (start() does nothing while it is off).
       if (e.affectsConfiguration("claudeSessionMonitor.wakeDeadTabs") || e.affectsConfiguration("claudeSessionMonitor.enableClaude")) {
-        stages.safe("tab wake start", () => tabWaker?.start());
+        stages.safe("tab wake start", () => tabWaker?.start(true));
       }
     }),
   );
@@ -4385,6 +4385,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       return tab && isClaudePanelTab(tab) ? tab.label : undefined;
     },
     restoreTabs,
+    claudeTabLabels: () => vscode.window.tabGroups.all.flatMap((g) => g.tabs.filter(isClaudePanelTab).map((t) => t.label)),
     yieldTo: () => continuity?.pending() === true,
     gate: automationGate.wakeGate("wake"),
   }));

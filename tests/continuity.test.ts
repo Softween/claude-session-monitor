@@ -574,14 +574,32 @@ describe("ContinuityServer", () => {
     expect(gate.spent).toBe(1); // a show counts against the spawn budget
   });
 
-  it("checks the gate again right before the restore: a hold leaves the tabs as they are", async () => {
-    const s = server({ gate: openGate({ beforeRestore: async () => ({ kind: "memory", reason: "memory pressure 2" }) }) });
+  it("checks the gate again right before the restore: tab automation turned off leaves the tabs as they are", async () => {
+    const s = server({ gate: openGate({ beforeRestore: async () => ({ kind: "off", reason: "tab automation is off" }) }) });
     writeRequests(request("r1"));
     s.srv.observe();
     await vi.advanceTimersByTimeAsync(800);
     expect(s.win.calls).toEqual(["reveal g0/c1"]); // shown, never put back
-    expect(s.logs).toContain("continuity: tab restore skipped (memory pressure 2)");
+    expect(s.logs).toContain("continuity: tab restore skipped (tab automation is off)");
     expect(s.logs).toContain("continuity: 0b563428 opened after 0.5s pid=4242, try 1/2, request r1");
+  });
+
+  it("a configuration change while the gate checks run cancels the show before the reveal: nothing shown or spent, no try used", async () => {
+    const gate = openGate();
+    let first = true;
+    gate.admit = async () => {
+      if (first) gate.abort("continuityChannel is off"); // the change lands while the checks await
+      first = false;
+      return undefined;
+    };
+    const s = server({ gate });
+    writeRequests(request("r1"));
+    s.srv.observe();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.win.calls).toEqual([]);
+    expect(gate.spent).toBe(0);
+    expect(s.logs).toContain("continuity: 0b563428 cancelled before the show (continuityChannel is off), request r1");
+    expect(beatFile().served).toEqual({});
   });
 
   it("turning the channel or tab automation off during the wait cancels the show: no restore, no try used", async () => {

@@ -15,7 +15,8 @@
  * warn or above, or the pulse daemon at ORANGE or RED where it is installed) and
  * once this window woke 3 tabs in 5 minutes; each such refusal backs the next try
  * off, 30 s doubling up to 10 min. Right before a wake puts the tabs back the
- * switches, Claude Code and memory are checked again. A configuration change that
+ * switches and Claude Code are checked again; memory is not, since a restore only
+ * shows tabs that were visible before and starts no process. A configuration change that
  * turns an automation off aborts its AbortSignal: a wake's wait and restore and a
  * running sweep stop.
  *
@@ -73,7 +74,7 @@ export interface WakeGate {
   admit(): Promise<Hold | undefined>;
   /** The wake starts: it counts against this window's budget. */
   spend(): void;
-  /** Right before a wake puts the tabs back: the switches, Claude Code and memory (not the budget). */
+  /** Right before a wake puts the tabs back: the switches and Claude Code (not memory or the budget: a restore starts no process). */
   beforeRestore(): Promise<Hold | undefined>;
   /** Aborted once a configuration change turns the feature or tab automation off. */
   signal(): AbortSignal;
@@ -154,7 +155,7 @@ export async function readPulseStage(nowMs: number, home: string = os.homedir())
 export class AutomationGate {
   private readonly controllers = new Map<Automation, AbortController>();
   private commandMiss: Miss | undefined = { reason: "Claude Code is not checked yet", loud: false, notice: false };
-  private waiting = false; // Claude Code is installed but not running yet
+  private recheck = false; // the next consult checks again: Claude Code had not started, or its command list could not be read
   private checking: Promise<void> | undefined;
   private logged: string | undefined; // the last compatibility result logged (undefined: compatible)
   private warnedVersion: string | undefined;
@@ -227,7 +228,7 @@ export class AutomationGate {
 
   private async runCheck(): Promise<void> {
     const cc = this.deps.claudeCode();
-    this.waiting = cc !== undefined && !cc.active;
+    this.recheck = cc !== undefined && !cc.active;
     if (cc && cc.version !== this.warnedVersion && newerVersion(cc.version, CHECKED_CLAUDE_CODE)) {
       this.warnedVersion = cc.version;
       this.deps.log(`compat: Claude Code ${cc.version} is newer than ${CHECKED_CLAUDE_CODE}, the newest version the tab automations were checked against`);
@@ -236,6 +237,7 @@ export class AutomationGate {
     else if (!cc.active) this.commandMiss = { reason: "Claude Code has not started yet", loud: false, notice: false };
     else {
       const ids = await Promise.resolve(this.deps.commands()).catch(() => undefined);
+      this.recheck = ids === undefined;
       const missing = CLAUDE_CODE_COMMANDS.filter((id) => !ids?.includes(id));
       this.commandMiss = !ids
         ? { reason: "the command list could not be read", loud: true, notice: false }
@@ -248,7 +250,7 @@ export class AutomationGate {
 
   /** The compatibility result now (the tab half is read each time); a change of a loud result is logged once. */
   private compat(): Miss | undefined {
-    if (this.waiting && this.deps.claudeCode()?.active) void this.checkCompat();
+    if (this.recheck && this.deps.claudeCode()?.active) void this.checkCompat();
     const stray = this.commandMiss ? [] : strayViewTypes(this.deps.tabViews(), this.deps.claudeTitles());
     const miss =
       this.commandMiss ??
@@ -294,9 +296,7 @@ export class AutomationGate {
 
   private async restoreHold(a: Automation): Promise<Hold | undefined> {
     const off = this.blocker(a);
-    if (off) return { kind: "off", reason: off };
-    const memory = await this.memoryReason();
-    return memory ? { kind: "memory", reason: memory } : undefined;
+    return off ? { kind: "off", reason: off } : undefined;
   }
 
   private async memoryReason(): Promise<string | undefined> {

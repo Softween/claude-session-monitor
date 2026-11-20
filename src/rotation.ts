@@ -198,6 +198,8 @@ export function parseJsonObject(s: string | undefined): Record<string, unknown> 
 }
 
 export interface SwitchDeps {
+  /** Takes the cross-window switch lock (accountSwitch.ts); its release, or null while another switch holds it. */
+  lock(): (() => void) | null;
   readKeychain(): Promise<string | undefined>;
   writeKeychain(json: string): Promise<void>;
   getSecret(key: string): Promise<string | undefined>;
@@ -212,27 +214,54 @@ export type SwitchResult =
   | { ok: true; email: string; refreshed?: OAuthBlob }
   | { ok: false; error: string };
 
-/**
- * Swap the active Claude Code login. Steps: snapshot the current login into the
- * vault, load the target, refresh it when about to expire, rewrite the keychain
- * (only claudeAiOauth) and ~/.claude.json (only oauthAccount).
- */
-export async function performSwitch(deps: SwitchDeps, targetId: string, targetEmail: string): Promise<SwitchResult> {
+/** The active login as read now: the keychain item, ~/.claude.json, and the account they name. */
+interface ActiveLogin {
+  kcRaw: string;
+  claudeJson: Record<string, unknown>;
+  id?: string;
+  oauth: unknown;
+  ident?: Record<string, unknown>;
+}
+
+async function readActiveLogin(deps: SwitchDeps): Promise<ActiveLogin | undefined> {
   const kcRaw = await deps.readKeychain();
   const kc = parseJsonObject(kcRaw);
-  const claudeJsonRaw = await deps.readClaudeJson();
-  const claudeJson = parseJsonObject(claudeJsonRaw);
-  if (!kcRaw || !kc || !claudeJsonRaw || !claudeJson) return { ok: false, error: "could not read the current Claude Code login" };
+  const claudeJson = parseJsonObject(await deps.readClaudeJson());
+  if (!kcRaw || !kc || !claudeJson) return undefined;
+  const ident = claudeJson.oauthAccount as Record<string, unknown> | undefined;
+  const id = ident && typeof ident.accountUuid === "string" ? ident.accountUuid : undefined;
+  return { kcRaw, claudeJson, id, oauth: kc.claudeAiOauth, ident };
+}
 
-  // 1) snapshot the current active login so it can be switched back to.
-  const curOauth = kc.claudeAiOauth;
-  const curIdent = claudeJson.oauthAccount as Record<string, unknown> | undefined;
-  const curId = curIdent && typeof curIdent.accountUuid === "string" ? curIdent.accountUuid : undefined;
-  if (curId && curOauth && typeof curOauth === "object" && curIdent) {
-    await deps.setSecret(vaultOauthKey(curId), JSON.stringify(curOauth));
-    await deps.setSecret(vaultIdentKey(curId), JSON.stringify(curIdent));
+/** Vault the login so it can be switched back to. */
+async function vaultLogin(deps: SwitchDeps, login: ActiveLogin): Promise<void> {
+  if (!login.id || !login.oauth || typeof login.oauth !== "object" || !login.ident) return;
+  await deps.setSecret(vaultOauthKey(login.id), JSON.stringify(login.oauth));
+  await deps.setSecret(vaultIdentKey(login.id), JSON.stringify(login.ident));
+}
+
+/**
+ * Swap the active Claude Code login, under the cross-window switch lock. Steps:
+ * snapshot the current login into the vault, load the target, refresh it when
+ * about to expire, rewrite the keychain (only claudeAiOauth) and ~/.claude.json
+ * (only oauthAccount) from reads taken right before the writes.
+ */
+export async function performSwitch(deps: SwitchDeps, targetId: string, targetEmail: string): Promise<SwitchResult> {
+  const release = deps.lock();
+  if (!release) return { ok: false, error: "another account switch is running" };
+  try {
+    return await switchLocked(deps, targetId, targetEmail);
+  } finally {
+    release();
   }
-  if (curId === targetId) return { ok: true, email: targetEmail };
+}
+
+async function switchLocked(deps: SwitchDeps, targetId: string, targetEmail: string): Promise<SwitchResult> {
+  // 1) snapshot the current active login so it can be switched back to.
+  const first = await readActiveLogin(deps);
+  if (!first) return { ok: false, error: "could not read the current Claude Code login" };
+  await vaultLogin(deps, first);
+  if (first.id === targetId) return { ok: true, email: targetEmail };
 
   // 2) load the target.
   const tOauth = parseJsonObject(await deps.getSecret(vaultOauthKey(targetId))) as OAuthBlob | undefined;
@@ -252,8 +281,14 @@ export async function performSwitch(deps: SwitchDeps, targetId: string, targetEm
     await deps.setSecret(vaultOauthKey(targetId), JSON.stringify(oauth));
   }
 
-  // 4) keychain, then 5) ~/.claude.json.
-  await deps.writeKeychain(buildKeychainPayload(kcRaw, oauth));
-  await deps.writeClaudeJson(JSON.stringify({ ...claudeJson, oauthAccount: tIdent }, null, 2));
+  // 4) keychain, then 5) ~/.claude.json, from reads taken now: a running CLI may
+  // have refreshed its token or rewritten ~/.claude.json while step 3 waited on
+  // the network. That fresh login is vaulted first (unless it already is the
+  // target, whose vault entry step 3 may just have refreshed).
+  const now = await readActiveLogin(deps);
+  if (!now) return { ok: false, error: "could not read the current Claude Code login" };
+  if (now.id !== targetId) await vaultLogin(deps, now);
+  await deps.writeKeychain(buildKeychainPayload(now.kcRaw, oauth));
+  await deps.writeClaudeJson(JSON.stringify({ ...now.claudeJson, oauthAccount: tIdent }, null, 2));
   return { ok: true, email: typeof tIdent.emailAddress === "string" ? tIdent.emailAddress : targetEmail, refreshed };
 }

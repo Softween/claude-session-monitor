@@ -42,6 +42,7 @@ import { ContinuityServer, continuityDir, focusBySlot, readText, storageDir, wri
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
 import { submitAnswer } from "./answers";
 import { nothingTyped, typeIntoPrompt, type TypeResult } from "./keystrokeTyping";
+import { acquireSwitchLock, autoRotateOn, remoteSwitch as routeRemoteSwitch } from "./accountSwitch";
 import { activateRestartGuard } from "./restartGuard";
 import {
   KIND_LABEL,
@@ -1649,8 +1650,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
    * shell, no token in args or logs). The panel shows "Switching…" while it runs;
    * on exit the active login is re-resolved and the panel re-rendered at once,
    * with the outcome in the panel, and the click-to-render time is logged.
+   * Returns null once `use` started, else why it did not (shown in the panel too).
    */
-  function useAccountViaCli(email: string, clickedAt?: number): void {
+  function useAccountViaCli(email: string, clickedAt?: number): string | null {
     const received = Date.now();
     const t0 = useStartMs(clickedAt, received);
     const at = typeof clickedAt === "number" ? clickedAt : received;
@@ -1660,21 +1662,18 @@ export function activate(ctx: vscode.ExtensionContext): void {
       log(`use: ${email} ${Date.now() - t0}ms (${cliMs === null ? "cli not run" : `cli ${cliMs}ms`}, ${ok ? "ok" : running ? "still running" : "failed"}: ${text})`);
       vscode.window.setStatusBarMessage(`claude-switch use ${email}: ${text.slice(0, 160)}`, 8000);
     };
-    if (usePending) {
-      finish(false, `already switching to ${usePending.email}`, null);
-      return;
-    }
+    const refuse = (text: string): string => {
+      finish(false, text, null);
+      return text;
+    };
+    if (usePending) return refuse(`already switching to ${usePending.email}`);
     const panel = installedPanel();
     if (!panelFresh(panel, Date.now()) || !(panel.accounts ?? []).some((a) => a.email === email)) {
-      finish(false, "claude-switch does not list this account right now (panel.json missing, stale or without it)", null);
-      return;
+      return refuse("claude-switch does not list this account right now (panel.json missing, stale or without it)");
     }
     const run: UseRun = { email, started: Date.now(), finish };
     const launch = switchRunner.start(["use", email], { timeoutMs: USE_STUCK_MS, onTimeout: () => stopWaitingForUse(run) });
-    if (!launch.started) {
-      finish(false, busyText(launch.running, Date.now()), null);
-      return;
-    }
+    if (!launch.started) return refuse(busyText(launch.running, Date.now()));
     usePending = run;
     pushUsagePayload();
     void launch.done.then(
@@ -1699,6 +1698,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         finish(false, spawnFailureText(e, SWITCH_CLI), null);
       },
     );
+    return null;
   }
 
   /** The UI timeout of a `use`: the panel stops showing "Switching…" and says the run goes on; the process is never signaled and its exit is still handled. */
@@ -2703,6 +2703,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   }
 
   const switchDeps: SwitchDeps = {
+    lock: () => acquireSwitchLock(path.join(MONITOR_DIR, "account-switch.lock")),
     readKeychain: async () => {
       const user = process.env.USER || os.userInfo().username || "";
       try {
@@ -2787,7 +2788,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   function maybeAutoRotate(): void {
     const c = cfg();
     const rc = {
-      autoRotate: c.get<boolean>("autoRotate", false),
+      autoRotate: autoRotateOn(c.get<boolean>("autoRotate", false), switchInstalled()), // claude-switch rotates by itself
       rotateAtPercent: c.get<number>("rotateAtPercent", 90),
     };
     if (!rc.autoRotate || switchInflight) return;
@@ -4048,20 +4049,20 @@ export function activate(ctx: vscode.ExtensionContext): void {
     return list;
   }
 
-  async function remoteSwitch(account: string): Promise<CommandOutcome> {
-    if (switchInflight) return { ok: false, message: "an account switch is already running" };
-    const views = currentAccountCtx().accounts;
-    const want = account.trim().toLowerCase();
-    const target =
-      want === "best"
-        ? pickBestAccount(views)
-        : views.find((a) => a.id.toLowerCase() === want || a.email.toLowerCase() === want);
-    if (!target) return { ok: false, message: want === "best" ? "no other account with usage data" : `unknown account ${account}` };
-    if (target.active) return { ok: true, message: `already on ${target.email}` };
-    await switchToAccount(target.id);
-    return accountsFile.activeId === target.id
-      ? { ok: true, message: `switched to ${target.email}` }
-      : { ok: false, message: `switch to ${target.email} did not complete` };
+  /** Remote switchAccount: through claude-switch when it is installed, else the extension's own switch (accountSwitch.ts). */
+  function remoteSwitch(account: string): Promise<CommandOutcome> {
+    return routeRemoteSwitch(account, {
+      accounts: () => currentAccountCtx().accounts,
+      switchInstalled: () => switchInstalled(),
+      readPanel: () => readPanel(),
+      nowMs: () => Date.now(),
+      busy: () => switchInflight,
+      startUse: (email) => useAccountViaCli(email),
+      switchDirect: async (id) => {
+        await switchToAccount(id);
+        return accountsFile.activeId === id;
+      },
+    });
   }
 
   async function executeRemote(cmd: FleetCommand): Promise<CommandOutcome> {

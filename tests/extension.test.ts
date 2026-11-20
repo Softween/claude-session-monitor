@@ -441,6 +441,49 @@ describe("extension activate()", () => {
       matchLabels: ["Listing count gap"],
     });
     await vi.waitFor(() => expect(terminal.shown).toBe(true));
+    const record = JSON.parse(fs.readFileSync(`${HOME}/.claude/session-monitor/tabs-debug.json`, "utf8"));
+    expect(record.terminalLookup.via).toBe("match");
+  });
+
+  it("openSession records the terminal lookup when no terminal hosts the session", async () => {
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    // A shell whose pid is neither the session's process nor one of its ancestors.
+    rec.terminals.push({
+      name: "zsh",
+      shown: false,
+      exitStatus: undefined,
+      processId: Promise.resolve(990778),
+      sent: [] as string[],
+      show() {},
+      sendText() {},
+    });
+    await rec.commands.get("claudeSessionMonitor.openSession")!({
+      key: "claude:unhosted-session",
+      provider: "claude",
+      title: "Session in another terminal",
+      sessionId: "unhosted-session",
+      pid: 990779,
+      bucket: "attention",
+      sub: "your turn",
+      capabilities: { focus: true, transcript: true, resume: true, kill: true, bulkInput: true },
+      transcriptPath: `${HOME}/unhosted-session.jsonl`,
+      tooltip: "",
+      detail: "",
+      lastActivityMs: Date.now(),
+      stale: false,
+      matchLabels: ["Session in another terminal"],
+    });
+    const file = `${HOME}/.claude/session-monitor/tabs-debug.json`;
+    const record = await vi.waitFor(() => {
+      const r = JSON.parse(fs.readFileSync(file, "utf8"));
+      expect(r).toMatchObject({ title: "Session in another terminal", action: "no-match -> prompt" });
+      return r;
+    });
+    expect(record.terminalLookup.pid).toBe(990779);
+    expect(record.terminalLookup.pidChain).toContain(990779);
+    expect(record.terminalLookup.terminals).toContainEqual({ name: "zsh", pid: 990778 });
+    expect(record.terminalLookup.via).toBeNull();
   });
 
   it("persists a hidden ended Codex dismissal across activation reloads", async () => {

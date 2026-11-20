@@ -32,7 +32,7 @@ import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickAct
 import { SwitchRunner, busyText, exitText, lastLine, spawnFailureText } from "./switchRunner";
 import { execFile } from "child_process";
 import { randomUUID } from "crypto";
-import { parseParentPid, pickSessionTerminal, pickUniqueLabel } from "./terminalMatch";
+import { parseParentPid, pickSessionTerminal, pickUniqueLabel, type TerminalCandidate } from "./terminalMatch";
 import { ResumeRegistry, isClaudeCliCommand, isClaudeSessionCommand } from "./resumeRegistry";
 import { allowedCwds, mergeSeen, withoutPaths } from "./remoteCwds";
 import { startNewSession } from "./remoteNewSession";
@@ -4656,24 +4656,39 @@ async function ancestorPids(pid: number | undefined): Promise<number[]> {
   return out;
 }
 
+/** What a terminal lookup saw (tabs-debug.json): the window's terminals, the session's pid chain, how it matched. */
+interface TerminalTrace {
+  terminals?: TerminalCandidate[];
+  pidChain?: number[];
+  via?: "match" | "registry" | null;
+}
+
 /**
  * The terminal in this window that hosts the session: the one whose shell pid is
  * the session's process or an ancestor of it, else the one terminal named
  * strictly like a `labels` entry (no name match when `labels` is empty), else the
  * live terminal this window started or resumed the session in (its hook record
- * may have no pid yet). Rejects when the terminal lookup itself fails.
+ * may have no pid yet). Rejects when the terminal lookup itself fails. Fills
+ * `trace`, when given, with what the lookup saw.
  */
 async function findSessionTerminal(
   v: SessionView,
   labels: string[] = [],
   rivals: string[] = [],
+  trace?: TerminalTrace,
 ): Promise<vscode.Terminal | undefined> {
   const terms = vscode.window.terminals;
   const pids = await Promise.all(terms.map((t) => Promise.resolve(t.processId).catch(() => undefined)));
   const candidates = terms.map((t, i) => ({ name: t.name, pid: pids[i] ?? undefined }));
   const pidChain = v.pid ? [v.pid, ...(await ancestorPids(v.pid))] : [];
   const hit = terms[pickSessionTerminal(candidates, labels, pidChain, rivals)];
-  return hit ?? resumeTerminals.liveTerminalFor(v.sessionId);
+  const term = hit ?? resumeTerminals.liveTerminalFor(v.sessionId);
+  if (trace) {
+    trace.terminals = candidates;
+    trace.pidChain = pidChain;
+    trace.via = hit ? "match" : term ? "registry" : null;
+  }
+  return term;
 }
 
 /** Answer of a remote command whose session has no tab (or several same-titled ones) in this window. */
@@ -4806,7 +4821,9 @@ async function jumpToSession(v: SessionView): Promise<void> {
     }
     // A session that runs in a terminal (a remote new session, Resume in Terminal,
     // `claude` typed in a shell) has no editor tab: show its terminal instead.
-    const term = await findSessionTerminal(v);
+    const trace: TerminalTrace = {};
+    const term = await findSessionTerminal(v, [], [], trace);
+    dbg.terminalLookup = { pid: v.pid ?? null, ...trace };
     if (term) {
       term.show();
       dbg.action = `terminal: ${term.name}`;

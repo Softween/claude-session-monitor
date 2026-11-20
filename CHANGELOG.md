@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.38.3
+- **A row click that finds no tab records why it found no terminal either.** The row-click debug record `~/.claude/session-monitor/tabs-debug.json` now carries `terminalLookup`: the session's pid (`null` when its hook record has none), its process chain (the pid and its ancestors), this window's terminals with their process ids, and how the lookup matched (`match` for a terminal whose pid is in that chain, `registry` for the terminal this window started or resumed the session in, `null` for neither). A click that still answers "has no open tab or terminal in this window" now shows whether the window's terminal list lacks the session's terminal or the pid match misses it.
+
 ## 2.38.2
 - **A closed restart guard tab comes back, so a restart of extensions is not left unguarded.** A guard tab you closed stayed closed until the window started again, and the protection went with it. On 2026-11-20 at 02:52 a **Developer: Restart Extension Host** went through without the confirmation because the window had no guard tab: it stopped every Claude session in the window, and each Claude Code tab that had been open showed "Claude Code stopped responding in this tab" when it was next selected, until Claude Code reopened its conversation in a new tab (18 tabs in the next half hour). With `claudeSessionMonitor.restartGuard` on, a guard tab that is closed now opens again the next time the window is not focused, or right away when the window is not focused already, so it never moves a tab or the focus while you work in the window. Turning the setting off still closes it and keeps it closed. Each close is logged as `restart guard: tab closed` in `~/.claude/session-monitor/csm-debug.log`.
 

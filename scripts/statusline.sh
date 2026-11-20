@@ -6,14 +6,28 @@
 #
 #   ~/.claude/session-monitor/limits.json          latest snapshot (atomic)
 #   ~/.claude/session-monitor/limits-history.jsonl  throttled time series (<=1/min)
-#   ~/.claude/session-monitor/statusline-last-raw.json  last raw payload (schema/debug)
+#   ~/.claude/session-monitor/statusline-last-raw.json  last raw payload (schema/debug, atomic)
 #
 # Prints a compact English status line for the Claude UI.
 
 dir="$HOME/.claude/session-monitor"
 mkdir -p "$dir" 2>/dev/null
 in="$(cat)"
-printf '%s' "$in" > "$dir/statusline-last-raw.json" 2>/dev/null
+
+# Replace file $1 with text $2 through a unique temp file in the same folder and
+# a rename: every open session renders through this script, often at once, so a
+# reader never sees a half-written file and two renders never share a temp file.
+put() {
+  local tmp
+  tmp="$(mktemp "$(dirname "$1")/.$(basename "$1").XXXXXX" 2>/dev/null)" || return 1
+  if printf '%s' "$2" > "$tmp" 2>/dev/null && mv -f "$tmp" "$1" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
+put "$dir/statusline-last-raw.json" "$in"
 
 vals="$(printf '%s' "$in" | /usr/bin/jq -c '{
   fh: .rate_limits.five_hour.utilization,
@@ -29,7 +43,7 @@ vals="$(printf '%s' "$in" | /usr/bin/jq -c '{
 if [ -n "$vals" ] && [ "$vals" != "null" ]; then
   has=$(printf '%s' "$vals" | /usr/bin/jq -r '(.fh // .sd // .sds) != null' 2>/dev/null)
   if [ "$has" = "true" ]; then
-    printf '%s' "$vals" > "$dir/limits.json.tmp" 2>/dev/null && mv "$dir/limits.json.tmp" "$dir/limits.json" 2>/dev/null
+    put "$dir/limits.json" "$vals"
     hist="$dir/limits-history.jsonl"
     if [ ! -f "$hist" ] || [ -z "$(/usr/bin/find "$hist" -mmin -1 2>/dev/null)" ]; then
       # Tag the point with the active account so multi-account charts stay
@@ -44,7 +58,23 @@ if [ -n "$vals" ] && [ "$vals" != "null" ]; then
   fi
 fi
 
-printf '%s' "$in" | /usr/bin/jq -r '
+line="$(printf '%s' "$in" | /usr/bin/jq -r '
   def pct(x): if x==null then "-" elif x<=1 then ((x*100)|floor|tostring) else (x|floor|tostring) end;
   "Claude  5h " + pct(.rate_limits.five_hour.utilization) + "%  ·  7d " + pct(.rate_limits.seven_day.utilization) + "%"
-' 2>/dev/null
+' 2>/dev/null)"
+# Optional ctxgov segment (live context size / request count / fixed prefix), only
+# where the local ctxgov tool is installed. Cached for 60s (find -mmin -1, same
+# throttle idiom as the limits-history write above) so a render, which happens on
+# every prompt/tool-use, does not pay a python3 startup cost each time.
+seg=""
+ctxgov="$HOME/.claude/ctxgov/ctxgov.py"
+if [ -f "$ctxgov" ]; then
+  ctxcache="${TMPDIR:-/tmp}/claude-statusline-ctxgov.cache"
+  if [ -f "$ctxcache" ] && [ -n "$(/usr/bin/find "$ctxcache" -mmin -1 2>/dev/null)" ]; then
+    seg="$(cat "$ctxcache" 2>/dev/null)"
+  else
+    seg="$(/opt/homebrew/bin/python3 "$ctxgov" statusline "$dir/statusline-last-raw.json" 2>/dev/null)"
+    put "$ctxcache" "$seg"
+  fi
+fi
+if [ -n "$seg" ]; then printf '%s  ·  %s' "$line" "$seg"; else printf '%s' "$line"; fi

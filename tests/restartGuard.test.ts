@@ -151,8 +151,11 @@ function showGuard(uri: unknown, viewColumn: number): void {
   g.activeTab = tab;
 }
 
-/** Activates the guard with recording deps; `resolveOnOpen` makes vscode.openWith resolve the editor like VS Code does. */
-function activate(dir: string, resolveOnOpen = true) {
+/**
+ * Activates the guard with recording deps; `resolveOnOpen` makes vscode.openWith resolve the
+ * editor like VS Code does; `idleMs` is the time since the last input (a minute by default).
+ */
+function activate(dir: string, resolveOnOpen = true, idleMs: () => Promise<number | undefined> = async () => 60_000) {
   const calls: string[] = [];
   env.onExecute = (id, args) => {
     calls.push(id);
@@ -163,9 +166,10 @@ function activate(dir: string, resolveOnOpen = true) {
   const ctx: any = { subscriptions: [], globalStorageUri: { fsPath: dir } };
   activateRestartGuard(ctx, {
     log: (m) => calls.push(`log ${m}`),
-    focusGroup: async (i) => {
-      calls.push(`focus ${i}`);
+    focusGroup: async (g) => {
+      calls.push(`focus ${g.viewColumn - 1}`); // the group's on-screen slot
     },
+    idleMs,
   });
   return { calls, ctx };
 }
@@ -297,6 +301,71 @@ describe("activateRestartGuard", () => {
     await flush();
     expect(calls).toHaveLength(5);
     expect(env.executed).toHaveLength(2);
+  });
+
+  it("focuses the guard's group and then the focused group by their on-screen slots", async () => {
+    const left = group(1, textTab());
+    const right = group(3, textTab());
+    const middle = group(2, textTab()); // split off after the right group, placed left of it
+    env.groups = [left, right, middle]; // tabGroups.all order: creation
+    env.focused = middle;
+    const { calls } = activate(tmpDir());
+    await flush();
+    expect(calls).toEqual(["vscode.openWith", "focus 0", MRU_BACK, "focus 1", "log restart guard: tab opened"]);
+  });
+
+  it("takes no step back when another tab of the guard's group was chosen while the guard loaded", async () => {
+    const chosen = textTab();
+    const g = group(1, textTab(), chosen);
+    env.groups = [g];
+    const { calls } = activate(tmpDir(), false);
+    await flush();
+    expect(calls).toEqual(["vscode.openWith"]);
+    g.activeTab = chosen; // the guard no longer covers the tab that was active
+    env.providers[0].provider.resolveCustomTextEditor({}, fakePanel());
+    await flush();
+    expect(calls).toEqual(["vscode.openWith", "log restart guard: tab opened"]);
+    expect(g.activeTab).toBe(chosen);
+  });
+
+  it("gives the focus back to the group the user moved to while the guard loaded", async () => {
+    const first = group(1, textTab());
+    const second = group(2, textTab());
+    env.groups = [first, second];
+    const { calls } = activate(tmpDir(), false);
+    await flush();
+    env.focused = second;
+    env.providers[0].provider.resolveCustomTextEditor({}, fakePanel());
+    await flush();
+    expect(calls).toEqual(["vscode.openWith", "focus 0", MRU_BACK, "focus 1", "log restart guard: tab opened"]);
+  });
+
+  it("at activation waits while the user types in the focused window, then opens the guard", async () => {
+    vi.useFakeTimers();
+    env.groups = [group(1, textTab())];
+    const idles = [500, 1_200, 2_500]; // ms since the last input at each check
+    activate(tmpDir(), true, async () => idles.shift());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(opens()).toBe(0);
+    await vi.advanceTimersByTimeAsync(1_500); // 2 s after that input there was another one
+    expect(opens()).toBe(0);
+    await vi.advanceTimersByTimeAsync(800);
+    expect(opens()).toBe(1);
+  });
+
+  it("at activation opens at once while the window is not focused, whatever the input", async () => {
+    env.groups = [group(1, textTab())];
+    env.windowFocused = false;
+    activate(tmpDir(), true, async () => 100);
+    await flush();
+    expect(opens()).toBe(1);
+  });
+
+  it("at activation opens at once when the idle time is unreadable", async () => {
+    env.groups = [group(1, textTab())];
+    activate(tmpDir(), true, async () => undefined);
+    await flush();
+    expect(opens()).toBe(1);
   });
 
   it("takes no step back when the guard's group had no active tab", async () => {

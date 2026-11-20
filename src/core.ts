@@ -171,13 +171,50 @@ export function effectiveEffort(
   return EFFORT_LEVELS.indexOf(effort) > EFFORT_LEVELS.indexOf(cap) ? cap : effort;
 }
 
+/** The rename that publishes a replaced file; injected so a test can make it fail. */
+export interface ReplaceOps {
+  rename(from: string, to: string): void;
+}
+
+/**
+ * Replace a file that other programs own (the user's Claude settings) without
+ * ever leaving it half-written: a unique temp file next to the symlink-resolved
+ * target gets the content and the target's mode, is fsynced, then renamed over
+ * the target, so a symlink stays a symlink to the updated file. On any failure
+ * the old file is untouched, the temp file removed and the error rethrown.
+ */
+export function replaceFileAtomic(file: string, content: string, ops: ReplaceOps = { rename: fs.renameSync }): void {
+  const target = fs.realpathSync(file);
+  const mode = fs.statSync(target).mode & 0o777;
+  const tmp = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`);
+  const fd = fs.openSync(tmp, "wx", 0o600);
+  try {
+    try {
+      fs.writeFileSync(fd, content);
+      fs.fchmodSync(fd, mode);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    ops.rename(tmp, target);
+  } catch (e) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* already gone */
+    }
+    throw e;
+  }
+}
+
 /**
  * Write `effortLevel` into ~/.claude/settings.json, preserving every other
- * key. Returns false (and touches nothing) if the file can't be read/parsed
- * or isn't a JSON object — callers must abort rather than sweep a stale
- * value into running sessions when this fails.
+ * key, atomically (replaceFileAtomic). Returns false (and touches nothing) if
+ * the file can't be read/parsed, isn't a JSON object or can't be replaced —
+ * callers must abort rather than sweep a stale value into running sessions
+ * when this fails.
  */
-export function writeGlobalEffort(effort: string, file = SETTINGS_FILE): boolean {
+export function writeGlobalEffort(effort: string, file = SETTINGS_FILE, ops?: ReplaceOps): boolean {
   let obj: Record<string, unknown>;
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -187,7 +224,7 @@ export function writeGlobalEffort(effort: string, file = SETTINGS_FILE): boolean
     return false;
   }
   try {
-    fs.writeFileSync(file, JSON.stringify({ ...obj, effortLevel: effort }, null, 2) + "\n");
+    replaceFileAtomic(file, JSON.stringify({ ...obj, effortLevel: effort }, null, 2) + "\n", ops);
     return true;
   } catch {
     return false;

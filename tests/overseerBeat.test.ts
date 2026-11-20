@@ -4,7 +4,7 @@ import * as path from "path";
 import { afterEach, describe, expect, it } from "vitest";
 import { acquireSwitchLock } from "../src/accountSwitch";
 import { HEALTH_VERSION, type WindowHealth } from "../src/health";
-import { EMIT_GAP_MS, HEARTBEAT_EVERY, OverseerBeat, PRUNE_MS, TOOL_ID, liveWindows, overseerBin, summarize, type BeatDeps } from "../src/overseerBeat";
+import { EMIT_GAP_MS, HEARTBEAT_EVERY, OverseerBeat, PRUNE_EVERY_MS, PRUNE_MS, TOOL_ID, liveWindows, overseerBin, pruneHealth, summarize, type BeatDeps } from "../src/overseerBeat";
 
 const NOW = Date.parse("2026-11-20T12:00:00.000Z");
 const GONE_PID = 2_000_000_000; // above every platform's pid range: no process carries it
@@ -28,6 +28,9 @@ function health(win: string, over: Partial<WindowHealth> = {}): WindowHealth {
   };
 }
 
+/** The health file of a window that closed without removing it a day before `nowMs`. */
+const gone = (win: string, nowMs: number): WindowHealth => health(win, { pid: GONE_PID, ts: (nowMs - PRUNE_MS) / 1000 - 1 });
+
 interface Rig {
   deps: BeatDeps;
   runs: string[][];
@@ -37,7 +40,7 @@ interface Rig {
 }
 
 /** A window's BeatDeps on a real temp folder (real lock files); the CLI is recorded, not run. */
-function rig(dir = fs.mkdtempSync(path.join(os.tmpdir(), "csm-beat-")), exitText: () => string | undefined = () => undefined): Rig {
+function rig(dir = fs.mkdtempSync(path.join(os.tmpdir(), "csm-beat-")), exitText: (args: readonly string[]) => string | undefined = () => undefined): Rig {
   dirs.push(dir);
   const runs: string[][] = [];
   const logs: string[] = [];
@@ -56,7 +59,7 @@ function rig(dir = fs.mkdtempSync(path.join(os.tmpdir(), "csm-beat-")), exitText
     lock: (f) => acquireSwitchLock(f),
     run: async (_file, args) => {
       runs.push([...args]);
-      return exitText();
+      return exitText(args);
     },
     log: (m) => void logs.push(m),
   };
@@ -84,40 +87,77 @@ describe("summarize", () => {
   });
 });
 
+/** Live, dead, stale and day-old health files, next to files that are no window's. */
+function putMixed(r: Rig): void {
+  r.put(health("aaaaaaaaaaaaaaaa"));
+  r.put(health(`empty-${process.pid}`, { ts: NOW / 1000 - 60 }));
+  r.put(health("cccccccccccccccc", { pid: GONE_PID })); // its window closed without removing the file
+  r.put(health("dddddddddddddddd", { ts: NOW / 1000 - 120 })); // not written for 2 minutes
+  r.put(health("eeeeeeeeeeeeeeee", { ts: (NOW - PRUNE_MS) / 1000 - 1 }));
+  r.put(gone(`empty-${GONE_PID}`, NOW)); // a window without a folder that crashed
+  fs.writeFileSync(path.join(r.deps.dir, "errors.json"), "{}");
+  fs.writeFileSync(path.join(r.deps.dir, "ffffffffffffffff.json"), "not json");
+}
+
 describe("liveWindows", () => {
-  it("reads the fresh files of live pids, skips the stale, dead and foreign ones, and removes files gone for a day", () => {
+  it("reads the fresh files of live pids, skips the stale, dead and foreign ones, and removes none", () => {
     const r = rig();
-    r.put(health("aaaaaaaaaaaaaaaa"));
-    r.put(health(`empty-${process.pid}`, { ts: NOW / 1000 - 60 }));
-    r.put(health("cccccccccccccccc", { pid: GONE_PID })); // its window closed without removing the file
-    r.put(health("dddddddddddddddd", { ts: NOW / 1000 - 120 })); // not written for 2 minutes
-    r.put(health("eeeeeeeeeeeeeeee", { ts: (NOW - PRUNE_MS) / 1000 - 1 }));
-    fs.writeFileSync(path.join(r.deps.dir, "errors.json"), "{}");
-    fs.writeFileSync(path.join(r.deps.dir, "ffffffffffffffff.json"), "not json");
+    putMixed(r);
+    const files = fs.readdirSync(r.deps.dir).sort();
     expect(liveWindows(r.deps, NOW).map((w) => w.win)).toEqual(["aaaaaaaaaaaaaaaa", `empty-${process.pid}`]);
-    expect(fs.existsSync(path.join(r.deps.dir, "eeeeeeeeeeeeeeee.json"))).toBe(false);
-    expect(fs.existsSync(path.join(r.deps.dir, "cccccccccccccccc.json"))).toBe(true);
-    expect(fs.existsSync(path.join(r.deps.dir, "errors.json"))).toBe(true);
+    expect(fs.readdirSync(r.deps.dir).sort()).toEqual(files);
+  });
+});
+
+describe("pruneHealth", () => {
+  it("removes the health files of windows gone for a day and keeps every other file", () => {
+    const r = rig();
+    putMixed(r);
+    pruneHealth(r.deps, NOW);
+    expect(fs.readdirSync(r.deps.dir).sort()).toEqual(
+      ["aaaaaaaaaaaaaaaa.json", "cccccccccccccccc.json", "dddddddddddddddd.json", `empty-${process.pid}.json`, "errors.json", "ffffffffffffffff.json"].sort(),
+    );
   });
 });
 
 describe("OverseerBeat", () => {
-  it("observer mode takes no lock, writes no state and emits nothing", async () => {
+  it("observer mode takes no lock, writes no state, emits nothing and removes no file", async () => {
     const r = rig();
     r.deps.shared = () => false;
     r.put(health("aaaaaaaaaaaaaaaa"));
+    r.put(gone("eeeeeeeeeeeeeeee", NOW));
     expect(await new OverseerBeat(r.deps).tick()).toBe("observer mode");
+    expect(r.runs).toEqual([]);
+    expect(fs.readdirSync(r.deps.dir).sort()).toEqual(["aaaaaaaaaaaaaaaa.json", "eeeeeeeeeeeeeeee.json"]);
+  });
+
+  it("where overseer is not installed it sends nothing but still removes the health files of windows gone for a day", async () => {
+    const r = rig();
+    r.deps.exists = () => false;
+    r.put(health("aaaaaaaaaaaaaaaa"));
+    r.put(gone(`empty-${GONE_PID}`, NOW)); // a window without a folder that crashed: every such crash leaves a new file
+    expect(await new OverseerBeat(r.deps).tick()).toBe("no overseer");
     expect(r.runs).toEqual([]);
     expect(fs.readdirSync(r.deps.dir)).toEqual(["aaaaaaaaaaaaaaaa.json"]);
   });
 
-  it("does nothing where overseer is not installed", async () => {
+  it("looks for health files to remove at most once an hour, and at once after the clock was set back", async () => {
     const r = rig();
     r.deps.exists = () => false;
-    r.put(health("aaaaaaaaaaaaaaaa"));
-    expect(await new OverseerBeat(r.deps).tick()).toBe("no overseer");
-    expect(r.runs).toEqual([]);
-    expect(fs.readdirSync(r.deps.dir)).toEqual(["aaaaaaaaaaaaaaaa.json"]);
+    const beat = new OverseerBeat(r.deps);
+    const day = path.join(r.deps.dir, "eeeeeeeeeeeeeeee.json");
+    await beat.tick(); // the first beat looks
+    r.clock.now += 30_000;
+    r.put(gone("eeeeeeeeeeeeeeee", r.clock.now));
+    await beat.tick();
+    expect(fs.existsSync(day)).toBe(true); // within the hour: not looked for again
+    r.clock.now += PRUNE_EVERY_MS;
+    await beat.tick();
+    expect(fs.existsSync(day)).toBe(false);
+    r.clock.now -= 3 * PRUNE_EVERY_MS; // the clock set back
+    r.put(gone("eeeeeeeeeeeeeeee", r.clock.now));
+    await beat.tick();
+    expect(fs.existsSync(day)).toBe(false);
   });
 
   it("sends one heartbeat summarizing all live windows through overseer emit, then an action line for the new state", async () => {
@@ -184,19 +224,49 @@ describe("OverseerBeat", () => {
     expect(r.runs.filter((x) => x.includes("--heartbeat"))).toHaveLength(3);
   });
 
+  it("an action line that did not reach overseer is sent again with the next emit", async () => {
+    let actionFails = true;
+    const r = rig(undefined, (args) => (actionFails && !args.includes("--heartbeat") ? "inbox session-monitor.jsonl is locked" : undefined));
+    const beat = new OverseerBeat(r.deps);
+    r.put(health("aaaaaaaaaaaaaaaa"));
+    expect(await beat.tick()).toBe("failed");
+    actionFails = false;
+    for (let i = 0; i < 2; i++) {
+      r.clock.now += EMIT_GAP_MS;
+      r.put(health("aaaaaaaaaaaaaaaa", { ts: r.clock.now / 1000 }));
+      expect(await beat.tick()).toBe("emitted");
+    }
+    expect(r.runs.filter((x) => !x.includes("--heartbeat"))).toHaveLength(2); // the failed one and its resend, then none for the same state
+  });
+
   it("a failing emit is logged once per reason and still counts as the minute's emit", async () => {
-    const r = rig(undefined, () => "inbox session-monitor.jsonl is full");
+    let reason = "inbox session-monitor.jsonl is full";
+    const r = rig(undefined, () => reason);
     const beat = new OverseerBeat(r.deps);
     r.put(health("aaaaaaaaaaaaaaaa"));
     expect(await beat.tick()).toBe("failed");
     r.clock.now += EMIT_GAP_MS;
     r.put(health("aaaaaaaaaaaaaaaa", { ts: r.clock.now / 1000 }));
+    expect(await beat.tick()).toBe("failed"); // the action line sent again, failing for the same reason
+    r.clock.now += EMIT_GAP_MS;
+    r.put(health("aaaaaaaaaaaaaaaa", { ts: r.clock.now / 1000 }));
+    reason = "overseer: permission denied";
     expect(await beat.tick()).toBe("failed");
     expect(r.logs).toEqual([
       "overseer: emit failed (heartbeat: inbox session-monitor.jsonl is full; action: inbox session-monitor.jsonl is full); repeats are not logged",
-      "overseer: emit failed (heartbeat: inbox session-monitor.jsonl is full); repeats are not logged",
+      "overseer: emit failed (heartbeat: overseer: permission denied; action: overseer: permission denied); repeats are not logged",
     ]);
     r.clock.now += 10_000;
+    expect(await beat.tick()).toBe("recent");
+  });
+
+  it("a clock set back does not hold the emits until it passes the last one again", async () => {
+    const r = rig();
+    r.put(health("aaaaaaaaaaaaaaaa"));
+    fs.writeFileSync(path.join(r.deps.dir, "emit.json"), JSON.stringify({ ts: NOW + 3600_000, sig: "" })); // sent before the clock went back an hour
+    const beat = new OverseerBeat(r.deps);
+    expect(await beat.tick()).toBe("emitted");
+    r.clock.now += 30_000;
     expect(await beat.tick()).toBe("recent");
   });
 

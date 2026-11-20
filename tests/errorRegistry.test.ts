@@ -3,7 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import { afterEach, describe, expect, it } from "vitest";
 import { acquireSwitchLock } from "../src/accountSwitch";
-import { MAX_ERRORS, mergeErrors, saveErrors, type SaveDeps } from "../src/errorRegistry";
+import { MAX_ERRORS, mergeErrors, readIfThere, saveErrors, type SaveDeps } from "../src/errorRegistry";
 import type { ErrorRecord } from "../src/safeStage";
 
 const T0 = Date.parse("2026-11-20T12:00:00.000Z");
@@ -75,8 +75,9 @@ describe("mergeErrors", () => {
     expect(keys).toContain(`limits: Error: e${MAX_ERRORS + 1}`);
   });
 
-  it("starts over from a file of another format and skips malformed entries", () => {
-    expect(mergeErrors({ v: 2, errors: { k: {} } }, [], "2.40.0", "w")).toEqual({ v: 1, errors: {} });
+  it("refuses a file of another version or shape and skips malformed entries", () => {
+    expect(() => mergeErrors({ v: 2, errors: { k: {} } }, [], "2.40.0", "w")).toThrow(/left as it is/);
+    expect(() => mergeErrors(null, [], "2.40.0", "w")).toThrow(/left as it is/);
     const kept = { stage: "x", count: 1, first: "a", last: "b", stack: "s", ver: "1", win: "w" };
     expect(mergeErrors({ v: 1, errors: { good: kept, bad: { stage: 1 } } }, [], "2.40.0", "w")).toEqual({ v: 1, errors: { good: kept } });
   });
@@ -113,5 +114,44 @@ describe("saveErrors", () => {
     const deps = fileDeps();
     expect(saveErrors([], "2.40.0", "w1", deps)).toBe(true);
     expect(fs.existsSync(deps.file)).toBe(false);
+  });
+
+  it("leaves a file it cannot read as it is: only a missing file starts an empty registry", () => {
+    const deps = fileDeps();
+    expect(saveErrors([rec("wake: Error: x", 2, T0)], "2.40.0", "w1", deps)).toBe(true);
+    const before = fs.readFileSync(deps.file, "utf8");
+    const emfile = Object.assign(new Error("EMFILE: too many open files"), { code: "EMFILE" });
+    const unreadable: SaveDeps = {
+      ...deps,
+      read: () => {
+        throw emfile;
+      },
+    };
+    expect(() => saveErrors([rec("limits: Error: y", 1, T0)], "2.40.0", "w2", unreadable)).toThrow(emfile);
+    expect(fs.readFileSync(deps.file, "utf8")).toBe(before);
+    expect(fs.existsSync(`${deps.file}.lock`)).toBe(false);
+  });
+
+  it("leaves a file of another version or shape as it is, a newer window's included", () => {
+    const deps = fileDeps();
+    fs.mkdirSync(path.dirname(deps.file), { recursive: true });
+    for (const text of [`${JSON.stringify({ v: 2, errors: { "wake: Error: x": { count: 7 } } })}\n`, "not json", "null"]) {
+      fs.writeFileSync(deps.file, text);
+      expect(() => saveErrors([rec("wake: Error: x", 1, T0)], "2.40.0", "w1", deps)).toThrow();
+      expect(fs.readFileSync(deps.file, "utf8")).toBe(text);
+      expect(fs.existsSync(`${deps.file}.lock`)).toBe(false);
+    }
+  });
+});
+
+describe("readIfThere", () => {
+  it("gives a file's text, undefined only when there is no file, and throws any other error", () => {
+    const deps = fileDeps();
+    expect(readIfThere(deps.file)).toBeUndefined(); // neither the file nor its folder exists
+    fs.mkdirSync(deps.file, { recursive: true }); // a folder where the file belongs
+    expect(() => readIfThere(deps.file)).toThrow(/EISDIR/);
+    const file = path.join(deps.file, "x.json");
+    fs.writeFileSync(file, "{}");
+    expect(readIfThere(file)).toBe("{}");
   });
 });

@@ -47,6 +47,7 @@ import { submitAnswer } from "./answers";
 import { nothingTyped, typeIntoPrompt, type TypeResult } from "./keystrokeTyping";
 import { acquireSwitchLock, autoRotateOn, remoteSwitch as routeRemoteSwitch } from "./accountSwitch";
 import { activateRestartGuard } from "./restartGuard";
+import { observerMode } from "./observerMode";
 import {
   KIND_LABEL,
   RESET_KINDS,
@@ -236,7 +237,22 @@ function rotateLog(): void {
   }
 }
 
+let logSink: ((msg: string) => void) | undefined; // observer mode (observerMode.ts): this window's Output channel instead of the shared file
+
+/** Observer mode's log: a dev host never writes the shared csm-debug.log, it logs to an Output channel of its own. */
+function observerLog(ctx: vscode.ExtensionContext): (msg: string) => void {
+  const channel = vscode.window.createOutputChannel("Agent Session Monitor (observer)", { log: true });
+  const sink = (msg: string): void => channel.info(msg);
+  ctx.subscriptions.push(channel, {
+    dispose: () => {
+      if (logSink === sink) logSink = undefined;
+    },
+  });
+  return sink;
+}
+
 function log(msg: string): void {
+  if (logSink) return logSink(msg);
   try {
     ensurePrivateDir(MONITOR_DIR);
     try {
@@ -1590,6 +1606,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let providerFilter: AgentProvider | "all" =
     savedProviderFilter === "claude" || savedProviderFilter === "codex" ? savedProviderFilter : "all";
   const stages = stageGuard(log); // a refresh stage or feature start that throws is logged and skipped (safeStage.ts)
+  // An Extension Development Host only reads and shows both panels; dev.enableFeatures lists what it may do besides (observerMode.ts).
+  const observer = observerMode({
+    development: ctx.extensionMode === vscode.ExtensionMode.Development,
+    enableFeatures: cfg().get<unknown>("dev.enableFeatures", []),
+    notify: (text) => void vscode.window.showInformationMessage(text),
+  });
+  const allowed = observer.featureAllowed;
+  logSink = allowed("sharedFiles") ? undefined : observerLog(ctx);
+  if (observer.on) log(observer.summary());
 
   const resourceCache = new Map<number, ResStat>();
   const sessionsView = new SessionsView((action, sessionId) => {
@@ -1670,6 +1695,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       finish(false, text, null);
       return text;
     };
+    if (!allowed("accountWrites")) return refuse(observer.notice("accountWrites"));
     if (usePending) return refuse(`already switching to ${usePending.email}`);
     const panel = installedPanel();
     if (!panelFresh(panel, Date.now()) || !(panel.accounts ?? []).some((a) => a.email === email)) {
@@ -1728,6 +1754,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
       log(`${cmd}: ${email} failed: ${text}`);
       void vscode.window.showWarningMessage(`claude-switch ${cmd} ${email}: ${text}`);
     };
+    if (!allowed("accountWrites")) {
+      fail(observer.notice("accountWrites"));
+      return;
+    }
     if (!(installedPanel()?.accounts ?? []).some((a) => a.email === email)) {
       fail("claude-switch does not list this account (panel.json missing or without it)");
       return;
@@ -1890,7 +1920,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       vscode.window.setStatusBarMessage("Limit resets: another reset is being used", 5000);
     } else if (!resetsOn() || !kind || !email || !status || !grant) {
       void vscode.window.showInformationMessage(`No usable ${kind ? KIND_LABEL[kind] : "reset"}${email ? ` on ${email}` : ""} right now.`);
-    } else {
+    } else if (observer.actionAllowed("accountWrites")) {
       resetsClaiming = true;
       try {
         await confirmAndClaim(id, email, kind, status, grant);
@@ -2091,6 +2121,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const autoResumeOverrides = () => readOverrides(ctx.globalState.get(OVERRIDES_KEY), Date.now());
 
   function maybeScheduleAutoResume(views: SessionView[]): void {
+    if (!allowed("autoResume")) return; // observer mode: no sweep is ever scheduled
     const all = autoResumeAll();
     const limitedViews = claudeEnabled() ? limitedToResume(views, autoResumeOverrides(), all) : [];
     if (!claudeEnabled() || (!all && !limitedViews.length)) {
@@ -2194,6 +2225,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
       if (activeId) usageFail.set(activeId, { kind: "rate_limited", httpStatus: 429 });
     } else if (usageNote?.startsWith("usage API rate-limited")) {
       usageNote = null;
+    }
+    if (!allowed("usagePolls")) {
+      if (force) pushUsagePayload();
+      return; // observer mode: only what the other windows' polls saved (adopted above on every tick)
     }
     if (force) {
       cachedCreds = undefined; // re-read keychain: the account may have changed
@@ -2306,6 +2341,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           usageFail.delete(a.id);
           changed = true; // another window fetched it
         }
+        if (!allowed("usagePolls")) continue; // observer mode: only what the other windows' polls saved
         let vault = await readVaultOauth(a.id);
         const cliBlob = cliPresent ? await readCliVault(a.id, log) : null;
         const cliOauth = cliBlob?.claudeAiOauth;
@@ -2588,7 +2624,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
    * rate-limited.
    */
   async function captureActiveLogin(force: boolean): Promise<void> {
-    if (switchInflight || !trackAllAccounts() || process.platform !== "darwin") return;
+    if (!allowed("accountWrites") || switchInflight || !trackAllAccounts() || process.platform !== "darwin") return;
     if (captureInflight) {
       if (force) captureForceQueued = true; // don't drop a manual refresh: the next pass runs forced
       return;
@@ -2748,6 +2784,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   };
 
   async function switchToAccount(targetId: string, auto = false): Promise<void> {
+    if (!(auto ? allowed("rotation") : observer.actionAllowed("accountWrites"))) return; // observer mode: no keychain or ~/.claude.json write
     if (process.platform !== "darwin") {
       vscode.window.showErrorMessage("Agent Sessions: switching Claude accounts is only supported on macOS.");
       return;
@@ -2791,6 +2828,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   }
 
   function maybeAutoRotate(): void {
+    if (!allowed("rotation")) return;
     const c = cfg();
     const rc = {
       autoRotate: autoRotateOn(c.get<boolean>("autoRotate", false), switchInstalled()), // claude-switch rotates by itself
@@ -2872,7 +2910,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (next.id === accountsFile.activeId) return false;
     const disk = readAccountsFile();
     setAccounts(markActive(disk, next, Date.now() / 1000));
-    if (!alreadyActive(disk, next.id)) writeAccountsFile(accountsFile); // every window follows the switch within a tick: only the first one writes
+    if (!alreadyActive(disk, next.id) && allowed("accountWrites")) writeAccountsFile(accountsFile); // every window follows the switch within a tick: only the first one writes
     cachedCreds = undefined; // the keychain holds the new login's token now
     const snap = readOfficialSnapshot(officialUsageFileFor(next.id)); // another window may have polled it more recently
     const known = usageByAccount.get(next.id);
@@ -3186,7 +3224,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       lastRecentScan = now;
     }
 
-    if (now - lastCleanup > 600) {
+    if (now - lastCleanup > 600 && allowed("sharedFiles")) {
       try {
         cleanupMonitorFiles(12 * 3600 * 1000, now);
         cleanupMonitorFiles(12 * 3600 * 1000, now, CODEX_MONITOR_DIR);
@@ -3201,7 +3239,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       lastTokenScan = now;
       try {
         const tx7 = findRecentTranscripts(7 * 86400 * 1000, 400, now);
-        tokenUsage = scanTokenUsage(tx7, now);
+        tokenUsage = scanTokenUsage(tx7, now, { persist: allowed("sharedFiles") }); // observer mode reads the shared token-count cache, never writes it
       } catch {
         /* ignore */
       }
@@ -3235,7 +3273,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         const merged = mergePanelAccounts(accountsFile, panel0);
         if (merged !== accountsFile) {
           setAccounts(merged);
-          writeAccountsFile(accountsFile);
+          if (allowed("accountWrites")) writeAccountsFile(accountsFile);
         }
       }
       void pollOtherAccounts(false);
@@ -3720,7 +3758,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       );
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.wakeDeadTabsNow", async () => {
-      if (tabWaker) vscode.window.showInformationMessage(summaryText(await tabWaker.runNow()));
+      if (tabWaker && observer.actionAllowed("wake")) vscode.window.showInformationMessage(summaryText(await tabWaker.runNow()));
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.setModelAll", async () => {
       const queue = lastAllViews.filter(
@@ -3756,6 +3794,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       });
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.setEffortAll", async () => {
+      if (!observer.actionAllowed("accountWrites")) return; // it writes ~/.claude/settings.json
       const queue = inThisWindow(
         lastAllViews.filter((v) => v.provider === "claude" && v.capabilities.bulkInput && groupOf(v) !== "ended"),
       );
@@ -3798,7 +3837,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         codexEnabled() ? pollCodex(true) : Promise.resolve(),
       ]);
       try {
-        if (switchInstalled()) {
+        if (switchInstalled() && allowed("accountWrites")) {
           const launch = switchRunner.start(["tick", "--fresh"]);
           if (!launch.started) {
             vscode.window.setStatusBarMessage(busyText(launch.running, Date.now()), 8000);
@@ -3825,6 +3864,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claudeSessionMonitor.switchAccount", () => pickAndSwitchAccount()),
     vscode.commands.registerCommand("claudeSessionMonitor.switchToBestAccount", () => rotateToBest()),
     vscode.commands.registerCommand("claudeSessionMonitor.forgetOtherAccounts", async () => {
+      if (!observer.actionAllowed("accountWrites")) return;
       setAccounts(readAccountsFile()); // another window may have a fresher registry
       const keepId = accountsFile.activeId;
       if (!keepId) {
@@ -3934,7 +3974,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   ctx.subscriptions.push({ dispose: () => debouncedRefresh.cancel() });
   for (const monitorDir of [MONITOR_DIR, CODEX_MONITOR_DIR]) {
     try {
-      ensurePrivateDir(monitorDir);
+      if (allowed("sharedFiles")) ensurePrivateDir(monitorDir); // observer mode watches only a folder that is there
       const w = fs.watch(monitorDir, (_ev, name) => {
         if (monitorEventMatters(name)) debouncedRefresh();
       });
@@ -4202,9 +4242,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
   }
 
-  // Resolved once per activation; the remote path never runs a bare `claude`.
+  // Resolved once per activation; the remote path never runs a bare `claude`. Observer mode skips the `which` process.
   claudeBinaryPath = undefined;
-  claudeBinary = resolveClaudeBinary({ which: () => runTool("which", ["claude"], 3000), home: os.homedir() }).then((p) => {
+  const which = (): Promise<string | null> => (allowed("remoteBridge") ? runTool("which", ["claude"], 3000) : Promise.resolve(null));
+  claudeBinary = resolveClaudeBinary({ which, home: os.homedir() }).then((p) => {
     claudeBinaryPath = p;
     if (!p) {
       log(
@@ -4218,20 +4259,21 @@ export function activate(ctx: vscode.ExtensionContext): void {
   ctx.subscriptions.push(vscode.window.onDidCloseTerminal((t) => resumeTerminals.forget(t)));
 
   // Each feature start below fails alone: the others and the first refresh still run.
-  remoteBridge = stages.safe("remote bridge start", () => registerRemoteBridge(ctx, {
+  // Observer mode (observerMode.ts) skips the bridge and the restart guard and keeps wakes and continuity disabled.
+  remoteBridge = allowed("remoteBridge") ? stages.safe("remote bridge start", () => registerRemoteBridge(ctx, {
     log,
     accounts: remoteAccounts,
     execute: executeRemote,
     allowedCwds: () => remoteCwds(),
     autoResume: (v) => rowAutoResume(v, autoResumeOverrides(), autoResumeAll(), autoResumeAt),
-  }));
+  })) : undefined;
 
   // After a restart, show each limit-stopped Claude Code tab once so its process runs
   // again (wakeTabs.ts). Started before the first refresh, which updates its registry.
   const probes = nodeProbes();
   tabWaker = stages.safe("tab wake start", () => new TabWaker<TabMemo>({
     ...probes,
-    enabled: () => claudeEnabled() && cfg().get<boolean>("wakeDeadTabs", false) === true,
+    enabled: () => allowed("wake") && claudeEnabled() && cfg().get<boolean>("wakeDeadTabs", false) === true,
     store: ctx.workspaceState,
     log,
     now: () => Date.now(),
@@ -4261,7 +4303,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // (continuity.ts), each in its existing tab, ahead of the limit-stopped tab wakes.
   continuity = stages.safe("continuity start", () => new ContinuityServer<vscode.TabGroup, vscode.Tab>({
     ...probes,
-    enabled: () => claudeEnabled() && cfg().get<boolean>("continuityChannel", false) === true,
+    enabled: () => allowed("continuity") && claudeEnabled() && cfg().get<boolean>("continuityChannel", false) === true,
     storage: storageDir(ctx.storageUri?.fsPath),
     version: (ctx.extension?.packageJSON as { version?: string } | undefined)?.version ?? "0.0.0",
     pid: process.pid,
@@ -4284,11 +4326,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
   ctx.subscriptions.push({ dispose: () => continuity?.dispose() });
 
   // Ask before an extension restart stops every session in this window (restartGuard.ts).
-  stages.safe("restart guard start", () => activateRestartGuard(ctx, {
+  if (allowed("restartGuard")) stages.safe("restart guard start", () => activateRestartGuard(ctx, {
     log,
     focusGroup: focusTabGroup,
     idleMs: probes.idleMs,
   }));
+  // The commands of a feature observer mode keeps off say so instead of "command not found".
+  for (const { command, feature } of observer.offCommands()) {
+    ctx.subscriptions.push(vscode.commands.registerCommand(command, () => observer.actionAllowed(feature)));
+  }
 
   stages.safe("first refresh", refresh);
 }

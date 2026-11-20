@@ -28,7 +28,8 @@
         "claudeSessionMonitor.trackAllAccounts",
         "claudeSessionMonitor.remote.url",
         "claudeSessionMonitor.remote.host",
-        "claudeSessionMonitor.remote.typeFallback"
+        "claudeSessionMonitor.remote.typeFallback",
+        "claudeSessionMonitor.dev.enableFeatures"
       ]
     }
   },
@@ -502,6 +503,26 @@
           "scope": "application",
           "default": true,
           "markdownDescription": "Let a remote `send` or `resume` switch to a session's Claude Code tab and type into it (macOS keystrokes) when the session has no VS Code terminal here. Only when this VS Code window is focused (VS Code is never brought to the front), the tab is the window's one tab matching the session title (Claude Code's truncated labels included, never one another session's title matches too) and VS Code is still the frontmost app at the keystroke; otherwise `send` goes to the session's inbox. Off never types. It types in chunks of at most 200 characters and stops, without pressing Return, as soon as the Claude Code prompt input loses the focus."
+        },
+        "claudeSessionMonitor.dev.enableFeatures": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "remoteBridge",
+              "rotation",
+              "autoResume",
+              "wake",
+              "continuity",
+              "restartGuard",
+              "usagePolls",
+              "accountWrites",
+              "sharedFiles"
+            ]
+          },
+          "uniqueItems": true,
+          "default": [],
+          "markdownDescription": "Extension Development Host only; every other window ignores it. There the monitor runs in observer mode: it reads the sessions, usage and accounts the other windows saved and shows both panels, and every feature that acts on the shared state is off. List the ones a live test needs (read when the window starts; each feature's own setting still applies): `remoteBridge` (the remote bridge), `rotation` (`autoRotate`), `autoResume` (`autoResumeAfterReset`), `wake` (`wakeDeadTabs`), `continuity` (`continuityChannel`), `restartGuard` (the restart guard tab), `usagePolls` (this window's own usage polls and what they save: usage snapshots, limits history, reset readings, account registry, token refreshes), `accountWrites` (login capture, account switches through the keychain and `~/.claude.json`, claude-switch runs, forgetting accounts, reset claims, `~/.claude/settings.json`), `sharedFiles` (the debug log, the monitor folders, the token-count cache and the stale status-file cleanup; while it is off the log goes to the **Agent Session Monitor (observer)** Output channel)."
         }
       }
     },

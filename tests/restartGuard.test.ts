@@ -13,6 +13,9 @@ const env = vi.hoisted(() => ({
   commands: new Map<string, (...a: any[]) => any>(),
   configListeners: [] as Array<(e: any) => void>,
   providers: [] as Array<{ viewType: string; provider: any; options: any }>,
+  tabListeners: [] as Array<(e: any) => void>,
+  windowListeners: [] as Array<(e: any) => void>,
+  windowFocused: true,
 }));
 
 vi.mock("vscode", () => {
@@ -42,6 +45,17 @@ vi.mock("vscode", () => {
           env.closed.push(tabs);
           return true;
         },
+        onDidChangeTabs: (listener: (e: any) => void) => {
+          env.tabListeners.push(listener);
+          return { dispose() {} };
+        },
+      },
+      get state() {
+        return { focused: env.windowFocused };
+      },
+      onDidChangeWindowState: (listener: (e: any) => void) => {
+        env.windowListeners.push(listener);
+        return { dispose() {} };
       },
       registerCustomEditorProvider: (viewType: string, provider: any, options: any) => {
         env.providers.push({ viewType, provider, options });
@@ -91,6 +105,9 @@ afterEach(() => {
   env.commands.clear();
   env.configListeners.length = 0;
   env.providers.length = 0;
+  env.tabListeners.length = 0;
+  env.windowListeners.length = 0;
+  env.windowFocused = true;
   vi.useRealTimers();
 });
 
@@ -153,6 +170,19 @@ function activate(dir: string, resolveOnOpen = true) {
   return { calls, ctx };
 }
 
+const opens = () => env.executed.filter((e) => e.id === "vscode.openWith").length;
+const fireTabsClosed = (...closed: any[]) => env.tabListeners.forEach((l) => l({ opened: [], closed, changed: [] }));
+const fireWindow = (focused: boolean) => {
+  env.windowFocused = focused;
+  env.windowListeners.forEach((l) => l({ focused }));
+};
+/** Closes the guard tab like the user would: it leaves its group and the group's first tab becomes active. */
+const closeGuardTab = (g: any): void => {
+  const guard = g.tabs.find((t: any) => isGuardTab(t));
+  g.tabs = g.tabs.filter((t: any) => t !== guard);
+  g.activeTab = g.tabs[0];
+  fireTabsClosed(guard);
+};
 const fireConfig = (key: string) => env.configListeners.forEach((l) => l({ affectsConfiguration: (k: string) => k === key }));
 
 describe("guard page and file", () => {
@@ -312,6 +342,58 @@ describe("activateRestartGuard", () => {
     fireConfig("claudeSessionMonitor.restartGuard");
     await flush();
     expect(calls.slice(1)).toEqual(["vscode.openWith", "focus 0", MRU_BACK, "log restart guard: tab opened"]);
+  });
+
+  it("opens a closed guard tab again once the window loses focus, not while you work in it", async () => {
+    const g = group(1, textTab());
+    env.groups = [g];
+    const { calls } = activate(tmpDir());
+    await flush();
+    expect(opens()).toBe(1);
+
+    closeGuardTab(g);
+    await flush();
+    expect(opens()).toBe(1); // the window is focused: nothing moves under the user
+    expect(calls.at(-1)).toBe("log restart guard: tab closed, opens again when the window is not focused");
+
+    fireWindow(false);
+    await flush();
+    expect(calls.slice(-4)).toEqual(["vscode.openWith", "focus 0", MRU_BACK, "log restart guard: tab opened"]);
+    expect(findGuardTab(env.groups)).toBeDefined();
+
+    fireWindow(true);
+    fireWindow(false);
+    await flush();
+    expect(opens()).toBe(2); // once per close
+  });
+
+  it("opens a closed guard tab again right away when the window is not focused", async () => {
+    const g = group(1, textTab());
+    env.groups = [g];
+    activate(tmpDir());
+    await flush();
+    env.windowFocused = false;
+    closeGuardTab(g);
+    await flush();
+    expect(opens()).toBe(2);
+  });
+
+  it("does not open it again for another tab's close or once the setting is off", async () => {
+    const g = group(1, textTab());
+    env.groups = [g];
+    activate(tmpDir());
+    await flush();
+    fireTabsClosed(textTab());
+    fireWindow(false);
+    await flush();
+    expect(opens()).toBe(1);
+
+    fireWindow(true);
+    env.config.set("restartGuard", false);
+    closeGuardTab(g);
+    fireWindow(false);
+    await flush();
+    expect(opens()).toBe(1);
   });
 
   it("opens the guard with focus from the command, and logs a failure instead of throwing", async () => {

@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.38.1",
+  "version": "2.38.2",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -472,7 +472,7 @@
         "claudeSessionMonitor.restartGuard": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Keep a small **Claude restart guard** tab open in the first editor group, so VS Code asks (**Please confirm restart of extensions.**) before it restarts extensions, for example to apply an extension update. Restarting extensions stops every Claude Code session in the window, because each session's process runs inside the extension host. Updates still install and take effect at the next window reload; window reloads themselves are not guarded. The tab is shown once when the window starts and your previous tab comes back right away; a tab you close stays closed until the window starts again. Off closes the tab. **Agent Sessions: Open Claude restart guard** opens it again."
+          "markdownDescription": "Keep a small **Claude restart guard** tab open in the first editor group, so VS Code asks (**Please confirm restart of extensions.**) before it restarts extensions, for example to apply an extension update. Restarting extensions stops every Claude Code session in the window, because each session's process runs inside the extension host. Updates still install and take effect at the next window reload; window reloads themselves are not guarded. The tab is shown once when the window starts and your previous tab comes back right away; a tab you close opens again the next time the window is not focused, so nothing moves while you work in it. Off closes the tab and keeps it closed. **Agent Sessions: Open Claude restart guard** opens it again."
         },
         "claudeSessionMonitor.idleRamWarnMb": {
           "type": "number",

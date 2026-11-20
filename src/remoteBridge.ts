@@ -68,6 +68,8 @@ export const TYPED_REASON: Record<string, string> = {
   accessibility: "macOS Accessibility permission missing for VS Code",
   aborted: "typing was interrupted",
   keystroke: "keystroke failed",
+  "not-prompt": "the Claude prompt input does not have the keyboard focus",
+  interrupted: "typing stopped midway (the keyboard focus or the tab changed); Return was not pressed",
 };
 
 /**

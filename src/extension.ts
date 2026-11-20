@@ -41,6 +41,7 @@ import { TabWaker, nodeProbes, summaryText } from "./wakeTabs";
 import { ContinuityServer, continuityDir, focusBySlot, readText, storageDir, writeTextAtomic } from "./continuity";
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
 import { submitAnswer } from "./answers";
+import { nothingTyped, typeIntoPrompt, type TypeResult } from "./keystrokeTyping";
 import { activateRestartGuard } from "./restartGuard";
 import {
   KIND_LABEL,
@@ -3342,18 +3343,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
   }
 
-  type FocusedTypeResult =
-    | { ok: true }
-    | { ok: false; reason: "aborted" | "not-frontmost" | "tab-mismatch" | "accessibility" | "keystroke"; detail: string };
+  type FocusedTypeResult = TypeResult;
 
   /**
    * Type `text` + Enter into the session whose tab is already active: (optionally
-   * bring VS Code forward,) focus the Claude input, re-verify right before the
-   * keystroke that this window is focused and the session's tab is active, then
-   * type; the osascript run that types first checks that VS Code is the frontmost
-   * app. `alive` aborts between steps. Shared by the typing sweep (activates VS
-   * Code, panel label match) and the remote keystroke path (no activation,
-   * strict match).
+   * bring VS Code forward,) focus the Claude input, then type in chunks
+   * (keystrokeTyping.ts): before every chunk and before Enter this window must be
+   * focused, the session's tab active, VS Code frontmost and the Claude prompt
+   * input focused, else typing stops without Enter. `alive` aborts between steps.
+   * Shared by the typing sweep (activates VS Code, panel label match) and the
+   * remote keystroke path (no activation, strict match).
    */
   async function typeIntoFocusedSession(
     text: string,
@@ -3373,17 +3372,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
     await sleep(220);
     if (!alive()) return aborted;
-    // Re-verify immediately before typing: this window focused AND the correct tab active.
-    const focused = windowFocused();
-    const matched = opts.tabActive();
-    if (!focused || !matched) {
-      return { ok: false, reason: focused ? "tab-mismatch" : "not-frontmost", detail: `focused=${focused} activeMatched=${matched}` };
-    }
-    const r = await typeAndSubmit(text, submitDelayMs);
-    if (r.ok) return { ok: true };
-    if (r.notFrontmost) return { ok: false, reason: "not-frontmost", detail: r.err };
-    const accessibility = /not allowed|assistive|accessibility|-1743|-25211|not permitted/i.test(r.err);
-    return { ok: false, reason: accessibility ? "accessibility" : "keystroke", detail: r.err || "keystroke failed" };
+    return typeIntoPrompt(text, { submitDelayMs: submitDelayMs ?? 150, alive, windowFocused, tabActive: opts.tabActive });
   }
 
   /**
@@ -3416,8 +3405,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
       tabActive: () => findSessionTab(v, rivals)?.active === true,
     });
     if (r.ok) return { ok: true };
-    // Every reason but a failed keystroke stopped before anything was typed.
-    return { ok: false, skip: r.reason !== "keystroke", reason: TYPED_REASON[r.reason] ?? r.reason, detail: r.detail };
+    // Only a failed keystroke or typing stopped midway is final: every other reason typed nothing.
+    return { ok: false, skip: nothingTyped(r.reason), reason: TYPED_REASON[r.reason] ?? r.reason, detail: r.detail };
   }
 
   /** Title candidates of every other listed session: a tab or terminal name they match too is ambiguous. */
@@ -4974,54 +4963,6 @@ function activateEditorApp(): Promise<void> {
 /** True when this VS Code window has OS focus: VS Code is the frontmost app and this is its focused window. */
 function windowFocused(): boolean {
   return vscode.window.state?.focused === true;
-}
-
-/** Bundle identifiers keystrokes may land in (the typing osascript checks the frontmost app against them). */
-const VSCODE_BUNDLE_IDS = ["com.microsoft.VSCode", "com.microsoft.VSCodeInsiders"];
-
-function appleStr(s: string): string {
-  return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
-}
-
-/**
- * Types `text` into the focused element and presses Return, via System Events,
- * in one osascript run that first checks the frontmost app's bundle identifier:
- * anything but VS Code (or Insiders) aborts before the first keystroke
- * (`notFrontmost`). `submitDelayMs` (default 150) is the pause between the
- * keystroke and Return — slash commands (e.g. "/model ...") pop an autocomplete
- * widget, so callers that type one should pass a longer delay (500ms).
- */
-function typeAndSubmit(
-  text: string,
-  submitDelayMs = 150,
-): Promise<{ ok: true } | { ok: false; notFrontmost: boolean; err: string }> {
-  return new Promise((res) => {
-    const delaySec = (Math.max(0, submitDelayMs) / 1000).toString();
-    const lines = [
-      'tell application "System Events"',
-      "try",
-      "set b to bundle identifier of first process whose frontmost is true",
-      "on error",
-      'set b to ""',
-      "end try",
-      `if b is not in {${VSCODE_BUNDLE_IDS.map(appleStr).join(", ")}} then return "not-frontmost"`,
-      `keystroke ${appleStr(text)}`,
-      `delay ${delaySec}`,
-      "key code 36",
-      "end tell",
-      'return "typed"',
-    ];
-    const args: string[] = [];
-    for (const l of lines) args.push("-e", l);
-    // A long text takes a while to type; never cut it off halfway.
-    const timeout = Math.max(8000, 4000 + text.length * 15);
-    execFile("osascript", args, { timeout }, (err, stdout, stderr) => {
-      const out = String(stdout ?? "").trim();
-      if (err) res({ ok: false, notFrontmost: false, err: String(stderr || err) });
-      else if (out === "typed") res({ ok: true });
-      else res({ ok: false, notFrontmost: true, err: `frontmost app is not VS Code (${out || "no answer"})` });
-    });
-  });
 }
 
 function dumpTabsTo(file: string): number {

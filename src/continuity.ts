@@ -13,7 +13,9 @@
  * back, and reports in ext/<key>.json: a heartbeat every 15 s with the gate that
  * would hold the next show back, and the newest 50 results. At most two tries per
  * request; a request goes before a limit-stopped tab wake (wakeTabs.ts) and the two
- * never show tabs at the same time. Nothing is typed or sent into a session.
+ * never show tabs at the same time. Every show and every restore passes the automation
+ * gate (automationGate.ts: tab automation, memory), and turning the setting or tab
+ * automation off cancels a show's wait and restore. Nothing is typed or sent into a session.
  *
  * No `vscode` import: extension.ts injects the editor side (ServerDeps).
  */
@@ -21,7 +23,8 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { FIRST_SWEEP_MS, IDLE_MIN_MS, MIN_GAP_MS, POLL_MS, PRESSURE_CRITICAL, WAIT_LIVE_MS, type LiveSession } from "./wakeTabs";
+import { FIRST_SWEEP_MS, IDLE_MIN_MS, MIN_GAP_MS, POLL_MS, WAIT_LIVE_MS, type LiveSession } from "./wakeTabs";
+import type { Hold, WakeGate } from "./automationGate";
 
 export const CHANNEL_VERSION = 1;
 export const REQUESTS_FILE = "requests.json";
@@ -53,8 +56,8 @@ export interface Served {
   ts: number; // epoch seconds
 }
 
-/** Why the next show would wait right now. */
-export type Gate = "ok" | "user-active" | "memory";
+/** Why the next show would wait right now: the user, or the automation gate (off: tab automation or the setting). */
+export type Gate = "ok" | "user-active" | Hold["kind"];
 
 /** The content of ext/<key>.json. */
 export interface Heartbeat {
@@ -145,11 +148,10 @@ export function tryOf(prev: Served | undefined): number {
   return prev?.result === "no-process" ? 2 : 1;
 }
 
-/** Why the next show would wait: the user, only while this window is focused and input is not idle (unreadable idle: focus alone), or memory. */
-export function gateOf(focused: boolean, idleMs: number | undefined, pressure: number | undefined): Gate {
+/** Why the next show would wait: the user, only while this window is focused and input is not idle (unreadable idle: focus alone), else what the automation gate holds. */
+export function gateOf(focused: boolean, idleMs: number | undefined, held: Hold["kind"] | undefined): Gate {
   if (focused && !(idleMs !== undefined && idleMs >= IDLE_MIN_MS)) return "user-active";
-  if (pressure !== undefined && pressure >= PRESSURE_CRITICAL) return "memory";
-  return "ok";
+  return held ?? "ok";
 }
 
 /**
@@ -257,13 +259,13 @@ export interface ServerDeps<G, T> {
   liveSessions(): LiveSession[];
   windowFocused(): boolean;
   idleMs(): Promise<number | undefined>; // undefined: unreadable
-  pressureLevel(): Promise<number | undefined>; // undefined: unavailable
   othersBusy(): boolean; // a limit-stopped tab wake (wakeTabs.ts) is running
   tabs(): Array<TabRef<G, T>>; // this window's tabs in tab order
   activeGroup(): G;
   activeTabOf(group: G): T | undefined;
   reveal(group: G, tab: T): Promise<void>; // make `tab` its group's active tab and focus the group
   focusGroup(group: G): Promise<void>;
+  gate: WakeGate; // automationGate.ts, consulted right before a show and its restore
 }
 
 export class ContinuityServer<G, T> {
@@ -380,11 +382,12 @@ export class ContinuityServer<G, T> {
 
   /** Try `attempt` of `req`: the gate, then make its tab active, wait for the process and put the tabs back. */
   private async show(req: OpenRequest, attempt: number): Promise<void> {
-    if ((await this.beat()) !== "ok" || !(await this.userAway())) return; // postponed: the heartbeat names the gate
+    if ((await this.beat(true)) !== "ok" || !(await this.userAway())) return; // postponed: the heartbeat names the gate
     const plan = pickTab(this.deps.tabs(), req.title, attempt); // the tabs may have changed meanwhile
     if (plan.kind !== "reveal" || !this.on()) return;
     const { group, tab } = plan.ref;
     const memo: RevealMemo<G, T> = { activeGroup: this.deps.activeGroup(), group, groupTab: this.deps.activeTabOf(group), tab };
+    const signal = this.deps.gate.signal();
     const started = this.deps.now();
     let error: string | undefined;
     try {
@@ -392,8 +395,13 @@ export class ContinuityServer<G, T> {
     } catch (e) {
       error = errText(e);
     }
-    const pid = error === undefined ? await this.waitLive(req.sid, started) : undefined;
-    if (error === undefined) await this.restore(memo); // after a failed show nothing else changes
+    const pid = error === undefined ? await this.waitLive(req.sid, started, signal) : undefined;
+    if (signal.aborted && pid === undefined) {
+      // No try used: the request is served again once the setting and tab automation are back on.
+      this.deps.log(`continuity: ${req.sid.slice(0, 8)} cancelled (${errText(signal.reason)}), tabs left as they are, request ${req.id}`);
+      return;
+    }
+    if (error === undefined) await this.restore(memo, signal); // after a failed show nothing else changes
     const note = ` after ${((this.deps.now() - started) / 1000).toFixed(1)}s${pid === undefined ? "" : ` pid=${pid}`}, try ${attempt}/${MAX_TRIES}`;
     const ambiguous = plan.ambiguous ? AMBIGUOUS : "";
     if (pid !== undefined) this.record(req, { result: "opened", detail: ambiguous }, note);
@@ -401,11 +409,11 @@ export class ContinuityServer<G, T> {
     else this.record(req, noProcess(attempt, ambiguous), note);
   }
 
-  private async waitLive(sid: string, since: number): Promise<number | undefined> {
+  private async waitLive(sid: string, since: number, signal: AbortSignal): Promise<number | undefined> {
     for (;;) {
       const hit = this.deps.liveSessions().find((s) => s.sessionId === sid);
       if (hit) return hit.pid;
-      if (this.deps.now() - since >= WAIT_LIVE_MS) return undefined;
+      if (signal.aborted || this.deps.now() - since >= WAIT_LIVE_MS) return undefined;
       await sleep(POLL_MS);
     }
   }
@@ -418,14 +426,22 @@ export class ContinuityServer<G, T> {
     return false;
   }
 
-  /** Put the shown tab's group back on its former tab and refocus the former group, unless the user moved meanwhile or types in this window. */
-  private async restore(memo: RevealMemo<G, T>): Promise<void> {
+  /**
+   * Put the shown tab's group back on its former tab and refocus the former group, unless the user moved meanwhile
+   * or types in this window, the show was cancelled, or the gate holds right now (tab automation, the setting).
+   */
+  private async restore(memo: RevealMemo<G, T>, signal: AbortSignal): Promise<void> {
     if (this.deps.windowFocused()) {
       const idle = await this.deps.idleMs();
       if (idle !== undefined && idle < TYPING_MS) {
         this.deps.log("continuity: tab restore skipped, the user is typing");
         return;
       }
+    }
+    const held = signal.aborted ? errText(signal.reason) : (await this.deps.gate.beforeRestore())?.reason;
+    if (held !== undefined) {
+      this.deps.log(`continuity: tab restore skipped (${held})`);
+      return;
     }
     const back = restoreAfter(memo, this.deps.activeGroup(), this.deps.activeTabOf(memo.group));
     if (!back) return;
@@ -437,11 +453,12 @@ export class ContinuityServer<G, T> {
     }
   }
 
-  /** The gate right now, then the heartbeat. */
-  private async beat(): Promise<Gate> {
+  /** The gate right now, then the heartbeat; `attempt`: a show follows. */
+  private async beat(attempt = false): Promise<Gate> {
     const focused = this.deps.windowFocused();
     const idle = focused ? await this.deps.idleMs() : undefined;
-    const gate = gateOf(focused, idle, await this.deps.pressureLevel());
+    const held = attempt ? await this.deps.gate.admit() : await this.deps.gate.hold();
+    const gate = gateOf(focused, idle, held?.kind);
     this.setGate(gate);
     return gate;
   }

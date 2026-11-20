@@ -53,6 +53,7 @@ import { nothingTyped, typeIntoPrompt, type TypeResult } from "./keystrokeTyping
 import { acquireSwitchLock, autoRotateOn, remoteSwitch as routeRemoteSwitch } from "./accountSwitch";
 import { activateRestartGuard } from "./restartGuard";
 import { observerMode } from "./observerMode";
+import { AutomationGate, type Automation } from "./automationGate";
 import {
   KIND_LABEL,
   RESET_KINDS,
@@ -2091,6 +2092,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   };
   let resumeTimer: ReturnType<typeof setTimeout> | undefined;
   let resumeActive = false;
+  let endSweep: (() => void) | undefined; // detaches the running sweep from its automation gate signal
   let autoResumeTimer: ReturnType<typeof setTimeout> | undefined;
   let autoResumeAt = 0;
   let lastIdleRamWarn = 0;
@@ -2142,10 +2144,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
       autoResumeTimer = undefined;
       autoResumeAt = 0;
       if (disposed || !claudeEnabled() || resumeActive) return;
+      const held = automationGate.blocker("autoResume");
+      if (held) {
+        log(`auto-resume skipped: ${held}`);
+        return;
+      }
       const queue = inThisWindow(sweepQueue(lastAllViews, autoResumeOverrides(), autoResumeAll()));
       if (!queue.length) return; // every window sweeps its own sessions; one without any stays silent
       vscode.window.showInformationMessage("Claude Sessions: limit reset — starting auto resume sweep.");
-      startResumeSweep(queue);
+      startResumeSweep(queue, "autoResume");
     }, delay);
   }
 
@@ -2176,6 +2183,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   const stopResume = (msg?: string) => {
     resumeActive = false;
+    endSweep?.();
+    endSweep = undefined;
     if (resumeTimer) {
       clearTimeout(resumeTimer);
       resumeTimer = undefined;
@@ -3428,13 +3437,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
    * when typing is allowed (`remote.typeFallback`), the session's tab is this
    * window's one tab matching its title (labelsMatchStrict, truncated labels
    * included, no other listed session matching it), and this window is focused,
-   * i.e. VS Code is already frontmost (it is never activated). The tab is then made active and
-   * re-verified, and the typing osascript checks the frontmost app itself. Never
-   * prompts. `skip` = nothing was typed; only a failed keystroke is final.
+   * i.e. VS Code is already frontmost (it is never activated), and the automation gate lets
+   * remote typing through. The tab is then made active and re-verified, and the typing
+   * osascript checks the frontmost app itself. Never prompts. `skip` = nothing was
+   * typed; only a failed keystroke is final.
    */
   async function typeIntoSession(v: SessionView, text: string): Promise<PathAttempt> {
     const skip = (reason: string, detail?: string): PathAttempt => ({ ok: false, skip: true, reason, detail });
     if (!remoteFlag("remote.typeFallback")) return skip("typing disabled (remote.typeFallback is off)");
+    const held = automationGate.blocker("remoteTyping");
+    if (held) return skip(`typing disabled (${held})`);
     if (process.platform !== "darwin") return skip("keystrokes need macOS");
     if (v.provider !== "claude" || !v.capabilities.bulkInput) return skip("this session has no typable Claude input");
     if (resumeActive) return skip("a typing sweep is running");
@@ -3444,11 +3456,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (!windowFocused()) return skip(TYPED_REASON["not-frontmost"], "this VS Code window is not focused");
     const s = sanitizeRemoteLine(text);
     if (!s.ok) return { ok: false, skip: false, reason: s.reason };
+    const signal = automationGate.signal("remoteTyping");
     if (!tab.active) {
       await focusTab(tab.gi, tab.ti);
       await sleep(500);
     }
-    const r = await typeIntoFocusedSession(s.line, undefined, () => !disposed && !resumeActive, {
+    const r = await typeIntoFocusedSession(s.line, undefined, () => !disposed && !resumeActive && !signal.aborted, {
       activate: false,
       tabActive: () => findSessionTab(v, rivals)?.active === true,
     });
@@ -3507,7 +3520,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
    * (never overlaps, never double-types).
    */
   /** The resume sweep over `queue`: resumePrompt typed into each session, staggered (resumeAll, auto-resume). */
-  function startResumeSweep(queue: SessionView[]): void {
+  function startResumeSweep(queue: SessionView[], feature: Automation = "typingSweep"): void {
     const c = cfg();
     // Collapse newlines so a single resumePrompt value can never encode more
     // than one Return keystroke (osascript `keystroke` submits on each \n).
@@ -3516,14 +3529,21 @@ export function activate(ctx: vscode.ExtensionContext): void {
       staggerSec: Math.max(5, c.get<number>("resumeStaggerSeconds", 60)),
       doneLabel: "resume",
       autoType: c.get<boolean>("resumeAutoType", true),
+      feature,
     });
   }
 
   function startTypingSweep(
     queue: SessionView[],
     text: string,
-    opts: { staggerSec: number; doneLabel: string; submitDelayMs?: number; autoType?: boolean },
+    opts: { staggerSec: number; doneLabel: string; submitDelayMs?: number; autoType?: boolean; feature?: Automation },
   ): void {
+    const feature = opts.feature ?? "typingSweep";
+    const off = automationGate.blocker(feature);
+    if (off) {
+      vscode.window.showInformationMessage(`Claude Sessions: ${opts.doneLabel} is off: ${off}.`);
+      return;
+    }
     // These commands type Claude slash-commands into the focused Claude input.
     // Keep this guard even when the caller already filtered by capability so a
     // mixed-provider command argument can never receive unattended keystrokes.
@@ -3540,6 +3560,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     let typed = 0;
     let skipped = 0;
     resumeActive = true;
+    // Turning tab automation or the sweep's own setting off stops it at once (automationGate.ts).
+    const signal = automationGate.signal(feature);
+    const onAbort = (): void => stopResume(`Claude Sessions: ${opts.doneLabel} stopped: ${String(signal.reason)}.`);
+    signal.addEventListener("abort", onAbort, { once: true });
+    endSweep = () => signal.removeEventListener("abort", onAbort);
 
     // Self-chaining: each step is fully awaited before the next is scheduled, so
     // a slow step (jump + osascript) can never overlap another and type twice.
@@ -3564,6 +3589,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
         return;
       }
       try {
+        const held = automationGate.blocker(feature); // right before the tab is shown
+        if (held) {
+          stopResume(`Claude Sessions: ${opts.doneLabel} stopped: ${held}.`);
+          return;
+        }
         if (!tab.active) await focusTab(tab.gi, tab.ti);
         await sleep(500);
         if (!resumeActive) return;
@@ -3787,6 +3817,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       }
       if (!value) return;
       startTypingSweep(queue, `/model ${value}`, {
+        feature: "typingSweep",
         staggerSec: Math.max(3, cfg().get<number>("commandStaggerSeconds", 8)),
         doneLabel: "set model",
         submitDelayMs: 500,
@@ -3811,6 +3842,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         `Claude Sessions: effortLevel set to "${level}"; sweeping /effort into ${queue.length} open session(s).`,
       );
       startTypingSweep(queue, `/effort ${level}`, {
+        feature: "typingSweep",
         staggerSec: Math.max(3, cfg().get<number>("commandStaggerSeconds", 8)),
         doneLabel: "set effort",
         submitDelayMs: 500,
@@ -4270,6 +4302,29 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // After a restart, show each limit-stopped Claude Code tab once so its process runs
   // again (wakeTabs.ts). Started before the first refresh, which updates its registry.
   const probes = nodeProbes();
+  // Every tab automation asks this gate right before it shows or moves a tab or types (automationGate.ts).
+  const automationOn: Record<Automation, () => boolean> = {
+    wake: () => cfg().get<boolean>("wakeDeadTabs", false) === true,
+    continuity: () => cfg().get<boolean>("continuityChannel", false) === true,
+    autoResume: () => autoResumeAll() || Object.values(autoResumeOverrides()).some((o) => o.enabled),
+    typingSweep: () => true,
+    remoteTyping: () => remoteFlag("remote.typeFallback"),
+  };
+  const automationGate = new AutomationGate({
+    log,
+    masterOn: () => cfg().get<boolean>("tabAutomation", true) !== false,
+    featureOn: (a) => claudeEnabled() && automationOn[a](),
+    pressureLevel: probes.pressureLevel,
+  });
+  ctx.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      automationGate.configChanged((setting) => e.affectsConfiguration(setting));
+      // Turning the wake on starts it without a restart (start() does nothing while it is off).
+      if (e.affectsConfiguration("claudeSessionMonitor.wakeDeadTabs") || e.affectsConfiguration("claudeSessionMonitor.enableClaude")) {
+        stages.safe("tab wake start", () => tabWaker?.start());
+      }
+    }),
+  );
   tabWaker = stages.safe("tab wake start", () => new TabWaker<TabMemo>({
     ...probes,
     enabled: () => allowed("wake") && claudeEnabled() && cfg().get<boolean>("wakeDeadTabs", false) === true,
@@ -4289,6 +4344,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     },
     restoreTabs,
     yieldTo: () => continuity?.pending() === true,
+    gate: automationGate.wakeGate("wake"),
   }));
   stages.safe("tab wake start", () => tabWaker?.start());
   ctx.subscriptions.push(
@@ -4321,6 +4377,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     activeTabOf: (group) => group.activeTab,
     reveal: revealTab,
     focusGroup: focusTabGroup,
+    gate: automationGate.wakeGate("continuity"),
   }));
   ctx.subscriptions.push({ dispose: () => continuity?.dispose() });
 

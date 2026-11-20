@@ -13,7 +13,9 @@
  * process, then puts the tabs and focus back unless the user works in the window
  * by then. Nothing is ever sent to a session.
  * A continuity request (continuity.ts) goes first: no tab is woken while one is
- * served or waits.
+ * served or waits. Every wake and every restore passes the automation gate
+ * (automationGate.ts: tab automation, memory), and turning the
+ * setting or tab automation off cancels a wake's wait and restore.
  *
  * No `vscode` import: extension.ts injects the editor side (WakeDeps).
  */
@@ -24,6 +26,7 @@ import { PROJECTS_DIR, lastAssistantStop, pidAlive, type AssistantStop } from ".
 import { loadRecords, type SessionRecord } from "./peerSend";
 import { runTool } from "./remote";
 import { labelsMatchStrict, parsePsOutput } from "./view";
+import type { WakeGate } from "./automationGate";
 
 export const OPEN_COMMAND = "claude-vscode.editor.open";
 export const REGISTRY_KEY = "csm.wake.registry";
@@ -36,7 +39,6 @@ export const FIRST_SWEEP_MS = 60_000;
 const SWEEP_EVERY_MS = 30_000;
 export const MIN_GAP_MS = 10_000; // between two wakes
 export const IDLE_MIN_MS = 20_000;
-export const PRESSURE_CRITICAL = 4; // kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical
 export const WAIT_LIVE_MS = 20_000;
 export const POLL_MS = 500;
 const REVEAL_WAIT_MS = 1_000; // Claude Code shows the tab only after editor.open returns
@@ -86,7 +88,6 @@ export interface WakeDeps<M> {
   limitStop(sid: string): AssistantStop | undefined;
   idleMs(): Promise<number | undefined>; // undefined: unreadable
   windowFocused(): boolean;
-  pressureLevel(): Promise<number | undefined>; // undefined: unavailable
   commandExists(id: string): Promise<boolean>;
   executeCommand(id: string, ...args: unknown[]): PromiseLike<unknown>;
   snapshotTabs(): M; // each group's active tab and the active group
@@ -94,6 +95,7 @@ export interface WakeDeps<M> {
   activeClaudeLabel(): string | undefined; // the active tab's label when it is a Claude Code tab
   restoreTabs(snapshot: M): Promise<void>;
   yieldTo?(): boolean; // a continuity request (continuity.ts) is served or waits: it goes first
+  gate: WakeGate; // automationGate.ts, consulted right before a wake and its restore
 }
 
 export type StepResult = "off" | "stopped" | "empty" | "postponed" | "woken" | "failed";
@@ -336,9 +338,10 @@ export class TabWaker<M> {
       this.postpone(reason);
       return "postponed";
     }
-    const ok = await this.wake(next);
-    this.settle(next, ok);
-    return ok ? "woken" : "failed";
+    const result = await this.wake(next);
+    if (result === "cancelled") return "postponed"; // no try used: the setting or tab automation went off during the wake
+    this.settle(next, result === "woken");
+    return result;
   }
 
   /** The first pending session that still qualifies; running ones and those no longer limit-stopped are dropped. */
@@ -352,12 +355,13 @@ export class TabWaker<M> {
   }
 
   /**
-   * Why the next wake has to wait, or undefined: memory, then the command, then the
-   * user (timed sweep only), read last so the idle time is fresh when the wake starts.
+   * Why the next wake has to wait, or undefined: the gate (tab automation, memory),
+   * then the command, then the user (timed sweep only), read last so the idle
+   * time is fresh when the wake starts.
    */
   private async blocker(manual: boolean): Promise<string | undefined> {
-    const level = await this.deps.pressureLevel();
-    if (level !== undefined && level >= PRESSURE_CRITICAL) return `memory pressure ${level}`;
+    const held = await this.deps.gate.admit();
+    if (held) return held.reason;
     if (!(await this.deps.commandExists(OPEN_COMMAND))) return `no ${OPEN_COMMAND} command`;
     if (!manual && (await this.recentInput())) return "user active";
     if (this.deps.yieldTo?.()) return "continuity request first"; // last: nothing awaits between it and the wake
@@ -385,9 +389,11 @@ export class TabWaker<M> {
 
   /**
    * Show `p`'s tab, wait up to 20 s for its process, then put the tabs back if the
-   * woken tab is still active and the user does not work in this window.
+   * woken tab is still active and the user does not work in this window. Turning the
+   * setting or tab automation off ends the wait and leaves the tabs as they are.
    */
-  private async wake(p: PendingEntry): Promise<boolean> {
+  private async wake(p: PendingEntry): Promise<"woken" | "failed" | "cancelled"> {
+    const signal = this.deps.gate.signal();
     const memo = this.deps.snapshotTabs();
     const started = this.deps.now();
     this.lastWakeMs = started;
@@ -398,40 +404,53 @@ export class TabWaker<M> {
       error = errText(e);
     }
     const [woken, pid]: [unknown, number | undefined] =
-      error === undefined ? await Promise.all([this.shownTab(p), this.waitLive(p.sid, started)]) : [this.deps.activeTab(), undefined];
+      error === undefined
+        ? await Promise.all([this.shownTab(p, signal), this.waitLive(p.sid, started, signal)])
+        : [this.deps.activeTab(), undefined];
+    const secs = (): string => ((this.deps.now() - started) / 1000).toFixed(1);
+    if (signal.aborted && pid === undefined) {
+      this.lastReason = errText(signal.reason);
+      this.deps.log(`wake: ${short(p.sid)} cancelled after ${secs()}s (${this.lastReason}), tabs left as they are`);
+      return "cancelled";
+    }
     const userActive = await this.userAtWindow();
     if (this.deps.activeTab() === woken) {
       if (userActive) this.deps.log(`wake: ${short(p.sid)} tabs left as they are, the user is active in this window`);
-      else await this.restore(memo);
+      else await this.restore(memo, p, signal);
     }
-    const secs = ((this.deps.now() - started) / 1000).toFixed(1);
-    if (pid !== undefined) this.deps.log(`wake: ${short(p.sid)} live after ${secs}s pid=${pid}`);
-    else this.deps.log(`wake: ${short(p.sid)} failed after ${secs}s (${error ?? "no process"}), attempt ${p.attempts + 1}/${MAX_ATTEMPTS}`);
-    return pid !== undefined;
+    if (pid !== undefined) this.deps.log(`wake: ${short(p.sid)} live after ${secs()}s pid=${pid}`);
+    else this.deps.log(`wake: ${short(p.sid)} failed after ${secs()}s (${error ?? "no process"}), attempt ${p.attempts + 1}/${MAX_ATTEMPTS}`);
+    return pid !== undefined ? "woken" : "failed";
   }
 
   /** The active tab once a Claude Code tab labelled with `p`'s title is (Claude Code shows it after the command returns), else after 1 s. */
-  private async shownTab(p: PendingEntry): Promise<unknown> {
+  private async shownTab(p: PendingEntry, signal: AbortSignal): Promise<unknown> {
     const title = this.deps.titleOf(p.sid) ?? p.title;
     const shown = (): boolean => {
       const label = this.deps.activeClaudeLabel();
       return title !== undefined && label !== undefined && labelsMatchStrict(label, title);
     };
     const until = this.deps.now() + REVEAL_WAIT_MS;
-    while (!shown() && this.deps.now() < until) await sleep(REVEAL_POLL_MS);
+    while (!shown() && !signal.aborted && this.deps.now() < until) await sleep(REVEAL_POLL_MS);
     return this.deps.activeTab();
   }
 
-  private async waitLive(sid: string, since: number): Promise<number | undefined> {
+  private async waitLive(sid: string, since: number, signal: AbortSignal): Promise<number | undefined> {
     for (;;) {
       const hit = this.deps.liveSessions().find((s) => s.sessionId === sid);
       if (hit) return hit.pid;
-      if (this.deps.now() - since >= WAIT_LIVE_MS) return undefined;
+      if (signal.aborted || this.deps.now() - since >= WAIT_LIVE_MS) return undefined;
       await sleep(POLL_MS);
     }
   }
 
-  private async restore(memo: M): Promise<void> {
+  /** Put the tabs back unless the wake was cancelled or the gate holds right now (tab automation, the setting). */
+  private async restore(memo: M, p: PendingEntry, signal: AbortSignal): Promise<void> {
+    const held = signal.aborted ? errText(signal.reason) : (await this.deps.gate.beforeRestore())?.reason;
+    if (held !== undefined) {
+      this.deps.log(`wake: ${short(p.sid)} tabs left as they are (${held})`);
+      return;
+    }
     try {
       await this.deps.restoreTabs(memo);
     } catch (e) {
@@ -511,9 +530,11 @@ export function findTranscript(sid: string, root = PROJECTS_DIR): string | undef
   return undefined;
 }
 
-type MachineDeps = Pick<WakeDeps<unknown>, "liveSessions" | "parentPids" | "limitStop" | "idleMs" | "pressureLevel">;
+type MachineDeps = Pick<WakeDeps<unknown>, "liveSessions" | "parentPids" | "limitStop" | "idleMs"> & {
+  pressureLevel(): Promise<number | undefined>; // the automation gate's memory check (automationGate.ts); undefined: unavailable
+};
 
-/** The machine side of WakeDeps (no editor state); transcript paths are cached per session. */
+/** The machine side of WakeDeps and the automation gate's memory pressure (no editor state); transcript paths are cached per session. */
 export function nodeProbes(run: typeof runTool = runTool): MachineDeps {
   const transcripts = new Map<string, string>();
   return {

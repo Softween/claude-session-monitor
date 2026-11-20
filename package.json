@@ -458,6 +458,12 @@
           "default": false,
           "description": "When Claude sessions hit the usage limit (or the Claude 5h window is at 99%+), automatically run the staggered resume sweep ~90s after the window resets. A remote `autoResume` command can switch a single limited session in or out of the sweep."
         },
+        "claudeSessionMonitor.tabAutomation": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Let the monitor show, move and type into tabs on its own: limit-stopped tab wakes, continuity requests, resume and command sweeps, auto-resume after a limit reset and remote typing. Each of them also needs its own setting. Turning this off stops all of them at once, including a wake, a tab restore or a sweep already in progress."
+        },
         "claudeSessionMonitor.wakeDeadTabs": {
           "type": "boolean",
           "default": false,

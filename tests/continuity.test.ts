@@ -16,6 +16,7 @@ import {
   servedFrom,
   storageDir,
   storageKey,
+  windowKey,
   withServed,
   writeTextAtomic,
   type Gate,
@@ -58,6 +59,8 @@ describe("addressing", () => {
     expect(storageDir(undefined)).toBeUndefined();
     expect(storageKey(STORAGE)).toBe("c7464c24ed54e168"); // python3: hashlib.sha256(path.encode()).hexdigest()[:16]
     expect(storageKey(`${STORAGE}-2`)).not.toBe("c7464c24ed54e168");
+    expect(windowKey(STORAGE, 4242)).toBe("c7464c24ed54e168"); // the key of the debug log and the health file too
+    expect(windowKey(undefined, 4242)).toBe("empty-4242");
     expect(continuityDir("/home/u")).toBe("/home/u/.claude/state/continuity");
   });
 });

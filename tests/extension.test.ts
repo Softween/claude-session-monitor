@@ -262,7 +262,7 @@ vi.mock("../src/remoteBridge", async (orig) => {
 
 import * as ext from "../src/extension";
 import { keeperWaiting } from "../src/cliVault";
-import { ContinuityServer } from "../src/continuity";
+import { ContinuityServer, storageKey } from "../src/continuity";
 import { TabWaker } from "../src/wakeTabs";
 
 beforeEach(() => {
@@ -2115,3 +2115,173 @@ describe("observer mode in an Extension Development Host", () => {
     expect(writesUnderHome()).toEqual([]);
   });
 });
+
+describe("the debug log: activation line, session summary, drop events and errors.json", () => {
+  const MON = `${HOME}/.claude/session-monitor`;
+  const logLines = (): any[] =>
+    fs.existsSync(`${MON}/csm-debug.log`)
+      ? fs.readFileSync(`${MON}/csm-debug.log`, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l))
+      : [];
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("the activation writes one line with the version, the pid and the window key first, and every line carries them", () => {
+    const storage = `${HOME}/workspaceStorage/0123abcd`;
+    lastCtx = { ...mkCtx(), storageUri: { fsPath: `${storage}/softween.claude-code-session-monitor` }, extension: { packageJSON: { version: "9.9.9" } } };
+    ext.activate(lastCtx);
+    const win = storageKey(storage);
+    const out = logLines();
+    const at = out.findIndex((l) => l.feature === "activation");
+    expect(out.filter((l) => l.feature === "activation")).toEqual([
+      { ts: expect.any(String), pid: process.pid, win, ver: "9.9.9", feature: "activation", lvl: "info", msg: `activated: version 9.9.9 pid ${process.pid} window ${win}` },
+    ]);
+    expect(out.length - at).toBeGreaterThan(1); // the activation logged more, after its first line
+    for (const l of out) expect(Object.keys(l)).toEqual(["ts", "pid", "win", "ver", "feature", "lvl", "msg"]);
+    for (const l of out.slice(at)) expect(l).toMatchObject({ pid: process.pid, win, ver: "9.9.9" });
+  });
+
+  it("a window without a folder is empty-<pid>", () => {
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    expect(logLines().find((l) => l.feature === "activation")).toMatchObject({ win: `empty-${process.pid}`, ver: "0.0.0" });
+  });
+
+  it("logs the session count every 5 minutes instead of every 20 s", () => {
+    vi.useFakeTimers();
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    const summaries = (): number => logLines().filter((l) => l.msg.startsWith("sessions=")).length;
+    expect(summaries()).toBe(1); // the first refresh
+    vi.advanceTimersByTime(4 * 60_000);
+    expect(summaries()).toBe(1);
+    vi.advanceTimersByTime(61_000);
+    expect(summaries()).toBe(2);
+  });
+
+  it("one line when 5 or more live sessions are gone within 60 s", () => {
+    const now = Date.now() / 1000;
+    const dir = `${HOME}/.claude/projects/-repo`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(MON, { recursive: true });
+    const sids = [0, 1, 2, 3, 4, 5].map((i) => `${String(i).repeat(8)}-0000-4000-8000-000000000000`);
+    const record = (sid: string, state: string, ts: number): void =>
+      fs.writeFileSync(`${MON}/${sid}.json`, JSON.stringify({ session_id: sid, provider: "claude", state, ts, cwd: "/repo", transcript_path: `${dir}/${sid}.jsonl`, pid: process.pid }));
+    for (const sid of sids) {
+      const line = { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "work" }] }, timestamp: new Date((now - 40) * 1000).toISOString() };
+      fs.writeFileSync(`${dir}/${sid}.jsonl`, JSON.stringify(line) + "\n");
+      record(sid, "working", now - 30);
+    }
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    const refresh = rec.commands.get("claudeSessionMonitor.refresh")!;
+    for (const sid of sids) record(sid, "ended", now);
+    refresh();
+    refresh();
+    const events = logLines().filter((l) => l.msg.includes("live sessions gone within 60 s"));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ feature: "sessions", lvl: "info" });
+    expect(events[0].msg).toMatch(/^sessions: 6 live sessions gone within 60 s, 0 still live \(/);
+    for (const sid of sids) expect(events[0].msg).toContain(sid.slice(0, 8));
+  });
+
+  it("errors.json gets the first stack and the count of a failing stage, saved after the first refresh and at dispose", () => {
+    vi.spyOn(ContinuityServer.prototype, "observe").mockImplementation(() => {
+      throw new Error("continuity broke");
+    });
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    const file = `${MON}/health/errors.json`;
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).errors["continuity: Error: continuity broke"].count).toBe(1);
+    const refresh = rec.commands.get("claudeSessionMonitor.refresh")!;
+    refresh();
+    refresh();
+    disposeCtx(lastCtx);
+    lastCtx = undefined;
+    const entry = JSON.parse(fs.readFileSync(file, "utf8")).errors["continuity: Error: continuity broke"];
+    expect(entry).toMatchObject({ stage: "continuity", count: 3, ver: "0.0.0", win: `empty-${process.pid}` });
+    expect(entry.stack).toMatch(/^Error: continuity broke\n\s+at /);
+    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+  });
+});
+
+describe("the health file and the overseer heartbeat", () => {
+  const MON = `${HOME}/.claude/session-monitor`;
+  const STORAGE = `${HOME}/workspaceStorage/0123abcd`;
+  const healthPath = (): string => `${MON}/health/${storageKey(STORAGE)}.json`;
+  // A window with a folder, a version and a workspace state (without one the limits payload throws, as in mkCtx()).
+  const ctxWithFolder = (): any => ({
+    ...mkCtx(),
+    storageUri: { fsPath: `${STORAGE}/softween.claude-code-session-monitor` },
+    extension: { packageJSON: { version: "9.9.9" } },
+    workspaceState: { get: (_k: string, def?: unknown) => def, update: () => Promise.resolve() },
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("writes this window's health file at activation and every 30 s, and removes it at dispose", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    lastCtx = ctxWithFolder();
+    ext.activate(lastCtx);
+    const first = JSON.parse(fs.readFileSync(healthPath(), "utf8"));
+    expect(first).toEqual({
+      v: 1,
+      win: storageKey(STORAGE),
+      pid: process.pid,
+      version: "9.9.9",
+      ts: Math.floor(Date.now() / 1000),
+      features: { sessions: "ok", limits: "ok", remote: "disabled", autoResume: "disabled", continuity: "disabled", wake: "disabled", restartGuard: "disabled" },
+      refreshP95Ms: expect.any(Number),
+      refreshSamples: expect.any(Number),
+      guardArmed: false,
+    });
+    expect(first.refreshSamples).toBeGreaterThanOrEqual(1); // the first refresh, timed
+    expect(fs.statSync(healthPath()).mode & 0o777).toBe(0o600);
+    vi.advanceTimersByTime(30_000);
+    const second = JSON.parse(fs.readFileSync(healthPath(), "utf8"));
+    expect(second.ts).toBe(first.ts + 30);
+    expect(second.refreshSamples).toBeGreaterThan(10); // every refresh in between was timed
+    disposeCtx(lastCtx);
+    lastCtx = undefined;
+    expect(fs.existsSync(healthPath())).toBe(false);
+  });
+
+  it("a feature whose refresh stage throws is in error in the health file", () => {
+    vi.spyOn(ContinuityServer.prototype, "observe").mockImplementation(() => {
+      throw new Error("continuity broke");
+    });
+    rec.config.set("continuityChannel", true);
+    lastCtx = ctxWithFolder();
+    ext.activate(lastCtx);
+    expect(JSON.parse(fs.readFileSync(healthPath(), "utf8")).features).toMatchObject({ continuity: "error", sessions: "ok" });
+  });
+
+  it("sends the overseer heartbeat for all live windows only where ~/.claude/bin/overseer exists", async () => {
+    lastCtx = ctxWithFolder();
+    ext.activate(lastCtx);
+    await settleAsync();
+    const overseerCalls = (): any[][] => rec.execFiles.filter((args) => String(args[0]).endsWith("/.claude/bin/overseer"));
+    expect(overseerCalls()).toEqual([]);
+    disposeCtx(lastCtx);
+
+    fs.mkdirSync(`${HOME}/.claude/bin`, { recursive: true });
+    fs.writeFileSync(`${HOME}/.claude/bin/overseer`, "#!/bin/sh\n", { mode: 0o755 });
+    rec.execFileImpl = (args) => {
+      if (!String(args[0]).endsWith("/.claude/bin/overseer")) return false;
+      args[args.length - 1](null, "", "");
+      return true;
+    };
+    lastCtx = ctxWithFolder();
+    ext.activate(lastCtx);
+    await settleAsync();
+    const [heartbeat, action] = overseerCalls().map((args) => args[1]);
+    expect(heartbeat.slice(0, 7)).toEqual(["emit", "--tool", "session-monitor", "--heartbeat", "--every", "5m", "--data"]);
+    expect(heartbeat[heartbeat.length - 1]).toMatch(/^1 window on 9\.9\.9; features in error: none; restart guard armed in 0 of 1; refresh p95 \d+ ms$/);
+    expect(JSON.parse(heartbeat[7]).windows).toEqual([expect.objectContaining({ win: storageKey(STORAGE), version: "9.9.9", failing: [] })]);
+    expect(action.slice(0, 5)).toEqual(["emit", "--tool", "session-monitor", "--level", "info"]);
+    expect(fs.existsSync(`${MON}/health/emit.lock`)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(`${MON}/health/emit.json`, "utf8"))).toMatchObject({ ts: expect.any(Number) });
+  });
+});
+

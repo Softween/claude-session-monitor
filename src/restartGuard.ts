@@ -113,6 +113,12 @@ export class GuardEditorProvider implements vscode.CustomTextEditorProvider {
   }
 }
 
+/** The guard's state for the health file (health.ts). */
+export interface RestartGuardState {
+  /** The setting is on and a guard editor this extension host resolved is open: a restart asks first. */
+  armed(): boolean;
+}
+
 /** What the guard needs from extension.ts. */
 export interface GuardDeps {
   log(msg: string): void;
@@ -190,7 +196,7 @@ async function closeGuard(log: (msg: string) => void): Promise<void> {
  * the window, and a restart is not left unguarded until the next activation.
  * At activation the guard opens after a pause in input (untilPaused).
  */
-export function activateRestartGuard(ctx: vscode.ExtensionContext, deps: GuardDeps): void {
+export function activateRestartGuard(ctx: vscode.ExtensionContext, deps: GuardDeps): RestartGuardState {
   const provider = new GuardEditorProvider();
   const fileUri = (): vscode.Uri => vscode.Uri.file(ensureGuardFile(ctx.globalStorageUri.fsPath));
   const enabled = (): boolean => vscode.workspace.getConfiguration("claudeSessionMonitor").get<boolean>(SETTING, false) === true;
@@ -226,4 +232,5 @@ export function activateRestartGuard(ctx: vscode.ExtensionContext, deps: GuardDe
     vscode.window.onDidChangeWindowState(reopenIfDue),
   );
   apply(true);
+  return { armed: () => enabled() && provider.live };
 }

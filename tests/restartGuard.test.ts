@@ -164,14 +164,14 @@ function activate(dir: string, resolveOnOpen = true, idleMs: () => Promise<numbe
     if (resolveOnOpen) env.providers[0].provider.resolveCustomTextEditor({}, fakePanel());
   };
   const ctx: any = { subscriptions: [], globalStorageUri: { fsPath: dir } };
-  activateRestartGuard(ctx, {
+  const state = activateRestartGuard(ctx, {
     log: (m) => calls.push(`log ${m}`),
     focusGroup: async (g) => {
       calls.push(`focus ${g.viewColumn - 1}`); // the group's on-screen slot
     },
     idleMs,
   });
-  return { calls, ctx };
+  return { calls, ctx, state };
 }
 
 const opens = () => env.executed.filter((e) => e.id === "vscode.openWith").length;
@@ -393,6 +393,23 @@ describe("activateRestartGuard", () => {
     vi.useRealTimers();
     await flush();
     expect(calls).toEqual(["vscode.openWith", "focus 0", MRU_BACK, "log restart guard: tab opened, not resolved within 10 s"]);
+  });
+
+  it("is armed (for the health file) only while the setting is on and a guard editor this host resolved is open", async () => {
+    env.groups = [group(1, textTab())];
+    const { state } = activate(tmpDir(), false);
+    await flush();
+    expect(state.armed()).toBe(false); // opened, not resolved yet: no veto
+    const panel = fakePanel();
+    env.providers[0].provider.resolveCustomTextEditor({}, panel);
+    await flush();
+    expect(state.armed()).toBe(true);
+    env.config.set("restartGuard", false);
+    expect(state.armed()).toBe(false);
+    env.config.set("restartGuard", true);
+    expect(state.armed()).toBe(true);
+    panel.dispose();
+    expect(state.armed()).toBe(false);
   });
 
   it("closes only guard tabs when turned off, opens again when turned back on", async () => {

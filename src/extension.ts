@@ -28,6 +28,11 @@ import { sanitizeRemoteLine } from "./remoteInput";
 import { backgroundByDue, fmtClock, timingNote } from "./closingBuckets";
 import { resolveClaudeBinary } from "./claudeBinary";
 import { stageGuard } from "./safeStage";
+import { DebugLog } from "./debugLog";
+import { saveErrors } from "./errorRegistry";
+import { SUMMARY_EVERY_SEC, SessionDrops, liveKeys, sessionSummary } from "./sessionLog";
+import { DurationRing, HEALTH_EVERY_MS, removeHealth, timed, writeHealth, type HealthDeps } from "./health";
+import { OverseerBeat, nodeBeatDeps, overseerBin } from "./overseerBeat";
 import { REFRESH_GAP_MS, codexSignature, monitorEventMatters, projectsEventMatters, throttle } from "./refreshGate";
 import { sendToSession } from "./peerSend";
 import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, type ActiveCandidate } from "./activeAccount";
@@ -40,7 +45,7 @@ import { allowedCwds, mergeSeen, withoutPaths } from "./remoteCwds";
 import { startNewSession } from "./remoteNewSession";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import { TabWaker, nodeProbes, summaryText } from "./wakeTabs";
-import { ContinuityServer, continuityDir, readText, storageDir, writeTextAtomic } from "./continuity";
+import { ContinuityServer, continuityDir, readText, storageDir, windowKey, writeTextAtomic } from "./continuity";
 import { focusGroupBySlot, revealTabByIndex, type TabFocusDeps } from "./tabFocus";
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
 import { submitAnswer } from "./answers";
@@ -188,9 +193,12 @@ import {
   type OfficialGauge,
 } from "./view";
 
-/** Append a line to ~/.claude/session-monitor/csm-debug.log (best-effort, for diagnosis). */
+/** The debug log, ~/.claude/session-monitor/csm-debug.log: one JSON line per message, from every window (debugLog.ts). */
 const LOG_FILE = `${MONITOR_DIR}/csm-debug.log`;
-let logCount = 0;
+const debugLog = new DebugLog({ file: LOG_FILE, pid: process.pid, lock: (file) => acquireSwitchLock(file) });
+/** The windows' health files (health.ts) and errors.json (errorRegistry.ts). */
+const HEALTH_DIR = path.join(MONITOR_DIR, "health");
+const ERRORS_FILE = path.join(HEALTH_DIR, "errors.json");
 
 function ensurePrivateDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -226,17 +234,6 @@ function writePrivateTextAtomic(file: string, text: string): void {
   }
 }
 
-function rotateLog(): void {
-  try {
-    if (fs.statSync(LOG_FILE).size > 1024 * 1024) {
-      const buf = fs.readFileSync(LOG_FILE);
-      writePrivateTextAtomic(LOG_FILE, buf.subarray(buf.length - 128 * 1024).toString("utf8"));
-    }
-  } catch {
-    /* no log yet */
-  }
-}
-
 let logSink: ((msg: string) => void) | undefined; // observer mode (observerMode.ts): this window's Output channel instead of the shared file
 
 /** Observer mode's log: a dev host never writes the shared csm-debug.log, it logs to an Output channel of its own. */
@@ -251,26 +248,10 @@ function observerLog(ctx: vscode.ExtensionContext): (msg: string) => void {
   return sink;
 }
 
-function log(msg: string): void {
+/** Appends one line to the debug log (best-effort, for diagnosis); `feature` names it when the first word does not (debugLog.ts). */
+function log(msg: string, feature?: string): void {
   if (logSink) return logSink(msg);
-  try {
-    ensurePrivateDir(MONITOR_DIR);
-    try {
-      if (fs.lstatSync(LOG_FILE).isSymbolicLink()) {
-        writePrivateTextAtomic(LOG_FILE, "");
-      }
-    } catch {
-      /* no log yet */
-    }
-    if (logCount++ % 1000 === 0) rotateLog();
-    fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${msg}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    fs.chmodSync(LOG_FILE, 0o600);
-  } catch {
-    /* ignore */
-  }
+  debugLog.write(msg, feature);
 }
 
 const RES_FRESH_SEC = 12;
@@ -1583,6 +1564,10 @@ setInterval(render, 1000); // keep countdowns live
 // ---------------------------------------------------------------------------
 
 export function activate(ctx: vscode.ExtensionContext): void {
+  // One key per window in the debug log, the health file and the continuity heartbeat (continuity.ts windowKey).
+  const win = windowKey(storageDir(ctx.storageUri?.fsPath), process.pid);
+  const version = (ctx.extension?.packageJSON as { version?: string } | undefined)?.version ?? "0.0.0";
+  debugLog.identify(win, version);
   const cfg = () => vscode.workspace.getConfiguration("claudeSessionMonitor");
   const showTokenStats = (): boolean => cfg().get<boolean>("showTokenStats", false);
   const workspaceCwd = () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -1614,6 +1599,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   });
   const allowed = observer.featureAllowed;
   logSink = allowed("sharedFiles") ? undefined : observerLog(ctx);
+  log(`activated: version ${version} pid ${process.pid} window ${win}`, "activation");
   if (observer.on) log(observer.summary());
 
   const resourceCache = new Map<number, ResStat>();
@@ -2028,7 +2014,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastResourceSample = 0;
   let lastTokenScan = Date.now() / 1000; // the first token scan waits a minute: activation is when Claude Code restores its tabs
   let lastSessLog = 0;
+  const sessionDrops = new SessionDrops(); // one log line when 5+ live sessions are gone within 60 s
   let lastRefreshMs = 0; // start of the last refresh from any path; timer, watcher and Codex poll refreshes wait REFRESH_GAP_MS after it
+  const refreshMs = new DurationRing(); // the recent refresh durations, for the health file's p95
   let tokenUsage: TokenUsage | null = null;
   let officialUsage: OfficialUsage | null = null;
   let officialUsageAcct: string | null = null; // account officialUsage was fetched for (the active card only shows its own)
@@ -3203,7 +3191,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
     );
   }
 
+  /** Every refresh is timed: the health file reports the 95th percentile of the recent ones (health.ts). */
   function refresh(): void {
+    timed(refreshMs, refreshOnce);
+  }
+
+  function refreshOnce(): void {
     if (disposed) return;
     lastRefreshMs = Date.now();
     const now = Date.now() / 1000;
@@ -3286,6 +3279,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       workspaceOnlyOverride !== undefined ? workspaceOnlyOverride : c.get<boolean>("workspaceOnly", false);
 
     let claudeViews: SessionView[] = [];
+    let collected = true;
     if (claudeEnabled()) {
       try {
         claudeViews = collectSessions({
@@ -3303,6 +3297,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         });
       } catch (e) {
         claudeViews = [];
+        collected = false;
         stages.fail("collect", e);
       }
     }
@@ -3311,6 +3306,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
       claudeViews,
       codexEnabled() ? codexSnapshot.sessions : [],
     );
+    // A failed collect or another provider or workspace filter starts the drop watch over (sessionLog.ts).
+    const listScope = collected ? JSON.stringify([enabledProviders(), wsOnly && workspaceCwd()]) : "collect failed";
+    const dropped = stages.safe("session drops", () => sessionDrops.observe(liveKeys(allViews), listScope, Date.now()));
+    if (dropped) log(dropped);
     let dismissalsChanged = false;
     for (const v of allViews) {
       const dismissedAt = dismissed.get(v.key);
@@ -3333,11 +3332,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (needsYouOnly) views = views.filter((v) => NEEDS_YOU.includes(groupOf(v)));
     lastViews = views;
 
-    if (now - lastSessLog > 20) {
+    if (now - lastSessLog >= SUMMARY_EVERY_SEC) {
       lastSessLog = now;
-      log(
-        `sessions=${allViews.length} ${JSON.stringify(countBuckets(allViews))} providers=${JSON.stringify(countProviders(allViews))} dismissed=${dismissed.size}`,
-      );
+      log(sessionSummary(allViews, dismissed.size));
     }
 
     stages.safe("sessions", () => pushSessions(views, allViews));
@@ -4328,17 +4325,63 @@ export function activate(ctx: vscode.ExtensionContext): void {
   ctx.subscriptions.push({ dispose: () => continuity?.dispose() });
 
   // Ask before an extension restart stops every session in this window (restartGuard.ts).
-  if (allowed("restartGuard")) stages.safe("restart guard start", () => activateRestartGuard(ctx, {
+  const restartGuard = allowed("restartGuard") ? stages.safe("restart guard start", () => activateRestartGuard(ctx, {
     log,
     focusGroup: focusTabGroup,
     idleMs: probes.idleMs,
-  }));
+  })) : undefined;
   // The commands of a feature observer mode keeps off say so instead of "command not found".
   for (const { command, feature } of observer.offCommands()) {
     ctx.subscriptions.push(vscode.commands.registerCommand(command, () => observer.actionAllowed(feature)));
   }
 
   stages.safe("first refresh", refresh);
+
+  // Now, every 30 s and at dispose: new occurrences of the errors the stage guard caught go to errors.json
+  // (errorRegistry.ts), this window's health file is rewritten (health.ts), and one window sends the
+  // overseer heartbeat for all of them (overseerBeat.ts; only where overseer is installed).
+  const saveStageErrors = (): void => {
+    const records = stages.unsaved();
+    const deps = { file: ERRORS_FILE, shared: () => allowed("sharedFiles"), lock: (file: string) => acquireSwitchLock(file), read: readText, write: writePrivateTextAtomic };
+    if (records.length && saveErrors(records, version, win, deps)) stages.saved(records);
+  };
+  const health: HealthDeps = {
+    dir: HEALTH_DIR,
+    win,
+    pid: process.pid,
+    version,
+    nowMs: () => Date.now(),
+    enabled: () => ({
+      sessions: claudeEnabled() || codexEnabled(),
+      limits: claudeEnabled(),
+      remote: remoteBridge?.running === true,
+      autoResume: allowed("autoResume") && claudeEnabled() && autoResumeAll(),
+      continuity: allowed("continuity") && claudeEnabled() && cfg().get<boolean>("continuityChannel", false) === true,
+      wake: allowed("wake") && claudeEnabled() && cfg().get<boolean>("wakeDeadTabs", false) === true,
+      restartGuard: allowed("restartGuard") && cfg().get<boolean>("restartGuard", false) === true,
+    }),
+    failures: () => stages.lastFailures(),
+    refresh: refreshMs,
+    guardArmed: () => restartGuard?.armed() === true,
+    shared: () => allowed("sharedFiles"),
+    write: writePrivateTextAtomic,
+    remove: (file) => fs.rmSync(file, { force: true }),
+  };
+  const overseer = new OverseerBeat(nodeBeatDeps(HEALTH_DIR, overseerBin(), () => allowed("sharedFiles"), log));
+  const observe = (): void => {
+    stages.safe("error registry", saveStageErrors);
+    stages.safe("health", () => writeHealth(health));
+    void overseer.tick().catch((e: unknown) => stages.fail("overseer", e));
+  };
+  observe();
+  const observeTimer = setInterval(observe, HEALTH_EVERY_MS);
+  ctx.subscriptions.push({
+    dispose: () => {
+      clearInterval(observeTimer);
+      stages.safe("error registry", saveStageErrors);
+      stages.safe("health", () => removeHealth(health));
+    },
+  });
 }
 
 export function deactivate(): void {}

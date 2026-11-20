@@ -2209,10 +2209,12 @@ describe("the health file and the overseer heartbeat", () => {
   const MON = `${HOME}/.claude/session-monitor`;
   const STORAGE = `${HOME}/workspaceStorage/0123abcd`;
   const healthPath = (): string => `${MON}/health/${storageKey(STORAGE)}.json`;
+  // A window with a folder, a version and a workspace state (without one the limits payload throws, as in mkCtx()).
   const ctxWithFolder = (): any => ({
     ...mkCtx(),
     storageUri: { fsPath: `${STORAGE}/softween.claude-code-session-monitor` },
     extension: { packageJSON: { version: "9.9.9" } },
+    workspaceState: { get: (_k: string, def?: unknown) => def, update: () => Promise.resolve() },
   });
   afterEach(() => {
     vi.restoreAllMocks();

@@ -57,6 +57,34 @@ describe("scanTokenUsage reads at most 4 MiB per call", () => {
   });
 });
 
+describe("scanTokenUsage with persist: false (observer mode)", () => {
+  const usage = (tokens: number, ago: number) =>
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "a" }], usage: { input_tokens: tokens, output_tokens: 0 } }, timestamp: iso(NOW - ago) });
+
+  it("counts the saved totals plus the unread tail and leaves both cache files as they were", () => {
+    const p = path.join(tmp, "s.jsonl");
+    const offsetsFile = path.join(tmp, "offsets.json");
+    const bucketsFile = path.join(tmp, "buckets.json");
+    fs.writeFileSync(p, usage(1000, 700) + "\n");
+    scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile }); // another window's scan saved 1000
+    fs.appendFileSync(p, usage(500, 600) + "\n");
+    const saved = [fs.readFileSync(offsetsFile, "utf8"), fs.readFileSync(bucketsFile, "utf8")];
+    for (let i = 0; i < 2; i++) {
+      expect(scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile, persist: false }).fiveHour).toBe(1500);
+    }
+    expect([fs.readFileSync(offsetsFile, "utf8"), fs.readFileSync(bucketsFile, "utf8")]).toEqual(saved);
+  });
+
+  it("creates no cache file when none was saved yet", () => {
+    const p = path.join(tmp, "fresh.jsonl");
+    fs.writeFileSync(p, usage(700, 600) + "\n");
+    const offsetsFile = path.join(tmp, "none-offsets.json");
+    const bucketsFile = path.join(tmp, "none-buckets.json");
+    expect(scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile, persist: false }).fiveHour).toBe(700);
+    expect([fs.existsSync(offsetsFile), fs.existsSync(bucketsFile)]).toEqual([false, false]);
+  });
+});
+
 describe("scanTokenUsage prefilter", () => {
   it("never JSON-parses a line without \"usage\" and still counts the usage lines", () => {
     const marker = "NO-USAGE-LINE";

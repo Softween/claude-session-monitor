@@ -21,6 +21,10 @@ const rec = vi.hoisted(() => ({
   execFileImpl: null as null | ((args: any[]) => boolean), // returns true when it handled the call
   spawnImpl: null as null | ((args: any[]) => any), // returns the child when it handled the call
   statusMessages: [] as string[],
+  execFiles: [] as any[][], // every execFile call, handled or not
+  infoMessages: [] as string[],
+  outputChannels: [] as Array<{ name: string; lines: string[] }>,
+  customEditors: [] as string[], // registered custom editor view types (the restart guard's)
 }));
 
 vi.mock("os", async (orig) => {
@@ -34,6 +38,7 @@ vi.mock("child_process", async () => {
   const { PassThrough } = await import("stream");
   return {
     execFile: (...args: any[]) => {
+      rec.execFiles.push(args);
       const cb = args[args.length - 1];
       if (rec.execFileImpl?.(args)) return { on() {} } as any;
       if (typeof cb === "function") cb(new Error("mocked"), "", "");
@@ -60,11 +65,40 @@ vi.mock("child_process", async () => {
 });
 
 // No real fs watchers: each fs.watch call is recorded (watched dir + listener) and a test fires it.
-const watchRec = vi.hoisted(() => ({ watchers: [] as Array<{ dir: string; fire: (event: string, name: string | null) => void }> }));
+// Every write still runs, and is recorded with its path arguments in `writes` (observer mode asserts there is none).
+const watchRec = vi.hoisted(() => ({ watchers: [] as Array<{ dir: string; fire: (event: string, name: string | null) => void }>, writes: [] as string[] }));
 vi.mock("fs", async (orig) => {
   const real = await orig<typeof import("fs")>();
+  const { O_WRONLY, O_RDWR, O_CREAT, O_APPEND, O_TRUNC } = real.constants;
+  const writing = (flags: unknown): boolean =>
+    typeof flags === "number" ? (flags & (O_WRONLY | O_RDWR | O_CREAT | O_APPEND | O_TRUNC)) !== 0 : typeof flags === "string" && !/^(r|rs|sr)$/.test(flags);
+  const note = (name: string, args: unknown[]): void => {
+    watchRec.writes.push(`${name} ${args.filter((a) => typeof a === "string").join(" ")}`);
+  };
+  const recorded = (name: string, fn: (...a: any[]) => any) => (...args: any[]) => {
+    note(name, args);
+    return fn(...args);
+  };
+  const promises: any = { ...real.promises };
+  const writers: any = {};
+  for (const name of ["writeFile", "appendFile", "rename", "unlink", "rm", "rmdir", "mkdir", "chmod", "copyFile", "symlink", "link", "truncate", "utimes", "cp"]) {
+    const sync = `${name}Sync`;
+    if (typeof (real as any)[sync] === "function") writers[sync] = recorded(sync, (real as any)[sync]);
+    if (typeof (real as any)[name] === "function") writers[name] = recorded(name, (real as any)[name]);
+    if (typeof (real.promises as any)[name] === "function") promises[name] = recorded(`promises.${name}`, (real.promises as any)[name].bind(real.promises));
+  }
+  promises.open = (p: any, flags?: any, ...rest: any[]) => {
+    if (writing(flags)) note("promises.open", [p]);
+    return real.promises.open(p, flags, ...rest);
+  };
   return {
     ...real,
+    ...writers,
+    promises,
+    openSync: (p: any, flags?: any, ...rest: any[]) => {
+      if (writing(flags)) note("openSync", [p]);
+      return real.openSync(p, flags, ...rest);
+    },
     watch: (dir: string, ...rest: any[]) => {
       const listener = rest[rest.length - 1];
       const watcher = { on: () => watcher, close() {} };
@@ -112,6 +146,7 @@ vi.mock("vscode", () => {
     ThemeColor,
     TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
     StatusBarAlignment: { Left: 1, Right: 2 },
+    ExtensionMode: { Production: 1, Development: 2, Test: 3 },
     Uri: { file: (p: string) => ({ fsPath: p, toString: () => p }) },
     window: {
       createTreeView: (id: string) => {
@@ -123,7 +158,15 @@ vi.mock("vscode", () => {
         rec.webviews.push({ id, p });
         return { dispose() {} };
       },
-      registerCustomEditorProvider: () => ({ dispose() {} }),
+      registerCustomEditorProvider: (viewType: string) => {
+        rec.customEditors.push(viewType);
+        return { dispose() {} };
+      },
+      createOutputChannel: (name: string) => {
+        const channel = { name, lines: [] as string[], info: (line: string) => channel.lines.push(line), dispose() {} };
+        rec.outputChannels.push(channel);
+        return channel;
+      },
       createStatusBarItem: () => {
         const s: any = { text: "", tooltip: "", command: "", backgroundColor: undefined, show() {}, dispose() {} };
         rec.statusBars.push(s);
@@ -155,7 +198,10 @@ vi.mock("vscode", () => {
         rec.closeListeners.push(listener);
         return { dispose() {} };
       },
-      showInformationMessage: () => Promise.resolve(undefined),
+      showInformationMessage: (msg: unknown) => {
+        rec.infoMessages.push(String(msg));
+        return Promise.resolve(undefined);
+      },
       showWarningMessage: (...args: any[]) => {
         rec.warningMessages.push(args);
         return Promise.resolve(undefined);
@@ -297,6 +343,11 @@ afterEach(() => {
   rec.execFileImpl = null;
   rec.spawnImpl = null;
   rec.statusMessages.length = 0;
+  rec.execFiles.length = 0;
+  rec.infoMessages.length = 0;
+  rec.outputChannels.length = 0;
+  rec.customEditors.length = 0;
+  watchRec.writes.length = 0;
   keeperWaiting.clear(); // module-level: one test's claude-switch keeper state must not leak into the next
   lastCtx = undefined;
   vi.useRealTimers();
@@ -1909,5 +1960,154 @@ describe("resume terminals: reuse, and remote resume / send / kill without a hoo
     } finally {
       kill.mockRestore();
     }
+  });
+});
+
+describe("observer mode in an Extension Development Host", () => {
+  const UA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const UB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const MON = `${HOME}/.claude/session-monitor`;
+  const OLD_STATUS = `${MON}/old-session.json`;
+  const MODE = { Production: 1, Development: 2, Test: 3 };
+  const fakeClock = () => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+  const card = (payload: any, id: string) => payload.providers.find((p: any) => p.accountId === id);
+  const writesUnderHome = () => watchRec.writes.filter((w) => w.includes(HOME));
+  const observerLog = () => rec.outputChannels.flatMap((c) => c.lines).join("\n");
+  const debugLog = () => (fs.existsSync(`${MON}/csm-debug.log`) ? fs.readFileSync(`${MON}/csm-debug.log`, "utf8") : "");
+
+  // What a normal window acts on: a registry still on A while ~/.claude.json names B (the registry
+  // follows), A's live usage at 99% near its reset (auto-resume), B's stored token expired with
+  // claude-switch installed (its vault gets seeded), a status file 13 h old (cleanup), a transcript
+  // (the token-count cache), and the wake, continuity and auto-resume settings on. Returns the secrets.
+  function seedSharedState(): Record<string, string> {
+    const now = Date.now();
+    const s5 = [{ key: "session", label: "Session (5h)", pct: 99, resetMs: now + 600_000 }];
+    fs.mkdirSync(MON, { recursive: true });
+    const accounts = [{ id: UA, email: "a@x.com", lastSeenTs: 100 }, { id: UB, email: "b@x.com", lastSeenTs: 50 }];
+    fs.writeFileSync(`${MON}/accounts.json`, JSON.stringify({ v: 1, activeId: UA, accounts }));
+    fs.writeFileSync(`${MON}/official-usage.json`, JSON.stringify({ gauges: s5, ts: now / 1000 - 60, acct: UA }));
+    for (const id of [UA, UB]) fs.writeFileSync(`${MON}/official-usage-${id.slice(0, 16)}.json`, JSON.stringify({ gauges: s5, ts: now / 1000 - 60 }));
+    fs.writeFileSync(OLD_STATUS, JSON.stringify({ session_id: "old-session", provider: "claude", state: "idle", ts: now / 1000 - 13 * 3600 }));
+    const old = new Date(now - 13 * 3600_000);
+    fs.utimesSync(OLD_STATUS, old, old);
+    fs.writeFileSync(`${HOME}/.claude.json`, JSON.stringify({ oauthAccount: { accountUuid: UB, emailAddress: "b@x.com" } }));
+    fs.mkdirSync(`${HOME}/.claude/bin`, { recursive: true });
+    fs.writeFileSync(`${HOME}/.claude/bin/claude-switch`, "#!/bin/sh\n", { mode: 0o755 });
+    fs.mkdirSync(`${HOME}/.claude/projects/-repo`, { recursive: true });
+    const turn = { type: "assistant", message: { content: [{ type: "text", text: "a" }], usage: { input_tokens: 1000, output_tokens: 0 } }, timestamp: new Date(now - 600_000).toISOString() };
+    fs.writeFileSync(`${HOME}/.claude/projects/-repo/observer-tx.jsonl`, JSON.stringify(turn) + "\n");
+    for (const key of ["wakeDeadTabs", "continuityChannel", "autoResumeAfterReset"]) rec.config.set(key, true);
+    return { [`csm.oauth.${UB}`]: JSON.stringify({ accessToken: "at-b", refreshToken: "rt-b", expiresAt: now - 60_000 }) };
+  }
+
+  // Activates in `mode` with the limits view resolved; only what the extension writes from here on is recorded.
+  function activateIn(mode: number, secrets: Record<string, string>): { posted: any[]; send: (m: any) => void } {
+    const ctx = mkCtx();
+    ctx.extensionMode = mode;
+    ctx.workspaceState = { get: (_k: string, def?: unknown) => def, update: () => Promise.resolve() };
+    ctx.secrets.get = (k: string) => Promise.resolve(secrets[k]);
+    ctx.secrets.store = vi.fn(() => Promise.resolve());
+    ctx.secrets.delete = vi.fn(() => Promise.resolve());
+    lastCtx = ctx;
+    watchRec.writes.length = 0;
+    ext.activate(ctx);
+    const posted: any[] = [];
+    let onMessage: (m: any) => void = () => undefined;
+    rec.webviews.find((w) => w.id === "claudeSessionMonitor.limits")!.p.resolveWebviewView({
+      webview: { options: {}, html: "", onDidReceiveMessage: (fn: (m: any) => void) => { onMessage = fn; }, postMessage: (m: any) => { if (m?.type !== "burn") posted.push(m); } },
+    });
+    return { posted, send: (m) => onMessage(m) };
+  }
+
+  // A running window, in 1 s steps: the usage polls, the 30 s registry reload and the 60 s token scan all come due.
+  async function runFor(seconds: number): Promise<void> {
+    for (let i = 0; i < seconds; i++) {
+      vi.advanceTimersByTime(1000);
+      await settleAsync();
+    }
+  }
+
+  it("Development mode starts no bridge, guard, wake, continuity or auto-resume, spawns nothing and writes nothing under the home, while both panels show the shared state", async () => {
+    fakeClock();
+    const secrets = seedSharedState();
+    rec.config.set("restartGuard", true); // its own setting on: observer mode keeps it off all the same
+    const { posted } = activateIn(MODE.Development, secrets);
+    await runFor(65);
+    expect(rec.bridgeDeps).toBeNull();
+    expect(rec.customEditors).toEqual([]);
+    expect(rec.execFiles).toEqual([]);
+    expect(rec.spawns).toEqual([]);
+    expect(writesUnderHome()).toEqual([]);
+    expect(fs.existsSync(OLD_STATUS)).toBe(true);
+    expect(fs.existsSync(`${MON}/csm-debug.log`)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(`${MON}/accounts.json`, "utf8")).activeId).toBe(UA);
+    expect(rec.webviews.map((w) => w.id)).toEqual(expect.arrayContaining(["claudeSessionMonitor.view", "claudeSessionMonitor.limits"]));
+    const last = posted[posted.length - 1];
+    expect(card(last, UB).active).toBe(true); // ~/.claude.json is followed in memory only
+    expect(card(last, UB).gauges[0].pct).toBe(99); // B's usage as the other windows saved it
+    expect(observerLog()).toContain(
+      "observer mode (Extension Development Host): off remoteBridge, rotation, autoResume, wake, continuity, restartGuard, usagePolls, accountWrites, sharedFiles",
+    );
+    expect(observerLog()).toContain("active: b@x.com (acct bbbbbbbb, from claude.json)");
+    expect(observerLog()).not.toContain("auto-resume scheduled");
+    expect(observerLog()).not.toContain("wake: activation");
+  });
+
+  it.each([
+    ["Production", MODE.Production],
+    ["Test", MODE.Test],
+  ])("%s mode keeps every feature: the same state starts the bridge and the guard, runs `which claude` and writes the shared files", async (_name, mode) => {
+    fakeClock();
+    const secrets = seedSharedState();
+    activateIn(mode, secrets);
+    await runFor(65);
+    expect(rec.bridgeDeps).not.toBeNull();
+    expect(rec.customEditors).toEqual(["claudeSessionMonitor.restartGuard"]);
+    expect(rec.execFiles.map((args) => args[0])).toContain("which");
+    expect(fs.existsSync(OLD_STATUS)).toBe(false); // the stale status file was cleaned up
+    expect(JSON.parse(fs.readFileSync(`${MON}/accounts.json`, "utf8")).activeId).toBe(UB); // the registry followed ~/.claude.json
+    expect(fs.existsSync(`${MON}/token-buckets.json`)).toBe(true);
+    expect(fs.existsSync(`${HOME}/.claude/state/claude-switch/vault/${UB}.json`)).toBe(true); // B's token seeded for claude-switch
+    expect(debugLog()).toContain("auto-resume scheduled");
+    expect(debugLog()).toContain("wake: activation");
+    expect(rec.outputChannels).toEqual([]);
+  });
+
+  it("dev.enableFeatures turns a listed feature back on in Development mode and leaves the others off", async () => {
+    fakeClock();
+    const secrets = seedSharedState();
+    rec.config.set("dev.enableFeatures", ["remoteBridge"]);
+    activateIn(MODE.Development, secrets);
+    await runFor(5);
+    expect(rec.bridgeDeps).not.toBeNull(); // the bridge started
+    expect(rec.execFiles.map((args) => args[0])).toEqual(["which"]); // with its `which claude` lookup, and nothing else ran
+    expect(rec.customEditors).toEqual([]);
+    expect(writesUnderHome()).toEqual([]);
+    expect(observerLog()).toContain("on through dev.enableFeatures remoteBridge");
+  });
+
+  it("Development mode refuses account and settings actions with a notice, and the commands of a feature that is off answer", async () => {
+    fakeClock();
+    const secrets = seedSharedState();
+    const { posted, send } = activateIn(MODE.Development, secrets);
+    await runFor(2);
+    const registry = fs.readFileSync(`${MON}/accounts.json`, "utf8");
+    await rec.commands.get("claudeSessionMonitor.forgetOtherAccounts")!();
+    await rec.commands.get("claudeSessionMonitor.setEffortAll")!();
+    await rec.commands.get("claudeSessionMonitor.refreshUsage")!(); // claude-switch is installed: no `tick --fresh` either
+    send({ type: "useAccount", email: "a@x.com", at: Date.now() });
+    for (const id of ["setRemoteToken", "remoteStatus", "openRestartGuard", "wakeDeadTabsNow"]) await rec.commands.get(`claudeSessionMonitor.${id}`)!();
+    await runFor(2);
+    const notices = (id: string) => rec.infoMessages.filter((m) => m.includes(`${id} is off in this Extension Development Host`)).length;
+    expect([notices("accountWrites"), notices("remoteBridge"), notices("restartGuard"), notices("wake")]).toEqual([2, 2, 1, 1]);
+    expect(posted[posted.length - 1].useResult).toMatchObject({ email: "a@x.com", ok: false });
+    expect(posted[posted.length - 1].useResult.text).toContain("accountWrites is off");
+    expect(lastCtx.secrets.store).not.toHaveBeenCalled();
+    expect(lastCtx.secrets.delete).not.toHaveBeenCalled();
+    expect(fs.readFileSync(`${MON}/accounts.json`, "utf8")).toBe(registry);
+    expect(fs.existsSync(`${HOME}/.claude/settings.json`)).toBe(false);
+    expect(rec.spawns).toEqual([]);
+    expect(rec.execFiles).toEqual([]);
+    expect(writesUnderHome()).toEqual([]);
   });
 });

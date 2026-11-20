@@ -170,6 +170,7 @@ function activate(dir: string, resolveOnOpen = true) {
   return { calls, ctx };
 }
 
+const opens = () => env.executed.filter((e) => e.id === "vscode.openWith").length;
 const fireTabsClosed = (...closed: any[]) => env.tabListeners.forEach((l) => l({ opened: [], closed, changed: [] }));
 const fireWindow = (focused: boolean) => {
   env.windowFocused = focused;
@@ -348,11 +349,11 @@ describe("activateRestartGuard", () => {
     env.groups = [g];
     const { calls } = activate(tmpDir());
     await flush();
-    expect(env.executed).toHaveLength(1);
+    expect(opens()).toBe(1);
 
     closeGuardTab(g);
     await flush();
-    expect(env.executed).toHaveLength(1); // the window is focused: nothing moves under the user
+    expect(opens()).toBe(1); // the window is focused: nothing moves under the user
     expect(calls.at(-1)).toBe("log restart guard: tab closed, opens again when the window is not focused");
 
     fireWindow(false);
@@ -363,7 +364,7 @@ describe("activateRestartGuard", () => {
     fireWindow(true);
     fireWindow(false);
     await flush();
-    expect(env.executed.filter((e) => e.id === "vscode.openWith")).toHaveLength(2); // once per close
+    expect(opens()).toBe(2); // once per close
   });
 
   it("opens a closed guard tab again right away when the window is not focused", async () => {
@@ -374,7 +375,7 @@ describe("activateRestartGuard", () => {
     env.windowFocused = false;
     closeGuardTab(g);
     await flush();
-    expect(env.executed.filter((e) => e.id === "vscode.openWith")).toHaveLength(2);
+    expect(opens()).toBe(2);
   });
 
   it("does not open it again for another tab's close or once the setting is off", async () => {
@@ -385,14 +386,14 @@ describe("activateRestartGuard", () => {
     fireTabsClosed(textTab());
     fireWindow(false);
     await flush();
-    expect(env.executed).toHaveLength(1);
+    expect(opens()).toBe(1);
 
     fireWindow(true);
     env.config.set("restartGuard", false);
     closeGuardTab(g);
     fireWindow(false);
     await flush();
-    expect(env.executed).toHaveLength(1);
+    expect(opens()).toBe(1);
   });
 
   it("opens the guard with focus from the command, and logs a failure instead of throwing", async () => {

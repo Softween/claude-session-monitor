@@ -169,8 +169,10 @@ async function closeGuard(log: (msg: string) => void): Promise<void> {
 
 /**
  * Registers the guard editor and the Open command, and applies the setting now
- * and on every change: on opens the guard, off closes it. A guard tab the user
- * closes stays closed until the next activation.
+ * and on every change: on opens the guard, off closes it. A guard tab closed
+ * while the setting is on opens again the next time the window is not focused
+ * (right away when it is not focused already): nothing moves while you work in
+ * the window, and a restart is not left unguarded until the next activation.
  */
 export function activateRestartGuard(ctx: vscode.ExtensionContext, deps: GuardDeps): void {
   const provider = new GuardEditorProvider();
@@ -184,6 +186,12 @@ export function activateRestartGuard(ctx: vscode.ExtensionContext, deps: GuardDe
     if (enabled()) run("open", () => ensureGuard(provider, fileUri, deps));
     else run("close", () => closeGuard(deps.log));
   };
+  let reopenPending = false; // a guard tab was closed while the setting is on
+  const reopenIfDue = (): void => {
+    if (!reopenPending || vscode.window.state.focused || !enabled()) return;
+    reopenPending = false;
+    run("open", () => ensureGuard(provider, fileUri, deps));
+  };
   ctx.subscriptions.push(
     vscode.window.registerCustomEditorProvider(GUARD_VIEW_TYPE, provider, { supportsMultipleEditorsPerDocument: false }),
     vscode.commands.registerCommand(OPEN_GUARD_COMMAND, () =>
@@ -192,6 +200,13 @@ export function activateRestartGuard(ctx: vscode.ExtensionContext, deps: GuardDe
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration(`claudeSessionMonitor.${SETTING}`)) apply();
     }),
+    vscode.window.tabGroups.onDidChangeTabs((e) => {
+      if (!enabled() || !e.closed.some(isGuardTab)) return;
+      reopenPending = true;
+      deps.log("restart guard: tab closed, opens again when the window is not focused");
+      reopenIfDue();
+    }),
+    vscode.window.onDidChangeWindowState(reopenIfDue),
   );
   apply();
 }

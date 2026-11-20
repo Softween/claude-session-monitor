@@ -24,8 +24,13 @@ import {
 const NOW = Date.UTC(2026, 10, 10, 6, 15, 0); // 08:15 Istanbul, the restart of 2026-11-10
 const none = (): undefined => undefined;
 const reg = (sid: string, title?: string): RegistryEntry => ({ sid, title, lastSeenMs: NOW - 3_600_000, missed: 2 });
+const titleOf = (sid: string): string => `Limit-stopped session ${sid}`;
+const REVEAL_MS = 30; // Claude Code shows the tab after editor.open returns (two more command round trips)
 
-/** Fake editor + machine: a tab wake makes its tab active and its process appear 0.4 s later. */
+/**
+ * Fake editor + machine: like Claude Code, a tab wake returns before its tab (labelled
+ * with the session title) becomes active, 30 ms later; its process appears 0.4 s after the wake.
+ */
 function harness(over: Partial<WakeDeps<string>> = {}, stored: Record<string, unknown> = {}) {
   const store = new Map<string, unknown>(Object.entries(stored));
   const writes: Array<[string, unknown]> = [];
@@ -33,7 +38,7 @@ function harness(over: Partial<WakeDeps<string>> = {}, stored: Record<string, un
   const state = { live: [] as LiveSession[], active: "editor-a", spawn: true };
   const executeCommand = vi.fn(async (_id: string, ...args: unknown[]) => {
     const sid = String(args[0]);
-    state.active = `claude-${sid}`;
+    setTimeout(() => (state.active = `claude-${sid}`), REVEAL_MS);
     if (state.spawn) setTimeout(() => state.live.push({ sessionId: sid, pid: 4242, entrypoint: "claude-vscode" }), 400);
   });
   const restoreTabs = vi.fn(async (memo: string) => {
@@ -54,7 +59,7 @@ function harness(over: Partial<WakeDeps<string>> = {}, stored: Record<string, un
     },
     now: () => Date.now(),
     hostPid: 100,
-    titleOf: none,
+    titleOf,
     liveSessions: () => state.live,
     parentPids,
     limitStop: () => ({ ts: (Date.now() - 60_000) / 1000, apiError: true, status: 429 }),
@@ -65,6 +70,7 @@ function harness(over: Partial<WakeDeps<string>> = {}, stored: Record<string, un
     executeCommand,
     snapshotTabs: () => state.active,
     activeTab: () => state.active,
+    activeClaudeLabel: () => (state.active.startsWith("claude-") ? titleOf(state.active.slice("claude-".length)) : undefined),
     restoreTabs,
     ...over,
   };
@@ -220,6 +226,27 @@ describe("limit stop (lastAssistantStop + isLimitStop)", () => {
 });
 
 describe("preconditions", () => {
+  it("checks memory, then the command, then idle and focus, right before it acts", async () => {
+    const order: string[] = [];
+    const h = harness(
+      {
+        pressureLevel: async () => (order.push("memory"), 1),
+        commandExists: async () => (order.push("command"), true),
+        idleMs: async () => (order.push("idle"), undefined), // unreadable: the window focus decides
+        windowFocused: () => (order.push("focus"), false),
+      },
+      { [REGISTRY_KEY]: [reg("a")] },
+    );
+    const wake = h.executeCommand.getMockImplementation()!;
+    h.executeCommand.mockImplementation(async (id: string, ...args: unknown[]) => {
+      order.push("act");
+      await wake(id, ...args);
+    });
+    h.waker.start();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(order.slice(0, 5)).toEqual(["memory", "command", "idle", "focus", "act"]);
+  });
+
   it("waits while the user is active and logs one line per reason per 10 min", async () => {
     let idle: number | undefined = 5_000;
     let focused = true;
@@ -298,6 +325,59 @@ describe("sweep step", () => {
     expect(h.logs).toContain("wake: s1 live after 0.5s pid=4242");
     expect(h.restoreTabs).not.toHaveBeenCalled();
     expect(h.state.active).toBe("editor-b");
+  });
+
+  it("records the woken tab once Claude Code shows it, waiting up to 1 s, so the tabs are put back", async () => {
+    const h = harness({}, { [REGISTRY_KEY]: [reg("s1")] });
+    h.executeCommand.mockImplementationOnce(async () => {
+      setTimeout(() => (h.state.active = "claude-s1"), 600); // a slow reveal, still within 1 s
+      setTimeout(() => h.state.live.push({ sessionId: "s1", pid: 4242 }), 400);
+    });
+    h.waker.start();
+    await vi.advanceTimersByTimeAsync(60_500);
+    expect(h.restoreTabs).not.toHaveBeenCalled(); // the process runs, the tab is not shown yet
+    await vi.advanceTimersByTimeAsync(500);
+    expect(h.restoreTabs).toHaveBeenCalledWith("editor-a");
+    expect(h.state.active).toBe("editor-a");
+  });
+
+  it("waits at most 1 s for the tab to show", async () => {
+    const h = harness({}, { [REGISTRY_KEY]: [reg("s1")] });
+    h.executeCommand.mockImplementationOnce(async () => {
+      setTimeout(() => h.state.live.push({ sessionId: "s1", pid: 4242 }), 400); // no tab shows
+    });
+    h.waker.start();
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(h.logs).toContain("wake: s1 live after 1.0s pid=4242");
+    expect(h.store.get(PENDING_KEY)).toEqual([]);
+  });
+
+  it("leaves the tabs alone while the user works in the focused window, puts them back after input elsewhere", async () => {
+    let idle = 60_000;
+    let focused = false;
+    let inWindow = true; // where the input during the next wake's wait happens
+    const h = harness({ idleMs: async () => idle, windowFocused: () => focused }, { [REGISTRY_KEY]: [reg("a"), reg("b")] });
+    const wake = h.executeCommand.getMockImplementation()!;
+    h.executeCommand.mockImplementation(async (id: string, ...args: unknown[]) => {
+      await wake(id, ...args);
+      setTimeout(() => {
+        idle = 3_000;
+        focused = inWindow;
+      }, 200);
+    });
+    h.waker.start();
+    await vi.advanceTimersByTimeAsync(61_000); // a is woken at 60 s, its process runs at 60.5 s
+    expect(h.executeCommand).toHaveBeenCalledTimes(1);
+    expect(h.restoreTabs).not.toHaveBeenCalled();
+    expect(h.state.active).toBe("claude-a");
+    expect(h.logs).toContain("wake: a tabs left as they are, the user is active in this window");
+
+    idle = 60_000; // the user leaves; during b's wait there is input in another app
+    focused = false;
+    inWindow = false;
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(h.executeCommand).toHaveBeenCalledTimes(2);
+    expect(h.restoreTabs).toHaveBeenCalledTimes(1);
   });
 
   it("wakeDeadTabsNow wakes every pending tab at once, idle or not, at least 10 s apart", async () => {

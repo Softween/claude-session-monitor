@@ -38,7 +38,8 @@ import { allowedCwds, mergeSeen, withoutPaths } from "./remoteCwds";
 import { startNewSession } from "./remoteNewSession";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import { TabWaker, nodeProbes, summaryText } from "./wakeTabs";
-import { ContinuityServer, continuityDir, focusBySlot, readText, storageDir, writeTextAtomic } from "./continuity";
+import { ContinuityServer, continuityDir, readText, storageDir, writeTextAtomic } from "./continuity";
+import { focusGroupBySlot, revealTabByIndex, type TabFocusDeps } from "./tabFocus";
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
 import { submitAnswer } from "./answers";
 import { activateRestartGuard } from "./restartGuard";
@@ -2117,8 +2118,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
       autoResumeTimer = undefined;
       autoResumeAt = 0;
       if (disposed || !claudeEnabled() || resumeActive) return;
-      const queue = sweepQueue(lastAllViews, autoResumeOverrides(), autoResumeAll());
-      if (!queue.length) return;
+      const queue = inThisWindow(sweepQueue(lastAllViews, autoResumeOverrides(), autoResumeAll()));
+      if (!queue.length) return; // every window sweeps its own sessions; one without any stays silent
       vscode.window.showInformationMessage("Claude Sessions: limit reset — starting auto resume sweep.");
       startResumeSweep(queue);
     }, delay);
@@ -3425,6 +3426,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     return lastAllViews.filter((o) => o.sessionId !== v.sessionId).flatMap((o) => matchCandidates(o));
   }
 
+  /** The sessions among `views` whose one matching tab (findSessionTab) is in this window: the typing sweep's queue. */
+  function inThisWindow(views: SessionView[]): SessionView[] {
+    return views.filter((v) => findSessionTab(v, rivalLabels(v)) !== null);
+  }
+
   /**
    * Remote path (a): write `text` + Return straight into the VS Code terminal
    * that hosts the session (process-tree match first, else the one terminal
@@ -3485,9 +3491,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     // These commands type Claude slash-commands into the focused Claude input.
     // Keep this guard even when the caller already filtered by capability so a
     // mixed-provider command argument can never receive unattended keystrokes.
-    queue = queue.filter((v) => v.provider === "claude" && v.capabilities.bulkInput);
+    // Only sessions whose one matching tab is in this window are queued.
+    queue = inThisWindow(queue.filter((v) => v.provider === "claude" && v.capabilities.bulkInput));
     if (!queue.length) {
-      vscode.window.showInformationMessage(`Claude Sessions: no open sessions to ${opts.doneLabel}.`);
+      vscode.window.showInformationMessage(`Claude Sessions: no open sessions in this window to ${opts.doneLabel}.`);
       return;
     }
     stopResume();
@@ -3511,8 +3518,17 @@ export function activate(ctx: vscode.ExtensionContext): void {
         return;
       }
       const v = queue[i++];
+      const rivals = rivalLabels(v);
+      const tab = findSessionTab(v, rivals);
+      if (!tab) {
+        // Its tab closed, or no longer is the one match, since the sweep began: skip it, never prompt.
+        skipped++;
+        log(`${opts.doneLabel} skip ${v.key}: ${NO_TAB_MESSAGE}`);
+        if (resumeActive) resumeTimer = setTimeout(runOne, 0); // nothing was shown or typed
+        return;
+      }
       try {
-        await jumpToSession(v);
+        if (!tab.active) await focusTab(tab.gi, tab.ti);
         await sleep(500);
         if (!resumeActive) return;
 
@@ -3530,10 +3546,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         } else {
           const t = await typeIntoFocusedSession(text, opts.submitDelayMs, () => resumeActive, {
             activate: true,
-            tabActive: () => {
-              const a = activeTabLabel();
-              return !!a && matchCandidates(v).some((c) => labelsMatch(a, c));
-            },
+            tabActive: () => findSessionTab(v, rivals)?.active === true,
           });
           if (!t.ok && t.reason === "aborted") return;
           if (!t.ok && (t.reason === "not-frontmost" || t.reason === "tab-mismatch")) {
@@ -3744,8 +3757,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
       });
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.setEffortAll", async () => {
-      const queue = lastAllViews.filter(
-        (v) => v.provider === "claude" && v.capabilities.bulkInput && groupOf(v) !== "ended",
+      const queue = inThisWindow(
+        lastAllViews.filter((v) => v.provider === "claude" && v.capabilities.bulkInput && groupOf(v) !== "ended"),
       );
       const level = await vscode.window.showQuickPick(["low", "medium", "high", "xhigh", "max"], {
         placeHolder: "Reasoning effort to set for every open session",
@@ -4223,6 +4236,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     executeCommand: (id, ...args) => vscode.commands.executeCommand(id, ...args),
     snapshotTabs,
     activeTab: () => vscode.window.tabGroups.activeTabGroup.activeTab,
+    activeClaudeLabel: () => {
+      const tab = vscode.window.tabGroups.activeTabGroup.activeTab;
+      return tab && isClaudePanelTab(tab) ? tab.label : undefined;
+    },
     restoreTabs,
     yieldTo: () => continuity?.pending() === true,
   });
@@ -4263,7 +4280,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // Ask before an extension restart stops every session in this window (restartGuard.ts).
   activateRestartGuard(ctx, {
     log,
-    focusGroup: (i) => (i >= 0 && i < FOCUS_GROUP_CMDS.length ? vscode.commands.executeCommand(FOCUS_GROUP_CMDS[i]) : Promise.resolve()),
+    focusGroup: focusTabGroup,
+    idleMs: probes.idleMs,
   });
 
   refresh();
@@ -4618,16 +4636,11 @@ function nativeNotify(c: vscode.WorkspaceConfiguration, title: string, message: 
 // Click actions
 // ---------------------------------------------------------------------------
 
-const FOCUS_GROUP_CMDS = [
-  "workbench.action.focusFirstEditorGroup",
-  "workbench.action.focusSecondEditorGroup",
-  "workbench.action.focusThirdEditorGroup",
-  "workbench.action.focusFourthEditorGroup",
-  "workbench.action.focusFifthEditorGroup",
-  "workbench.action.focusSixthEditorGroup",
-  "workbench.action.focusSeventhEditorGroup",
-  "workbench.action.focusEighthEditorGroup",
-];
+/** The editor side of tabFocus.ts. */
+const TAB_FOCUS: TabFocusDeps<vscode.TabGroup> = {
+  run: (command, ...args) => vscode.commands.executeCommand(command, ...args),
+  activeGroup: () => vscode.window.tabGroups.activeTabGroup,
+};
 
 function writeTabDebug(dbg: unknown): void {
   try {
@@ -4715,21 +4728,16 @@ function findSessionTab(v: SessionView, rivals: string[]): TabHit | null {
   return k >= 0 ? tabs[k] : null;
 }
 
-/** Make tab `ti` of editor group `gi` the active editor; returns the action taken (tabs-debug.json). */
+/**
+ * Make tab `ti` of editor group `gi` (tabGroups.all order) the active editor, by its
+ * index in the group focused by its screen slot (tabFocus.ts); returns the action
+ * taken (tabs-debug.json). Throws when the group or tab is gone or cannot be focused.
+ */
 async function focusTab(gi: number, ti: number): Promise<string> {
-  if (gi < FOCUS_GROUP_CMDS.length) {
-    await vscode.commands.executeCommand(FOCUS_GROUP_CMDS[gi]);
-  }
-  if (ti < 9) {
-    await vscode.commands.executeCommand(`workbench.action.openEditorAtIndex${ti + 1}`);
-    return "openEditorAtIndex" + (ti + 1);
-  }
-  // beyond index 9 there is no direct command: jump to the first tab and step.
-  await vscode.commands.executeCommand("workbench.action.openEditorAtIndex1");
-  for (let k = 0; k < ti; k++) {
-    await vscode.commands.executeCommand("workbench.action.nextEditorInGroup");
-  }
-  return "step-to-" + ti;
+  const group = vscode.window.tabGroups.all[gi];
+  if (!group) throw new Error(`editor group ${gi} is gone`);
+  await revealTabByIndex(group, ti, TAB_FOCUS);
+  return `openEditorAtIndex ${ti} in editor group ${group.viewColumn}`;
 }
 
 /** Each editor group's active tab and the active group, taken before a tab wake (wakeTabs.ts). */
@@ -4746,36 +4754,32 @@ function snapshotTabs(): TabMemo {
   };
 }
 
-/** Make every remembered tab its group's active tab again, then focus the remembered group. */
+/** Make every remembered tab its group's active tab again, then focus the remembered group (by index and screen slot, tabFocus.ts). */
 async function restoreTabs(memo: TabMemo): Promise<void> {
   const all = vscode.window.tabGroups.all;
   for (const [g, tab] of memo.actives) {
-    const gi = all.indexOf(g);
     const ti = tab ? g.tabs.indexOf(tab) : -1;
-    if (gi >= 0 && ti >= 0 && g.activeTab !== tab) await focusTab(gi, ti);
+    if (all.includes(g) && ti >= 0 && g.activeTab !== tab) await revealTabByIndex(g, ti, TAB_FOCUS);
   }
-  const ai = all.indexOf(memo.group);
-  if (ai >= 0 && ai < FOCUS_GROUP_CMDS.length && vscode.window.tabGroups.activeTabGroup !== memo.group) {
-    await vscode.commands.executeCommand(FOCUS_GROUP_CMDS[ai]);
+  if (all.includes(memo.group) && vscode.window.tabGroups.activeTabGroup !== memo.group) {
+    await focusGroupBySlot(memo.group, TAB_FOCUS);
   }
 }
 
 /**
- * Make `tab` its group's active tab and focus the group (continuity.ts): the group's
- * screen-slot focus command, confirmed (focusTabGroup), then the openEditorAtIndex
- * handler with the index as argument, so a tab past the ninth is reached without
- * showing the tabs before it.
+ * Make `tab` its group's active tab and focus the group (continuity.ts), by its index
+ * in the group focused by its screen slot (tabFocus.ts), so a tab past the ninth is
+ * reached without showing the tabs before it.
  */
 async function revealTab(group: vscode.TabGroup, tab: vscode.Tab): Promise<void> {
   const ti = group.tabs.indexOf(tab);
   if (ti < 0) return; // closed meanwhile
-  await focusTabGroup(group);
-  await vscode.commands.executeCommand("workbench.action.openEditorAtIndex", ti);
+  await revealTabByIndex(group, ti, TAB_FOCUS);
 }
 
 /** Focus `group` by its screen slot (viewColumn); throws unless it became the active group. */
 function focusTabGroup(group: vscode.TabGroup): Promise<void> {
-  return focusBySlot(group, FOCUS_GROUP_CMDS, (cmd) => vscode.commands.executeCommand(cmd), () => vscode.window.tabGroups.activeTabGroup);
+  return focusGroupBySlot(group, TAB_FOCUS);
 }
 
 /** A Claude Code editor tab (the anthropic.claude-code `claudeVSCodePanel` webview). */
@@ -4835,7 +4839,7 @@ async function jumpToSession(v: SessionView): Promise<void> {
     dbg.error = String(e);
   }
   writeTabDebug(dbg);
-  await promptNoTabMatch(v);
+  if (!dbg.matched) await promptNoTabMatch(v); // a matched tab that could not be shown is in tabs-debug.json
 }
 
 /**
@@ -4976,10 +4980,6 @@ function debounce(fn: () => void, ms: number): CancelableDebounced {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-function activeTabLabel(): string | undefined {
-  return vscode.window.tabGroups.activeTabGroup?.activeTab?.label;
 }
 
 function activateEditorApp(): Promise<void> {

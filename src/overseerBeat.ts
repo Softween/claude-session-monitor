@@ -1,17 +1,19 @@
 /**
  * overseerBeat.ts - one machine-level heartbeat for overseer, a local monitor of
- * autonomous tools. It is a private feature: nothing happens unless
+ * autonomous tools. It is a private feature: nothing is sent unless
  * ~/.claude/bin/overseer exists.
  *
  * Every window calls tick() right after writing its health file (health.ts, every
  * 30 s). The window that takes the O_EXCL lock health/emit.lock (a holder whose pid
- * is gone loses it) and finds the last emit in health/emit.json at least 60 s old
- * claims the next one, then reads the health files of all live windows and runs
+ * is gone loses it) and finds the last emit in health/emit.json at least 60 s old,
+ * or later than now after the clock was set back, claims the next one, then reads
+ * the health files of all live windows and runs
  *   overseer emit --tool session-monitor --heartbeat --every 5m --data <json> "<summary>"
  * When the windows, versions, failing features or armed guards changed since the
- * last emit, an action line with the same summary follows (warn while a feature is
- * in error), so the change shows on the overseer timeline. Health files of windows
- * gone for a day are removed. No vscode import.
+ * last action line that reached overseer, an action line with the same summary
+ * follows (warn while a feature is in error), so the change shows on the overseer
+ * timeline. With or without overseer, each window removes the health files of
+ * windows gone for a day, at most once an hour. No vscode import.
  */
 import { execFile } from "child_process";
 import * as fs from "fs";
@@ -26,6 +28,7 @@ export const TOOL_ID = "session-monitor";
 export const EMIT_GAP_MS = 60_000;
 export const LIVE_MS = 90_000; // a health file at most this old, from a live pid, is a live window
 export const PRUNE_MS = 24 * 3600_000; // health files of windows gone this long are removed
+export const PRUNE_EVERY_MS = 3600_000; // a window looks for them at most this often
 export const HEARTBEAT_EVERY = "5m"; // overseer calls the tool late after 2.5 x this without a heartbeat
 const RUN_TIMEOUT_MS = 15_000;
 const WINDOW_FILE = /^(?:[0-9a-f]{16}|empty-\d+)\.json$/;
@@ -60,8 +63,8 @@ export function overseerBin(home: string = os.homedir()): string {
   return path.join(home, ".claude", "bin", "overseer");
 }
 
-/** The health files of the live windows (fresh, pid alive), by window key; files of windows gone for a day are removed. */
-export function liveWindows(deps: Pick<BeatDeps, "dir" | "list" | "read" | "remove" | "alive">, nowMs: number): WindowHealth[] {
+/** The health files of the live windows (fresh, pid alive), by window key. */
+export function liveWindows(deps: Pick<BeatDeps, "dir" | "list" | "read" | "alive">, nowMs: number): WindowHealth[] {
   const out: WindowHealth[] = [];
   for (const name of deps.list(deps.dir).filter((n) => WINDOW_FILE.test(n)).sort()) {
     const file = path.join(deps.dir, name);
@@ -69,9 +72,17 @@ export function liveWindows(deps: Pick<BeatDeps, "dir" | "list" | "read" | "remo
     if (!health) continue;
     const age = nowMs - health.ts * 1000;
     if (age <= LIVE_MS && deps.alive(health.pid)) out.push(health);
-    else if (age > PRUNE_MS) deps.remove(file);
   }
   return out;
+}
+
+/** Removes the health files of windows gone for a day (not written for PRUNE_MS); every other file stays. */
+export function pruneHealth(deps: Pick<BeatDeps, "dir" | "list" | "read" | "remove">, nowMs: number): void {
+  for (const name of deps.list(deps.dir).filter((n) => WINDOW_FILE.test(n))) {
+    const file = path.join(deps.dir, name);
+    const health = parseHealth(deps.read(file));
+    if (health && nowMs - health.ts * 1000 > PRUNE_MS) deps.remove(file);
+  }
 }
 
 /** One line for all live windows, and the state behind it. */
@@ -97,7 +108,7 @@ export function summarize(windows: readonly WindowHealth[]): Summary {
 
 interface EmitState {
   ts: number; // epoch ms of the last claimed emit
-  sig: string;
+  sig: string; // the state the last action line that reached overseer reported ("" before the first)
 }
 
 function parseState(text: string | undefined): EmitState | undefined {
@@ -111,16 +122,18 @@ function parseState(text: string | undefined): EmitState | undefined {
 
 export class OverseerBeat {
   private lastProblem = "";
+  private prunedMs: number | undefined; // when this window last looked for health files to remove
 
   constructor(private readonly deps: BeatDeps) {}
 
   /** One step from this window's health beat; resolves with what happened. */
   async tick(): Promise<TickResult> {
     if (!this.deps.shared()) return "observer mode";
+    this.prune();
     if (!this.deps.exists(this.deps.overseer)) return "no overseer";
     const claim = this.claim();
     if (typeof claim === "string") return claim;
-    const { summary, changed } = claim;
+    const { summary, changed, ts } = claim;
     const data = JSON.stringify(summary.data);
     const problems: string[] = [];
     const heartbeat = await this.deps.run(this.deps.overseer, ["emit", "--tool", TOOL_ID, "--heartbeat", "--every", HEARTBEAT_EVERY, "--data", data, summary.text]);
@@ -128,6 +141,7 @@ export class OverseerBeat {
     if (changed) {
       const action = await this.deps.run(this.deps.overseer, ["emit", "--tool", TOOL_ID, "--level", summary.level, "--data", data, summary.text]);
       if (action !== undefined) problems.push(`action: ${action}`);
+      else this.saveSig(ts, summary.sig);
     }
     const problem = problems.join("; ");
     if (problem && problem !== this.lastProblem) this.deps.log(`overseer: emit failed (${problem}); repeats are not logged`);
@@ -135,18 +149,43 @@ export class OverseerBeat {
     return problem ? "failed" : "emitted";
   }
 
-  /** Under the emitter lock: the next emit is this window's when the last one is 60 s old; it is recorded before it runs. */
-  private claim(): { summary: Summary; changed: boolean } | "busy" | "recent" {
+  /** pruneHealth at the first beat, then at most once an hour (at once when the clock was set back past the last look). */
+  private prune(): void {
+    const now = this.deps.nowMs();
+    const last = this.prunedMs;
+    if (last !== undefined && last <= now && now - last < PRUNE_EVERY_MS) return;
+    this.prunedMs = now;
+    pruneHealth(this.deps, now);
+  }
+
+  /**
+   * Under the emitter lock: the next emit is this window's when the last one is 60 s old, or later than now (the clock
+   * was set back). Its time is recorded before it runs; the state it reports only once its action line reached
+   * overseer (saveSig), so an action line that failed is sent again with the next emit.
+   */
+  private claim(): { summary: Summary; changed: boolean; ts: number } | "busy" | "recent" {
     const release = this.deps.lock(path.join(this.deps.dir, "emit.lock"));
     if (!release) return "busy";
     try {
       const now = this.deps.nowMs();
       const stateFile = path.join(this.deps.dir, "emit.json");
       const last = parseState(this.deps.read(stateFile));
-      if (last && now - last.ts < EMIT_GAP_MS) return "recent";
+      if (last && last.ts <= now && now - last.ts < EMIT_GAP_MS) return "recent";
       const summary = summarize(liveWindows(this.deps, now));
-      this.deps.write(stateFile, JSON.stringify({ ts: now, sig: summary.sig }));
-      return { summary, changed: summary.sig !== last?.sig };
+      this.deps.write(stateFile, JSON.stringify({ ts: now, sig: last?.sig ?? "" }));
+      return { summary, changed: summary.sig !== last?.sig, ts: now };
+    } finally {
+      release();
+    }
+  }
+
+  /** Under the emitter lock: records the state the action line of the emit claimed at `ts` reported, unless another window claimed an emit since. */
+  private saveSig(ts: number, sig: string): void {
+    const release = this.deps.lock(path.join(this.deps.dir, "emit.lock"));
+    if (!release) return; // the next emit sends the action line again
+    try {
+      const stateFile = path.join(this.deps.dir, "emit.json");
+      if (parseState(this.deps.read(stateFile))?.ts === ts) this.deps.write(stateFile, JSON.stringify({ ts, sig }));
     } finally {
       release();
     }

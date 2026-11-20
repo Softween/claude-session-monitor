@@ -1144,7 +1144,7 @@ describe("active login and Use this account", () => {
   });
 });
 
-describe("a session's tab: shown by its index", () => {
+describe("a session's tab: shown by its index, typed into only when it is the one match", () => {
   const FOCUS = [
     "workbench.action.focusFirstEditorGroup",
     "workbench.action.focusSecondEditorGroup",
@@ -1152,10 +1152,13 @@ describe("a session's tab: shown by its index", () => {
   ];
   type FakeTab = { label: string; isActive: boolean };
   type FakeGroup = { viewColumn: number; isActive: boolean; tabs: FakeTab[]; activeTab: FakeTab | undefined };
-  let restoreEditor: (() => void) | undefined;
+  const restorers: Array<() => void> = [];
+  let vscodeApi: any; // the vscode mock, resolved before a test turns on fake timers
+  beforeEach(async () => {
+    vscodeApi ??= await import("vscode");
+  });
   afterEach(() => {
-    restoreEditor?.();
-    restoreEditor = undefined;
+    for (const restore of restorers.splice(0)) restore();
   });
 
   /**
@@ -1165,8 +1168,8 @@ describe("a session's tab: shown by its index", () => {
    * 1-9 in the command name), nextEditorInGroup the tab after the active one.
    * Every tab that becomes active is recorded as shown; the first group is active.
    */
-  async function fakeEditor(layout: Array<{ viewColumn: number; labels: string[] }>) {
-    const vscode: any = await import("vscode");
+  function fakeEditor(layout: Array<{ viewColumn: number; labels: string[] }>) {
+    const vscode = vscodeApi;
     const tabGroups = vscode.window.tabGroups;
     const saved = { all: tabGroups.all, active: tabGroups.activeTabGroup };
     const groups: FakeGroup[] = layout.map(({ viewColumn, labels }) => {
@@ -1202,20 +1205,82 @@ describe("a session's tab: shown by its index", () => {
       else if (id === "workbench.action.nextEditorInGroup") show(g, g.tabs.indexOf(g.activeTab!) + 1);
       return undefined;
     });
-    restoreEditor = () => {
+    restorers.push(() => {
       exec.mockRestore();
       tabGroups.all = saved.all;
       tabGroups.activeTabGroup = saved.active;
-    };
-    return { groups, shown, calls };
+    });
+    return { groups, shown, calls, activeLabel: (): string | undefined => tabGroups.activeTabGroup.activeTab?.label };
   }
+
+  /** A your-turn Claude session titled `title` (its ai-title); `lastPrompt` adds a last-prompt line. */
+  function seedSession(sid: string, title: string, lastPrompt?: string): void {
+    const now = Date.now() / 1000;
+    const iso = (s: number) => new Date(s * 1000).toISOString();
+    const dir = `${HOME}/.claude/projects/-repo`;
+    const mon = `${HOME}/.claude/session-monitor`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(mon, { recursive: true });
+    const tx = `${dir}/${sid}.jsonl`;
+    const lines: object[] = [
+      { type: "ai-title", aiTitle: title },
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: lastPrompt ?? title }] }, timestamp: iso(now - 40) },
+      { type: "assistant", message: { id: `m-${sid}`, content: [{ type: "text", text: "Done." }], stop_reason: "end_turn" }, timestamp: iso(now - 30) },
+    ];
+    if (lastPrompt) lines.push({ type: "last-prompt", lastPrompt });
+    fs.writeFileSync(tx, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    fs.writeFileSync(`${mon}/${sid}.json`, JSON.stringify({ session_id: sid, provider: "claude", state: "idle", ts: now - 35, cwd: "/repo", transcript_path: tx }));
+  }
+
+  /** Records information messages and the typing sweep's "about to type" modal, which is answered with Start typing. */
+  function recordMessages() {
+    const vscode = vscodeApi;
+    const infos: string[] = [];
+    const sweeps: string[] = [];
+    const info = vi.spyOn(vscode.window, "showInformationMessage").mockImplementation(async (msg: any) => {
+      infos.push(String(msg));
+      return undefined;
+    });
+    const warn = vi.spyOn(vscode.window, "showWarningMessage").mockImplementation(async (msg: any) => {
+      if (!String(msg).includes("about to type")) return undefined;
+      sweeps.push(String(msg));
+      return "Start typing";
+    });
+    restorers.push(() => {
+      info.mockRestore();
+      warn.mockRestore();
+    });
+    return { infos, sweeps };
+  }
+
+  /** Answers osascript like a frontmost VS Code and records the active tab's label at every keystroke run. */
+  function recordTyping(e: { activeLabel(): string | undefined }): Array<string | undefined> {
+    const typedInto: Array<string | undefined> = [];
+    rec.execFileImpl = (args) => {
+      if (args[0] !== "osascript") return false;
+      const keystroke = (args[1] as string[]).some((line) => line.startsWith("keystroke "));
+      if (keystroke) typedInto.push(e.activeLabel());
+      args[args.length - 1](null, keystroke ? "typed" : "", "");
+      return true;
+    };
+    return typedInto;
+  }
+
+  const BILLING_EU = "Refactor the billing module for EU";
+  const BILLING_US = "Refactor the billing module for US";
+  const AUTH = "Continue the refactor of the auth layer";
+  const NOTES = "Write the release notes for 2.39";
+  // Claude Code's tab labels for them: the first 24 characters and an ellipsis.
+  const BILLING_TAB = "Refactor the billing mod…";
+  const AUTH_TAB = "Continue the refactor of…";
+  const NOTES_TAB = "Write the release notes …";
 
   it("a click shows the session's tab past the ninth by its index, in the group at its on-screen slot", async () => {
     lastCtx = mkCtx();
     ext.activate(lastCtx);
     // tabGroups.all is creation order: the middle group was split off after the one to its right.
     const files = Array.from({ length: 15 }, (_, i) => `file-${i}.ts`);
-    const e = await fakeEditor([
+    const e = fakeEditor([
       { viewColumn: 1, labels: ["notes.md"] },
       { viewColumn: 3, labels: ["right.md", "spec.md"] },
       { viewColumn: 2, labels: [...files, "Review the payment retri…", "file-16.ts"] },
@@ -1226,6 +1291,75 @@ describe("a session's tab: shown by its index", () => {
     await settleAsync();
     expect(e.calls).toEqual(["workbench.action.focusSecondEditorGroup", "workbench.action.openEditorAtIndex 15"]);
     expect(e.shown).toEqual(["Review the payment retri…"]);
+  });
+
+  it("the typing sweep types only into the one tab that matches: two titles sharing 24 characters and a \"continue\" prompt get nothing", async () => {
+    vi.useFakeTimers();
+    rec.config.set("resumeStaggerSeconds", 5);
+    seedSession("eu", BILLING_EU);
+    seedSession("us", BILLING_US);
+    seedSession("flaky", "Fix the flaky login test", "continue");
+    seedSession("auth", AUTH);
+    seedSession("notes", NOTES);
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    await vi.advanceTimersByTimeAsync(2_000);
+    // The billing tab names both billing sessions; the auth tab loosely starts with "continue", the flaky session's last prompt.
+    const e = fakeEditor([{ viewColumn: 1, labels: ["notes.md", BILLING_TAB, AUTH_TAB, NOTES_TAB] }]);
+    const ui = recordMessages();
+    const typedInto = recordTyping(e);
+    rec.commands.get("claudeSessionMonitor.resumeAll")!();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(ui.sweeps).toEqual([expect.stringContaining("for 2 session(s)")]);
+    expect([...typedInto].sort()).toEqual([AUTH_TAB, NOTES_TAB]);
+    expect(ui.infos).toContain("Claude Sessions: resume done · typed 2, skipped 0.");
+  });
+
+  it("the typing sweep queues only this window's sessions and skips one whose tab closed before its turn, without a prompt", async () => {
+    vi.useFakeTimers();
+    rec.config.set("resumeStaggerSeconds", 5);
+    seedSession("notes", NOTES);
+    seedSession("auth", AUTH);
+    seedSession("elsewhere", "Plan the quarterly roadmap review"); // its tab is in another window
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    await vi.advanceTimersByTimeAsync(2_000);
+    const e = fakeEditor([{ viewColumn: 1, labels: ["notes.md", NOTES_TAB, AUTH_TAB] }]);
+    const ui = recordMessages();
+    const typedInto = recordTyping(e);
+    rec.commands.get("claudeSessionMonitor.resumeAll")!();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(ui.sweeps).toEqual([expect.stringContaining("for 2 session(s)")]);
+    expect(typedInto).toHaveLength(1);
+    const g = e.groups[0];
+    g.tabs = g.tabs.filter((t) => t.label === "notes.md" || t.label === typedInto[0]); // the other session's tab is closed
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(typedInto).toHaveLength(1);
+    expect(ui.infos.filter((m) => m.includes("has no open tab"))).toEqual([]);
+    expect(ui.infos).toContain("Claude Sessions: resume done · typed 1, skipped 1.");
+  });
+
+  it("auto-resume after a limit reset stays silent in a window without the sessions' tabs and sweeps only this window's", async () => {
+    vi.useFakeTimers();
+    seedSession("notes", NOTES);
+    seedSession("auth", AUTH);
+    const gauge = { key: "session", label: "Session", pct: 99, resetMs: Date.now() + 10_000 };
+    fs.writeFileSync(`${HOME}/.claude/session-monitor/official-usage.json`, JSON.stringify({ gauges: [gauge], ts: Date.now() / 1000 }));
+    rec.config.set("autoResumeAfterReset", true);
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    const e = fakeEditor([{ viewColumn: 1, labels: ["notes.md"] }]);
+    const ui = recordMessages();
+    const typedInto = recordTyping(e);
+    await vi.advanceTimersByTimeAsync(120_000); // the sweep is due 90 s after the reset
+    expect(ui.infos.filter((m) => m.includes("auto resume"))).toEqual([]);
+    expect(ui.sweeps).toEqual([]);
+
+    e.groups[0].tabs.push({ label: NOTES_TAB, isActive: false }); // the notes session's tab opens in this window
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(ui.infos).toContain("Claude Sessions: limit reset — starting auto resume sweep.");
+    expect(ui.sweeps).toEqual([expect.stringContaining("for 1 session(s)")]);
+    expect(typedInto).toEqual([NOTES_TAB]);
   });
 });
 

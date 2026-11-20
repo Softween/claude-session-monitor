@@ -25,6 +25,7 @@ import {
   type TabRef,
 } from "../src/continuity";
 import type { LiveSession } from "../src/wakeTabs";
+import type { Hold, WakeGate } from "../src/automationGate";
 
 const NOW = Date.UTC(2026, 10, 18, 11, 25, 0); // a whole second
 const NOW_S = NOW / 1000;
@@ -43,6 +44,27 @@ const request = (id: string, sid = SID, title = "Fix the build", over: Record<st
 });
 const file = (...requests: unknown[]) => ({ v: 1, ts: NOW_S - 10, requests });
 const done = (sid: string, result: Served["result"], ts = NOW_S): Served => ({ sid, result, detail: "", ts });
+
+/** An automation gate that lets every show through and counts them; abort() cancels the show in progress (automationGate.test.ts tests the real one). */
+function openGate(over: Partial<WakeGate> = {}) {
+  let ctl = new AbortController();
+  const gate = {
+    spent: 0,
+    abort: (why: string): void => {
+      ctl.abort(why);
+      ctl = new AbortController();
+    },
+    hold: async (): Promise<Hold | undefined> => undefined,
+    admit: async (): Promise<Hold | undefined> => undefined,
+    spend: (): void => {
+      gate.spent++;
+    },
+    beforeRestore: async (): Promise<Hold | undefined> => undefined,
+    signal: (): AbortSignal => ctl.signal,
+    ...over,
+  };
+  return gate;
+}
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -109,21 +131,21 @@ describe("requests", () => {
 });
 
 describe("gate", () => {
-  it("shows while the window is unfocused or input idles 20 s; user-active only when focused and not idle (unreadable: focus alone)", () => {
-    const table: Array<[boolean, number | undefined, number | undefined, Gate]> = [
-      [false, 0, 1, "ok"],
-      [false, undefined, 1, "ok"],
-      [true, 20_000, 1, "ok"],
-      [true, 19_999, 1, "user-active"],
-      [true, undefined, 1, "user-active"],
-      [true, 0, 4, "user-active"],
-      [false, 0, 4, "memory"],
-      [true, 60_000, 4, "memory"],
-      [false, 0, 2, "ok"],
+  it("shows while the window is unfocused or input idles 20 s; user-active only when focused and not idle (unreadable: focus alone); else what the automation gate holds", () => {
+    const table: Array<[boolean, number | undefined, Hold["kind"] | undefined, Gate]> = [
       [false, 0, undefined, "ok"],
+      [false, undefined, undefined, "ok"],
+      [true, 20_000, undefined, "ok"],
+      [true, 19_999, undefined, "user-active"],
+      [true, undefined, undefined, "user-active"],
+      [true, 0, "memory", "user-active"],
+      [false, 0, "memory", "memory"],
+      [true, 60_000, "memory", "memory"],
+      [false, 0, "budget", "budget"],
+      [false, 0, "off", "off"],
     ];
-    for (const [focused, idle, pressure, gate] of table) {
-      expect([focused, idle, pressure, gateOf(focused, idle, pressure)]).toEqual([focused, idle, pressure, gate]);
+    for (const [focused, idle, held, gate] of table) {
+      expect([focused, idle, held, gateOf(focused, idle, held)]).toEqual([focused, idle, held, gate]);
     }
   });
 });
@@ -296,13 +318,13 @@ describe("ContinuityServer", () => {
       liveSessions: () => win.state.live,
       windowFocused: () => false,
       idleMs: async () => 0,
-      pressureLevel: async () => 1,
       othersBusy: () => false,
       tabs: win.tabs,
       activeGroup: win.activeGroup,
       activeTabOf: win.activeTabOf,
       reveal: win.reveal,
       focusGroup: win.focusGroup,
+      gate: openGate(),
       ...over,
     };
     const t = Date.now();
@@ -408,14 +430,15 @@ describe("ContinuityServer", () => {
 
   it("checks the focus again right before the show: focused with input not idle is user-active and uses no try", async () => {
     let focused = false;
-    let pressureChecks = 0;
+    let gateChecks = 0;
+    const check = async (): Promise<Hold | undefined> => {
+      if (++gateChecks === 2) focused = true; // the user clicks into the window during the step's gate check
+      return undefined;
+    };
     const s = server({
       windowFocused: () => focused,
       idleMs: async () => 5_000,
-      pressureLevel: async () => {
-        if (++pressureChecks === 2) focused = true; // the user clicks into the window during the step's gate check
-        return 1;
-      },
+      gate: openGate({ hold: check, admit: check }),
     });
     writeRequests(request("r1"));
     s.srv.observe();
@@ -529,12 +552,52 @@ describe("ContinuityServer", () => {
     expect(s.logs.filter((l) => l.startsWith("continuity: gate"))).toEqual(["continuity: gate user-active", "continuity: gate ok (was user-active)"]);
   });
 
-  it("waits under critical memory pressure", async () => {
-    const s = server({ pressureLevel: async () => 4 });
+  it("waits while the automation gate holds (memory, the spawn budget, tab automation off): the heartbeat names it and no try is used", async () => {
+    let held: Hold | undefined = { kind: "memory", reason: "memory pressure 2" };
+    const gate = openGate({ hold: async () => held, admit: async () => held });
+    const s = server({ gate });
     writeRequests(request("r1"));
     await cycles(s.srv, 40_000);
-    expect(s.win.calls).toEqual([]);
     expect(beatFile().gate).toBe("memory");
+    held = { kind: "budget", reason: "3 wakes in 5 min" };
+    await cycles(s.srv, 20_000);
+    expect(beatFile().gate).toBe("budget");
+    held = { kind: "off", reason: "tab automation is off" };
+    await cycles(s.srv, 20_000);
+    expect(beatFile().gate).toBe("off");
+    expect(beatFile().served).toEqual({});
+    expect(s.win.calls).toEqual([]);
+    expect(gate.spent).toBe(0);
+    held = undefined;
+    await cycles(s.srv, 10_000);
+    expect(s.win.calls[0]).toBe("reveal g0/c1");
+    expect(gate.spent).toBe(1); // a show counts against the spawn budget
+  });
+
+  it("checks the gate again right before the restore: a hold leaves the tabs as they are", async () => {
+    const s = server({ gate: openGate({ beforeRestore: async () => ({ kind: "memory", reason: "memory pressure 2" }) }) });
+    writeRequests(request("r1"));
+    s.srv.observe();
+    await vi.advanceTimersByTimeAsync(800);
+    expect(s.win.calls).toEqual(["reveal g0/c1"]); // shown, never put back
+    expect(s.logs).toContain("continuity: tab restore skipped (memory pressure 2)");
+    expect(s.logs).toContain("continuity: 0b563428 opened after 0.5s pid=4242, try 1/2, request r1");
+  });
+
+  it("turning the channel or tab automation off during the wait cancels the show: no restore, no try used", async () => {
+    let on = true;
+    const gate = openGate();
+    const s = server({ gate, enabled: () => on });
+    s.win.state.spawn = false; // no process: the show waits up to 20 s
+    writeRequests(request("r1"));
+    s.srv.observe();
+    await vi.advanceTimersByTimeAsync(5_000);
+    on = false;
+    gate.abort("continuityChannel is off");
+    await vi.advanceTimersByTimeAsync(500);
+    expect(s.win.calls).toEqual(["reveal g0/c1"]);
+    expect(s.logs).toContain("continuity: 0b563428 cancelled (continuityChannel is off), tabs left as they are, request r1");
+    expect(beatFile().served).toEqual({});
   });
 
   it("waits while a limit-stopped tab wake runs and meanwhile asks the waker to let it go first", async () => {

@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
+import type { Hold, WakeGate } from "../src/automationGate";
 import { ContinuityServer, readText, writeTextAtomic } from "../src/continuity";
 import { lastAssistantStop } from "../src/core";
 import {
@@ -26,6 +27,27 @@ const none = (): undefined => undefined;
 const reg = (sid: string, title?: string): RegistryEntry => ({ sid, title, lastSeenMs: NOW - 3_600_000, missed: 2 });
 const titleOf = (sid: string): string => `Limit-stopped session ${sid}`;
 const REVEAL_MS = 30; // Claude Code shows the tab after editor.open returns (two more command round trips)
+
+/** An automation gate that lets every wake through and counts them; abort() cancels the wake in progress (automationGate.test.ts tests the real one). */
+function openGate(over: Partial<WakeGate> = {}) {
+  let ctl = new AbortController();
+  const gate = {
+    spent: 0,
+    abort: (why: string): void => {
+      ctl.abort(why);
+      ctl = new AbortController();
+    },
+    hold: async (): Promise<Hold | undefined> => undefined,
+    admit: async (): Promise<Hold | undefined> => undefined,
+    spend: (): void => {
+      gate.spent++;
+    },
+    beforeRestore: async (): Promise<Hold | undefined> => undefined,
+    signal: (): AbortSignal => ctl.signal,
+    ...over,
+  };
+  return gate;
+}
 
 /**
  * Fake editor + machine: like Claude Code, a tab wake returns before its tab (labelled
@@ -65,13 +87,13 @@ function harness(over: Partial<WakeDeps<string>> = {}, stored: Record<string, un
     limitStop: () => ({ ts: (Date.now() - 60_000) / 1000, apiError: true, status: 429 }),
     idleMs: async () => 60_000,
     windowFocused: () => false,
-    pressureLevel: async () => 1,
     commandExists: async () => true,
     executeCommand,
     snapshotTabs: () => state.active,
     activeTab: () => state.active,
     activeClaudeLabel: () => (state.active.startsWith("claude-") ? titleOf(state.active.slice("claude-".length)) : undefined),
     restoreTabs,
+    gate: openGate(),
     ...over,
   };
   return { deps, store, writes, logs, state, executeCommand, restoreTabs, parentPids, waker: new TabWaker(deps) };
@@ -226,11 +248,11 @@ describe("limit stop (lastAssistantStop + isLimitStop)", () => {
 });
 
 describe("preconditions", () => {
-  it("checks memory, then the command, then idle and focus, right before it acts", async () => {
+  it("checks the automation gate, then the command, then idle and focus, right before it acts", async () => {
     const order: string[] = [];
     const h = harness(
       {
-        pressureLevel: async () => (order.push("memory"), 1),
+        gate: openGate({ admit: async () => (order.push("gate"), undefined) }),
         commandExists: async () => (order.push("command"), true),
         idleMs: async () => (order.push("idle"), undefined), // unreadable: the window focus decides
         windowFocused: () => (order.push("focus"), false),
@@ -244,7 +266,7 @@ describe("preconditions", () => {
     });
     h.waker.start();
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(order.slice(0, 5)).toEqual(["memory", "command", "idle", "focus", "act"]);
+    expect(order.slice(0, 5)).toEqual(["gate", "command", "idle", "focus", "act"]);
   });
 
   it("waits while the user is active and logs one line per reason per 10 min", async () => {
@@ -262,23 +284,29 @@ describe("preconditions", () => {
     expect(h.executeCommand).toHaveBeenCalledTimes(1);
   });
 
-  it("waits under critical memory pressure or without Claude Code's command; skips an unavailable pressure check", async () => {
-    let level: number | undefined = 4;
+  it("waits while the automation gate holds (memory, the spawn budget) or without Claude Code's command; a wake counts against the budget", async () => {
+    let held: Hold | undefined = { kind: "memory", reason: "memory pressure 2" };
     let hasCommand = true;
-    const h = harness({ pressureLevel: async () => level, commandExists: async () => hasCommand }, { [REGISTRY_KEY]: [reg("a")] });
+    const gate = openGate({ admit: async () => held });
+    const h = harness({ gate, commandExists: async () => hasCommand }, { [REGISTRY_KEY]: [reg("a")] });
     h.waker.start();
     await vi.advanceTimersByTimeAsync(60_000);
-    level = undefined;
+    held = { kind: "budget", reason: "3 wakes in 5 min" };
+    await vi.advanceTimersByTimeAsync(30_000);
+    held = undefined;
     hasCommand = false;
     await vi.advanceTimersByTimeAsync(30_000);
     expect(h.executeCommand).not.toHaveBeenCalled();
+    expect(gate.spent).toBe(0);
     expect(h.logs.filter((l) => l.startsWith("wake: postponed"))).toEqual([
-      "wake: postponed (memory pressure 4), 1 pending",
+      "wake: postponed (memory pressure 2), 1 pending",
+      "wake: postponed (3 wakes in 5 min), 1 pending",
       `wake: postponed (no ${OPEN_COMMAND} command), 1 pending`,
     ]);
     hasCommand = true;
     await vi.advanceTimersByTimeAsync(30_000);
     expect(h.executeCommand).toHaveBeenCalledTimes(1);
+    expect(gate.spent).toBe(1);
   });
 
   it("gate off: nothing is read, written, scheduled or woken", async () => {
@@ -417,6 +445,35 @@ describe("sweep step", () => {
     expect(h.store.get(PENDING_KEY)).toEqual([]);
   });
 
+  it("checks the gate again right before the restore: a hold leaves the tabs as they are", async () => {
+    const gate = openGate({ beforeRestore: async () => ({ kind: "memory", reason: "memory pressure 2" }) });
+    const h = harness({ gate }, { [REGISTRY_KEY]: [reg("s1")] });
+    h.waker.start();
+    await vi.advanceTimersByTimeAsync(60_500);
+    expect(h.logs).toContain("wake: s1 tabs left as they are (memory pressure 2)");
+    expect(h.logs).toContain("wake: s1 live after 0.5s pid=4242");
+    expect(h.restoreTabs).not.toHaveBeenCalled();
+    expect(h.state.active).toBe("claude-s1");
+  });
+
+  it("turning the setting or tab automation off during the wait cancels it: no restore, no failed try, nothing more woken", async () => {
+    let on = true;
+    const gate = openGate();
+    const h = harness({ gate, enabled: () => on }, { [REGISTRY_KEY]: [reg("a"), reg("b")] });
+    h.state.spawn = false; // a's process never appears: the wake waits up to 20 s
+    h.waker.start();
+    await vi.advanceTimersByTimeAsync(65_000);
+    on = false;
+    gate.abort("wakeDeadTabs is off");
+    await vi.advanceTimersByTimeAsync(500);
+    expect(h.logs).toContain("wake: a cancelled after 5.5s (wakeDeadTabs is off), tabs left as they are");
+    expect(h.restoreTabs).not.toHaveBeenCalled();
+    expect(h.store.get(PENDING_KEY)).toEqual([{ sid: "a", attempts: 0 }, { sid: "b", attempts: 0 }]);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(h.executeCommand).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("a command error counts as a failed wake", async () => {
     const h = harness({}, { [REGISTRY_KEY]: [reg("a")] });
     h.executeCommand.mockRejectedValueOnce(new Error("command 'claude-vscode.editor.open' not found"));
@@ -487,7 +544,6 @@ describe("continuity requests (continuity.ts)", () => {
       liveSessions: () => h.state.live,
       windowFocused: () => false,
       idleMs: async () => 60_000,
-      pressureLevel: async () => 1,
       othersBusy: () => h.waker.isBusy(),
       tabs: () =>
         ["editor", "c1"].map((tab) => ({ group: "g0", tab, label: tab === "c1" ? "Fix the build" : "notes.md", claude: tab === "c1", active: active === tab })),
@@ -500,6 +556,7 @@ describe("continuity requests (continuity.ts)", () => {
         setTimeout(() => h.state.live.push({ sessionId: SID, pid: 7 }), 3_000);
       },
       focusGroup: async () => undefined,
+      gate: openGate(),
     });
     return { h, server, timeline };
   }

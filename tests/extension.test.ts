@@ -59,6 +59,21 @@ vi.mock("child_process", async () => {
   };
 });
 
+// No real fs watchers: each fs.watch call is recorded (watched dir + listener) and a test fires it.
+const watchRec = vi.hoisted(() => ({ watchers: [] as Array<{ dir: string; fire: (event: string, name: string | null) => void }> }));
+vi.mock("fs", async (orig) => {
+  const real = await orig<typeof import("fs")>();
+  return {
+    ...real,
+    watch: (dir: string, ...rest: any[]) => {
+      const listener = rest[rest.length - 1];
+      const watcher = { on: () => watcher, close() {} };
+      watchRec.watchers.push({ dir: String(dir), fire: (event, name) => listener(event, name) });
+      return watcher;
+    },
+  };
+});
+
 vi.mock("vscode", () => {
   class EventEmitter {
     private ls: any[] = [];
@@ -765,6 +780,81 @@ describe("a failing refresh stage or feature start does not stop the others", ()
     expect(rec.commands.has("claudeSessionMonitor.openRestartGuard")).toBe(true); // the restart guard, started last
     expect(rowIds(views!.sessions[views!.sessions.length - 1])).toContain(`claude:${SID}`);
     expect(logged("waker start broke")).toBe(1);
+  });
+});
+
+describe("refreshes wake only for files that matter and start at least 1 s apart", () => {
+  const UUID = "e7ec778d-bd90-48a0-8fad-0dbd854ddb1e";
+  const watcher = (dir: string) => watchRec.watchers.find((w) => w.dir === dir)!;
+
+  beforeEach(() => {
+    watchRec.watchers.length = 0;
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("only a hook record or a top-level transcript wakes a refresh; the log, state and temp files never do", () => {
+    vi.useFakeTimers();
+    rec.config.set("pollIntervalMs", 600_000); // the timer stays out of the way
+    const cont = vi.spyOn(ContinuityServer.prototype, "observe"); // one call per refresh
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    vi.advanceTimersByTime(5_000);
+    const monitor = watcher(`${HOME}/.claude/session-monitor`);
+    const projects = watcher(`${HOME}/.claude/projects`);
+    const base = cont.mock.calls.length;
+    for (const name of ["csm-debug.log", "token-offsets.json", "token-buckets.json", "accounts.json", "official-usage.json", `.${UUID}.abc123.tmp`]) {
+      monitor.fire("change", name);
+    }
+    projects.fire("change", `-repo/${UUID}/subagents/agent-a1.jsonl`);
+    vi.advanceTimersByTime(5_000);
+    expect(cont.mock.calls.length).toBe(base);
+    monitor.fire("rename", `${UUID}.json`);
+    vi.advanceTimersByTime(300);
+    expect(cont.mock.calls.length).toBe(base + 1);
+    vi.advanceTimersByTime(2_000);
+    projects.fire("change", `-repo/${UUID}.jsonl`);
+    vi.advanceTimersByTime(300);
+    expect(cont.mock.calls.length).toBe(base + 2);
+  });
+
+  it("timer and watcher refreshes start at least 1 s apart", () => {
+    vi.useFakeTimers();
+    rec.config.set("pollIntervalMs", 500); // the timer asks twice a second
+    const starts: number[] = [];
+    vi.spyOn(ContinuityServer.prototype, "observe").mockImplementation(() => {
+      starts.push(Date.now());
+    });
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    const monitor = watcher(`${HOME}/.claude/session-monitor`);
+    for (let i = 0; i < 20; i++) {
+      vi.advanceTimersByTime(250);
+      monitor.fire("rename", `${UUID}.json`); // and a hook record changes every 250 ms
+    }
+    vi.advanceTimersByTime(1_000);
+    const gaps = starts.slice(1).map((t, i) => t - starts[i]);
+    expect(starts.length).toBeGreaterThan(4);
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(1000);
+  });
+
+  it("a Codex poll refreshes only when its data changed", async () => {
+    vi.useFakeTimers();
+    rec.config.set("enableClaude", false);
+    rec.config.set("enableCodex", true);
+    rec.config.set("codexExecutable", "/missing/codex");
+    rec.config.set("pollIntervalMs", 600_000);
+    const cont = vi.spyOn(ContinuityServer.prototype, "observe"); // one call per refresh
+    lastCtx = mkCtx();
+    ext.activate(lastCtx); // refresh 1; its poll finds no CLI: loading -> degraded, a change
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(rec.spawns).toHaveLength(1);
+    expect(cont).toHaveBeenCalledTimes(2);
+    await rec.commands.get("claudeSessionMonitor.refreshUsage")!(); // a forced poll sees the same degraded state
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(rec.spawns).toHaveLength(2);
+    expect(cont).toHaveBeenCalledTimes(2);
   });
 });
 

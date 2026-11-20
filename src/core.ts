@@ -1280,7 +1280,7 @@ export const TOKEN_OFFSETS = path.join(MONITOR_DIR, "token-offsets.json");
 export const TOKEN_BUCKETS = path.join(MONITOR_DIR, "token-buckets.json");
 const BACKFILL_CAP = 4 * 1024 * 1024; // first-pass per-file tail cap
 const FILE_READ_CAP = 8 * 1024 * 1024; // max bytes read from a single file per scan call
-const SCAN_BYTE_BUDGET = 30 * 1024 * 1024; // max bytes read per scan call (backfill spreads over ticks)
+const SCAN_BYTE_BUDGET = 4 * 1024 * 1024; // max bytes read per scan call, once a minute (backfill spreads over ticks)
 
 export interface ModelStat {
   tokens: number; // in + out + cache-write
@@ -1511,8 +1511,8 @@ export function scanTokenUsage(
     }
 
     for (let i = startIdx; i < lines.length; i++) {
-      const s = lines[i].trim();
-      if (!s) continue;
+      const s = lines[i];
+      if (!s.includes('"usage"')) continue; // only a line with a usage object counts: prompts and tool results are never parsed
       let obj: any;
       try {
         obj = JSON.parse(s);

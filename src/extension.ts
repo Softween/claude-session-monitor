@@ -1994,7 +1994,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastRecentScan = 0;
   let lastCleanup = 0;
   let lastResourceSample = 0;
-  let lastTokenScan = 0;
+  let lastTokenScan = Date.now() / 1000; // the first token scan waits a minute: activation is when Claude Code restores its tabs
   let lastSessLog = 0;
   let lastRefreshMs = 0; // start of the last refresh from any path; timer, watcher and Codex poll refreshes wait REFRESH_GAP_MS after it
   let tokenUsage: TokenUsage | null = null;

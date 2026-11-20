@@ -28,6 +28,7 @@ import { sanitizeRemoteLine } from "./remoteInput";
 import { backgroundByDue, fmtClock, timingNote } from "./closingBuckets";
 import { resolveClaudeBinary } from "./claudeBinary";
 import { stageGuard } from "./safeStage";
+import { REFRESH_GAP_MS, codexSignature, monitorEventMatters, projectsEventMatters, throttle } from "./refreshGate";
 import { sendToSession } from "./peerSend";
 import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, type ActiveCandidate } from "./activeAccount";
 import { SwitchRunner, busyText, exitText, lastLine, spawnFailureText } from "./switchRunner";
@@ -1995,6 +1996,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastResourceSample = 0;
   let lastTokenScan = 0;
   let lastSessLog = 0;
+  let lastRefreshMs = 0; // start of the last refresh from any path; timer, watcher and Codex poll refreshes wait REFRESH_GAP_MS after it
   let tokenUsage: TokenUsage | null = null;
   let officialUsage: OfficialUsage | null = null;
   let officialUsageAcct: string | null = null; // account officialUsage was fetched for (the active card only shows its own)
@@ -2952,6 +2954,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (codexRefreshInflight) return;
     codexRefreshInflight = true;
     lastCodexRefresh = now;
+    let changed = false;
     try {
       const c = cfg();
       const wsOnly =
@@ -2969,6 +2972,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       // Ignore a late response from an executable/provider instance that was
       // disabled or replaced while its request was in flight.
       if (client === codexClient && codexEnabled()) {
+        changed = codexSignature(next) !== codexSignature(codexSnapshot);
         codexSnapshot = next;
         if (next.health.state === "degraded") {
           codexFailureCount++;
@@ -2985,7 +2989,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     } finally {
       codexRefreshInflight = false;
     }
-    if (!disposed) refresh();
+    if (!disposed && changed) autoRefresh(); // an unchanged poll leaves the redraw to the timer
   }
 
   /** Rebuild the sessions table payload (grouping, per-row stats, badge) and post it. */
@@ -3160,6 +3164,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   function refresh(): void {
     if (disposed) return;
+    lastRefreshMs = Date.now();
     const now = Date.now() / 1000;
     const c = cfg();
     if (providerFilter !== "all" && !enabledProviders().includes(providerFilter)) {
@@ -3920,12 +3925,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
     },
   );
 
-  const debouncedRefresh = debounce(refresh, 200);
+  const autoRefresh = throttle(refresh, REFRESH_GAP_MS, () => lastRefreshMs);
+  ctx.subscriptions.push({ dispose: () => autoRefresh.cancel() });
+  const debouncedRefresh = debounce(autoRefresh, 200);
   ctx.subscriptions.push({ dispose: () => debouncedRefresh.cancel() });
   for (const monitorDir of [MONITOR_DIR, CODEX_MONITOR_DIR]) {
     try {
       ensurePrivateDir(monitorDir);
-      const w = fs.watch(monitorDir, debouncedRefresh);
+      const w = fs.watch(monitorDir, (_ev, name) => {
+        if (monitorEventMatters(name)) debouncedRefresh();
+      });
       w.on("error", () => {});
       ctx.subscriptions.push({ dispose: () => w.close() });
     } catch {
@@ -3946,7 +3955,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
   }
   try {
-    const w2 = fs.watch(PROJECTS_DIR, { recursive: true }, debouncedRefresh);
+    const w2 = fs.watch(PROJECTS_DIR, { recursive: true }, (_ev, name) => {
+      if (projectsEventMatters(name)) debouncedRefresh();
+    });
     w2.on("error", () => {});
     ctx.subscriptions.push({ dispose: () => w2.close() });
   } catch {
@@ -3954,13 +3965,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
   }
 
   const pollMs = Math.max(500, cfg().get<number>("pollIntervalMs", 1500));
-  let pollTimer = setInterval(refresh, pollMs);
+  let pollTimer = setInterval(autoRefresh, pollMs);
   ctx.subscriptions.push({ dispose: () => clearInterval(pollTimer) });
   ctx.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("claudeSessionMonitor.pollIntervalMs")) {
         clearInterval(pollTimer);
-        pollTimer = setInterval(refresh, Math.max(500, cfg().get<number>("pollIntervalMs", 1500)));
+        pollTimer = setInterval(autoRefresh, Math.max(500, cfg().get<number>("pollIntervalMs", 1500)));
       }
       if (e.affectsConfiguration("claudeSessionMonitor.showTokenStats")) pushUsagePayload();
       if (

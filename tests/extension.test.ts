@@ -27,7 +27,7 @@ const rec = vi.hoisted(() => ({
   customEditors: [] as string[], // registered custom editor view types (the restart guard's)
   // The Claude Code extension the automation gate checks (automationGate.ts): installed, running, with its commands.
   claudeCode: { version: "2.1.327", active: true } as { version: string; active: boolean } | null,
-  claudeCommands: ["claude-vscode.editor.open"] as string[],
+  claudeCommands: ["claude-vscode.editor.open", "claude-vscode.focus"] as string[],
   extensionListeners: [] as Array<() => void>,
 }));
 
@@ -140,6 +140,9 @@ vi.mock("vscode", () => {
       public color?: any,
     ) {}
   }
+  class TabInputWebview {
+    constructor(public viewType: string) {}
+  }
   class ThemeColor {
     constructor(public id: string) {}
   }
@@ -148,6 +151,7 @@ vi.mock("vscode", () => {
     TreeItem,
     ThemeIcon,
     ThemeColor,
+    TabInputWebview,
     TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
     StatusBarAlignment: { Left: 1, Right: 2 },
     ExtensionMode: { Production: 1, Development: 2, Test: 3 },
@@ -218,6 +222,7 @@ vi.mock("vscode", () => {
       showTextDocument: () => Promise.resolve(undefined),
       tabGroups: { all: [], activeTabGroup: { activeTab: undefined }, onDidChangeTabs: () => ({ dispose() {} }) },
       state: { focused: true },
+      activeTextEditor: undefined as unknown,
       onDidChangeWindowState: () => ({ dispose() {} }),
     },
     workspace: {
@@ -368,7 +373,7 @@ afterEach(() => {
   rec.customEditors.length = 0;
   watchRec.writes.length = 0;
   rec.claudeCode = { version: "2.1.327", active: true };
-  rec.claudeCommands = ["claude-vscode.editor.open"];
+  rec.claudeCommands = ["claude-vscode.editor.open", "claude-vscode.focus"];
   rec.extensionListeners.length = 0;
   keeperWaiting.clear(); // module-level: one test's claude-switch keeper state must not leak into the next
   lastCtx = undefined;
@@ -1550,12 +1555,17 @@ describe("a session's tab: shown by its index, typed into only when it is the on
    * 1-9 in the command name), nextEditorInGroup the tab after the active one.
    * Every tab that becomes active is recorded as shown; the first group is active.
    */
-  function fakeEditor(layout: Array<{ viewColumn: number; labels: string[] }>) {
+  function fakeEditor(layout: Array<{ viewColumn: number; labels: string[] }>, claudeTabs: readonly string[] = []) {
     const vscode = vscodeApi;
     const tabGroups = vscode.window.tabGroups;
     const saved = { all: tabGroups.all, active: tabGroups.activeTabGroup };
     const groups: FakeGroup[] = layout.map(({ viewColumn, labels }) => {
-      const tabs = labels.map((label, i) => ({ label, isActive: i === 0 }));
+      // A label in `claudeTabs` is a Claude Code panel (webview view type claudeVSCodePanel).
+      const tabs = labels.map((label, i) => ({
+        label,
+        isActive: i === 0,
+        ...(claudeTabs.includes(label) ? { input: new vscode.TabInputWebview("mainThreadWebview-claudeVSCodePanel") } : {}),
+      }));
       return { viewColumn, isActive: false, tabs, activeTab: tabs[0] };
     });
     const shown: string[] = [];
@@ -1747,8 +1757,8 @@ describe("a session's tab: shown by its index, typed into only when it is the on
     expect(typedInto).toEqual([NOTES_TAB]);
   });
 
-  /** Answers osascript like a frontmost VS Code with the Claude prompt focused and names each run: activate, focus check, type, return. */
-  function recordOsascript(): string[] {
+  /** Answers osascript like a frontmost VS Code, the Claude prompt focused while `prompt()`, and names each run: activate, focus check, type, return. */
+  function recordOsascript(prompt: () => boolean = () => true): string[] {
     const steps: string[] = [];
     rec.execFileImpl = (args) => {
       if (args[0] !== "osascript") return false;
@@ -1759,7 +1769,8 @@ describe("a session's tab: shown by its index, typed into only when it is the on
       const activate = lines.some((line) => line.includes("to activate"));
       const step = type ? "type" : enter ? "return" : focusRead ? "focus check" : activate ? "activate" : undefined;
       if (step) steps.push(step);
-      args[args.length - 1](null, type || enter ? "typed" : focusRead ? "com.microsoft.VSCode\nAXTextArea\nMessage input" : "", "");
+      const focused = prompt() ? "com.microsoft.VSCode\nAXTextArea\nMessage input" : "com.microsoft.VSCode\nAXGroup\n";
+      args[args.length - 1](null, type || enter ? "typed" : focusRead ? focused : "", "");
       return true;
     };
     return steps;
@@ -1781,6 +1792,62 @@ describe("a session's tab: shown by its index, typed into only when it is the on
     expect(vi.mocked(vscodeApi.commands.executeCommand).mock.calls.map((c: any[]) => c[0])).not.toContain("claude-vscode.focus");
     expect(steps).toEqual(["activate", "focus check", "type", "focus check", "return"]);
     expect(ui.infos).toContain("Claude Sessions: resume done · typed 1, skipped 0.");
+    expect(debugLog()).toContain("typing resume claude:notes: prompt already focused");
+  });
+
+  const debugLog = (): string => {
+    const file = `${HOME}/.claude/session-monitor/csm-debug.log`;
+    return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+  };
+  const focusCommands = (): number =>
+    vi.mocked(vscodeApi.commands.executeCommand).mock.calls.filter((c: any[]) => c[0] === "claude-vscode.focus").length;
+
+  /** One session whose Claude panel is the active tab of the only group, typed into by Resume All. */
+  async function sweepOneClaudeTab(prompt: () => boolean) {
+    vi.useFakeTimers();
+    rec.config.set("resumeStaggerSeconds", 5);
+    seedSession("notes", NOTES);
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    await vi.advanceTimersByTimeAsync(2_000);
+    const e = fakeEditor([{ viewColumn: 1, labels: [NOTES_TAB, "notes.md"] }], [NOTES_TAB]);
+    const ui = recordMessages();
+    const steps = recordOsascript(prompt);
+    rec.commands.get("claudeSessionMonitor.resumeAll")!();
+    await vi.advanceTimersByTimeAsync(15_000);
+    return { e, ui, steps };
+  }
+
+  it("the prompt not focused after the tab is shown: Claude Code's focus command runs once, the tab's group is focused again and typing follows", async () => {
+    const { e, ui, steps } = await sweepOneClaudeTab(() => focusCommands() > 0);
+    expect(focusCommands()).toBe(1);
+    expect(e.calls).toEqual(["workbench.action.focusFirstEditorGroup", "workbench.action.openEditorAtIndex 0", "workbench.action.focusFirstEditorGroup"]);
+    expect(steps).toEqual(["activate", "focus check", "focus check", "type", "focus check", "return"]);
+    expect(ui.infos).toContain("Claude Sessions: resume done · typed 1, skipped 0.");
+    expect(debugLog()).toContain("typing resume claude:notes: prompt focused after claude-vscode.focus");
+  });
+
+  it("the focus command never runs while a text editor is active (its selection would become an @-mention): the session is skipped", async () => {
+    const window = vscodeApi.window;
+    window.activeTextEditor = { selection: { isEmpty: false } };
+    try {
+      const { ui, steps } = await sweepOneClaudeTab(() => false);
+      expect(focusCommands()).toBe(0);
+      expect(steps).toEqual(["activate", "focus check"]);
+      expect(ui.infos).toContain("Claude Sessions: resume done · typed 0, skipped 1.");
+      expect(debugLog()).toContain("typing resume claude:notes: skipped (not-prompt: ");
+      expect(debugLog()).toContain("claude-vscode.focus not run: a text editor is active)");
+    } finally {
+      window.activeTextEditor = undefined;
+    }
+  });
+
+  it("the prompt still not focused after the focus command: nothing is typed, the session is skipped", async () => {
+    const { ui, steps } = await sweepOneClaudeTab(() => false);
+    expect(focusCommands()).toBe(1);
+    expect(steps).toEqual(["activate", "focus check", "focus check"]);
+    expect(ui.infos).toContain("Claude Sessions: resume done · typed 0, skipped 1.");
+    expect(debugLog()).toContain("typing resume claude:notes: skipped after claude-vscode.focus (not-prompt: ");
   });
 
   it("with tabAutomation off, Resume All shows no tab and types nothing", async () => {
@@ -1867,7 +1934,7 @@ describe("a session's tab: shown by its index, typed into only when it is the on
     start.mockRestore();
   });
 
-  it("a Claude Code without claude-vscode.editor.open keeps the typing sweep off with one notice in the Sessions view, until an update brings it back", async () => {
+  it("a Claude Code without the commands the automations call keeps the typing sweep off with one notice in the Sessions view, until an update brings them back", async () => {
     vi.useFakeTimers();
     rec.claudeCommands = [];
     seedSession("notes", NOTES);
@@ -1883,14 +1950,14 @@ describe("a session's tab: shown by its index, typed into only when it is the on
     const typedInto = recordTyping(e);
     rec.commands.get("claudeSessionMonitor.resumeAll")!();
     await vi.advanceTimersByTimeAsync(10_000);
-    const reason = "Claude Code 2.1.327 has no claude-vscode.editor.open command";
+    const reason = "Claude Code 2.1.327 has no claude-vscode.editor.open or claude-vscode.focus command";
     expect(typedInto).toEqual([]);
     expect(e.calls).toEqual([]);
     expect(ui.infos).toContain(`Claude Sessions: resume is off: ${reason}.`);
     const claude = (p: any) => p.health.filter((x: any) => x.provider === "claude");
     expect(claude(posted[posted.length - 1])).toEqual([expect.objectContaining({ state: "degraded", message: `tab automation off: ${reason}` })]);
 
-    rec.claudeCommands = ["claude-vscode.editor.open"]; // Claude Code updated
+    rec.claudeCommands = ["claude-vscode.editor.open", "claude-vscode.focus"]; // Claude Code updated
     for (const listener of rec.extensionListeners) listener();
     await vi.advanceTimersByTimeAsync(2_000);
     expect(claude(posted[posted.length - 1])).toEqual([expect.objectContaining({ state: "ready" })]);

@@ -141,7 +141,7 @@ describe("gate", () => {
       [true, 0, "memory", "user-active"],
       [false, 0, "memory", "memory"],
       [true, 60_000, "memory", "memory"],
-      [false, 0, "budget", "budget"],
+      [false, 0, "budget", "memory"], // the daemon keeps a request waiting for memory, not for an unknown gate
       [false, 0, "off", "off"],
     ];
     for (const [focused, idle, held, gate] of table) {
@@ -552,7 +552,7 @@ describe("ContinuityServer", () => {
     expect(s.logs.filter((l) => l.startsWith("continuity: gate"))).toEqual(["continuity: gate user-active", "continuity: gate ok (was user-active)"]);
   });
 
-  it("waits while the automation gate holds (memory, the spawn budget, tab automation off): the heartbeat names it and no try is used", async () => {
+  it("waits while the automation gate holds (memory, the spawn budget, tab automation off): no try is used; a budget hold reads as memory, so the daemon keeps the request", async () => {
     let held: Hold | undefined = { kind: "memory", reason: "memory pressure 2" };
     const gate = openGate({ hold: async () => held, admit: async () => held });
     const s = server({ gate });
@@ -561,7 +561,7 @@ describe("ContinuityServer", () => {
     expect(beatFile().gate).toBe("memory");
     held = { kind: "budget", reason: "3 wakes in 5 min" };
     await cycles(s.srv, 20_000);
-    expect(beatFile().gate).toBe("budget");
+    expect(beatFile().gate).toBe("memory");
     held = { kind: "off", reason: "tab automation is off" };
     await cycles(s.srv, 20_000);
     expect(beatFile().gate).toBe("off");

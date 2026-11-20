@@ -21,7 +21,7 @@ import { OPEN_COMMAND, REGISTRY_KEY, TabWaker, type LiveSession } from "../src/w
 const NOW = Date.UTC(2026, 10, 20, 12, 0, 0);
 const ALL: readonly Automation[] = ["wake", "continuity", "autoResume", "typingSweep", "remoteTyping"];
 const PANEL = "mainThreadWebview-claudeVSCodePanel";
-const MISSING = `Claude Code ${CHECKED_CLAUDE_CODE} has no ${OPEN_COMMAND} command`;
+const MISSING = `Claude Code ${CHECKED_CLAUDE_CODE} has no ${OPEN_COMMAND} or claude-vscode.focus command`;
 
 /** A gate over settings, memory, tabs and a Claude Code the test changes as it goes. */
 function harness() {

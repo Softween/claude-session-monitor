@@ -858,6 +858,20 @@ describe("refreshes wake only for files that matter and start at least 1 s apart
   });
 });
 
+describe("the token scan", () => {
+  it("runs no earlier than 60 s after activation, when Claude Code has restored its tabs", () => {
+    vi.useFakeTimers();
+    const buckets = `${HOME}/.claude/session-monitor/token-buckets.json`; // written by every scan
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    expect(fs.existsSync(buckets)).toBe(false);
+    vi.advanceTimersByTime(59_000);
+    expect(fs.existsSync(buckets)).toBe(false);
+    vi.advanceTimersByTime(4_000);
+    expect(fs.existsSync(buckets)).toBe(true);
+  });
+});
+
 describe("active login and Use this account", () => {
   const UA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const UB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";

@@ -2204,3 +2204,82 @@ describe("the debug log: activation line, session summary, drop events and error
     expect(fs.statSync(file).mode & 0o777).toBe(0o600);
   });
 });
+
+describe("the health file and the overseer heartbeat", () => {
+  const MON = `${HOME}/.claude/session-monitor`;
+  const STORAGE = `${HOME}/workspaceStorage/0123abcd`;
+  const healthPath = (): string => `${MON}/health/${storageKey(STORAGE)}.json`;
+  const ctxWithFolder = (): any => ({
+    ...mkCtx(),
+    storageUri: { fsPath: `${STORAGE}/softween.claude-code-session-monitor` },
+    extension: { packageJSON: { version: "9.9.9" } },
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("writes this window's health file at activation and every 30 s, and removes it at dispose", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    lastCtx = ctxWithFolder();
+    ext.activate(lastCtx);
+    const first = JSON.parse(fs.readFileSync(healthPath(), "utf8"));
+    expect(first).toEqual({
+      v: 1,
+      win: storageKey(STORAGE),
+      pid: process.pid,
+      version: "9.9.9",
+      ts: Math.floor(Date.now() / 1000),
+      features: { sessions: "ok", limits: "ok", remote: "disabled", autoResume: "disabled", continuity: "disabled", wake: "disabled", restartGuard: "disabled" },
+      refreshP95Ms: expect.any(Number),
+      refreshSamples: expect.any(Number),
+      guardArmed: false,
+    });
+    expect(first.refreshSamples).toBeGreaterThanOrEqual(1); // the first refresh, timed
+    expect(fs.statSync(healthPath()).mode & 0o777).toBe(0o600);
+    vi.advanceTimersByTime(30_000);
+    const second = JSON.parse(fs.readFileSync(healthPath(), "utf8"));
+    expect(second.ts).toBe(first.ts + 30);
+    expect(second.refreshSamples).toBeGreaterThan(10); // every refresh in between was timed
+    disposeCtx(lastCtx);
+    lastCtx = undefined;
+    expect(fs.existsSync(healthPath())).toBe(false);
+  });
+
+  it("a feature whose refresh stage throws is in error in the health file", () => {
+    vi.spyOn(ContinuityServer.prototype, "observe").mockImplementation(() => {
+      throw new Error("continuity broke");
+    });
+    rec.config.set("continuityChannel", true);
+    lastCtx = ctxWithFolder();
+    ext.activate(lastCtx);
+    expect(JSON.parse(fs.readFileSync(healthPath(), "utf8")).features).toMatchObject({ continuity: "error", sessions: "ok" });
+  });
+
+  it("sends the overseer heartbeat for all live windows only where ~/.claude/bin/overseer exists", async () => {
+    lastCtx = ctxWithFolder();
+    ext.activate(lastCtx);
+    await settleAsync();
+    const overseerCalls = (): any[][] => rec.execFiles.filter((args) => String(args[0]).endsWith("/.claude/bin/overseer"));
+    expect(overseerCalls()).toEqual([]);
+    disposeCtx(lastCtx);
+
+    fs.mkdirSync(`${HOME}/.claude/bin`, { recursive: true });
+    fs.writeFileSync(`${HOME}/.claude/bin/overseer`, "#!/bin/sh\n", { mode: 0o755 });
+    rec.execFileImpl = (args) => {
+      if (!String(args[0]).endsWith("/.claude/bin/overseer")) return false;
+      args[args.length - 1](null, "", "");
+      return true;
+    };
+    lastCtx = ctxWithFolder();
+    ext.activate(lastCtx);
+    await settleAsync();
+    const [heartbeat, action] = overseerCalls().map((args) => args[1]);
+    expect(heartbeat.slice(0, 7)).toEqual(["emit", "--tool", "session-monitor", "--heartbeat", "--every", "5m", "--data"]);
+    expect(heartbeat[heartbeat.length - 1]).toMatch(/^1 window on 9\.9\.9; features in error: none; restart guard armed in 0 of 1; refresh p95 \d+ ms$/);
+    expect(JSON.parse(heartbeat[7]).windows).toEqual([expect.objectContaining({ win: storageKey(STORAGE), version: "9.9.9", failing: [] })]);
+    expect(action.slice(0, 5)).toEqual(["emit", "--tool", "session-monitor", "--level", "info"]);
+    expect(fs.existsSync(`${MON}/health/emit.lock`)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(`${MON}/health/emit.json`, "utf8"))).toMatchObject({ ts: expect.any(Number) });
+  });
+});
+

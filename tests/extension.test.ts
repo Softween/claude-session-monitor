@@ -2032,7 +2032,12 @@ describe("observer mode in an Extension Development Host", () => {
     const secrets = seedSharedState();
     rec.config.set("restartGuard", true); // its own setting on: observer mode keeps it off all the same
     const { posted } = activateIn(MODE.Development, secrets);
+    // ~/.claude.json is followed in memory only. Once a payload shows B active every later one must too,
+    // across the 30 s registry reloads: the registry on disk still names A and this window never writes it.
+    await vi.waitFor(() => expect(card(posted[posted.length - 1], UB).active).toBe(true), { timeout: 5000 });
+    const followed = posted.length - 1;
     await runFor(65);
+    expect([...new Set(posted.slice(followed).map((p) => card(p, UB).active))]).toEqual([true]);
     expect(rec.bridgeDeps).toBeNull();
     expect(rec.customEditors).toEqual([]);
     expect(rec.execFiles).toEqual([]);
@@ -2042,9 +2047,7 @@ describe("observer mode in an Extension Development Host", () => {
     expect(fs.existsSync(`${MON}/csm-debug.log`)).toBe(false);
     expect(JSON.parse(fs.readFileSync(`${MON}/accounts.json`, "utf8")).activeId).toBe(UA);
     expect(rec.webviews.map((w) => w.id)).toEqual(expect.arrayContaining(["claudeSessionMonitor.view", "claudeSessionMonitor.limits"]));
-    const last = posted[posted.length - 1];
-    expect(card(last, UB).active).toBe(true); // ~/.claude.json is followed in memory only
-    expect(card(last, UB).gauges[0].pct).toBe(99); // B's usage as the other windows saved it
+    expect(card(posted[posted.length - 1], UB).gauges[0].pct).toBe(99); // B's usage as the other windows saved it
     expect(observerLog()).toContain(
       "observer mode (Extension Development Host): off remoteBridge, rotation, autoResume, wake, continuity, restartGuard, usagePolls, accountWrites, sharedFiles",
     );
@@ -2065,9 +2068,10 @@ describe("observer mode in an Extension Development Host", () => {
     expect(rec.customEditors).toEqual(["claudeSessionMonitor.restartGuard"]);
     expect(rec.execFiles.map((args) => args[0])).toContain("which");
     expect(fs.existsSync(OLD_STATUS)).toBe(false); // the stale status file was cleaned up
-    expect(JSON.parse(fs.readFileSync(`${MON}/accounts.json`, "utf8")).activeId).toBe(UB); // the registry followed ~/.claude.json
+    // Both finish on real file I/O, not on the fake clock: wait for them.
+    await vi.waitFor(() => expect(JSON.parse(fs.readFileSync(`${MON}/accounts.json`, "utf8")).activeId).toBe(UB), { timeout: 5000 }); // the registry followed ~/.claude.json
+    await vi.waitFor(() => expect(fs.existsSync(`${HOME}/.claude/state/claude-switch/vault/${UB}.json`)).toBe(true), { timeout: 5000 }); // B's token seeded for claude-switch
     expect(fs.existsSync(`${MON}/token-buckets.json`)).toBe(true);
-    expect(fs.existsSync(`${HOME}/.claude/state/claude-switch/vault/${UB}.json`)).toBe(true); // B's token seeded for claude-switch
     expect(debugLog()).toContain("auto-resume scheduled");
     expect(debugLog()).toContain("wake: activation");
     expect(rec.outputChannels).toEqual([]);

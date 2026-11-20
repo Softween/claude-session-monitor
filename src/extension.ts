@@ -38,7 +38,8 @@ import { allowedCwds, mergeSeen, withoutPaths } from "./remoteCwds";
 import { startNewSession } from "./remoteNewSession";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import { TabWaker, nodeProbes, summaryText } from "./wakeTabs";
-import { ContinuityServer, continuityDir, focusBySlot, readText, storageDir, writeTextAtomic } from "./continuity";
+import { ContinuityServer, continuityDir, readText, storageDir, writeTextAtomic } from "./continuity";
+import { FOCUS_GROUP_COMMANDS, focusGroupBySlot, revealTabByIndex, type TabFocusDeps } from "./tabFocus";
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
 import { submitAnswer } from "./answers";
 import { activateRestartGuard } from "./restartGuard";
@@ -4263,7 +4264,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // Ask before an extension restart stops every session in this window (restartGuard.ts).
   activateRestartGuard(ctx, {
     log,
-    focusGroup: (i) => (i >= 0 && i < FOCUS_GROUP_CMDS.length ? vscode.commands.executeCommand(FOCUS_GROUP_CMDS[i]) : Promise.resolve()),
+    focusGroup: (i) => (i >= 0 && i < FOCUS_GROUP_COMMANDS.length ? vscode.commands.executeCommand(FOCUS_GROUP_COMMANDS[i]) : Promise.resolve()),
   });
 
   refresh();
@@ -4618,16 +4619,11 @@ function nativeNotify(c: vscode.WorkspaceConfiguration, title: string, message: 
 // Click actions
 // ---------------------------------------------------------------------------
 
-const FOCUS_GROUP_CMDS = [
-  "workbench.action.focusFirstEditorGroup",
-  "workbench.action.focusSecondEditorGroup",
-  "workbench.action.focusThirdEditorGroup",
-  "workbench.action.focusFourthEditorGroup",
-  "workbench.action.focusFifthEditorGroup",
-  "workbench.action.focusSixthEditorGroup",
-  "workbench.action.focusSeventhEditorGroup",
-  "workbench.action.focusEighthEditorGroup",
-];
+/** The editor side of tabFocus.ts. */
+const TAB_FOCUS: TabFocusDeps<vscode.TabGroup> = {
+  run: (command, ...args) => vscode.commands.executeCommand(command, ...args),
+  activeGroup: () => vscode.window.tabGroups.activeTabGroup,
+};
 
 function writeTabDebug(dbg: unknown): void {
   try {
@@ -4700,21 +4696,16 @@ function findSessionTab(v: SessionView, rivals: string[]): TabHit | null {
   return k >= 0 ? tabs[k] : null;
 }
 
-/** Make tab `ti` of editor group `gi` the active editor; returns the action taken (tabs-debug.json). */
+/**
+ * Make tab `ti` of editor group `gi` (tabGroups.all order) the active editor, by its
+ * index in the group focused by its screen slot (tabFocus.ts); returns the action
+ * taken (tabs-debug.json). Throws when the group or tab is gone or cannot be focused.
+ */
 async function focusTab(gi: number, ti: number): Promise<string> {
-  if (gi < FOCUS_GROUP_CMDS.length) {
-    await vscode.commands.executeCommand(FOCUS_GROUP_CMDS[gi]);
-  }
-  if (ti < 9) {
-    await vscode.commands.executeCommand(`workbench.action.openEditorAtIndex${ti + 1}`);
-    return "openEditorAtIndex" + (ti + 1);
-  }
-  // beyond index 9 there is no direct command: jump to the first tab and step.
-  await vscode.commands.executeCommand("workbench.action.openEditorAtIndex1");
-  for (let k = 0; k < ti; k++) {
-    await vscode.commands.executeCommand("workbench.action.nextEditorInGroup");
-  }
-  return "step-to-" + ti;
+  const group = vscode.window.tabGroups.all[gi];
+  if (!group) throw new Error(`editor group ${gi} is gone`);
+  await revealTabByIndex(group, ti, TAB_FOCUS);
+  return `openEditorAtIndex ${ti} in editor group ${group.viewColumn}`;
 }
 
 /** Each editor group's active tab and the active group, taken before a tab wake (wakeTabs.ts). */
@@ -4731,36 +4722,32 @@ function snapshotTabs(): TabMemo {
   };
 }
 
-/** Make every remembered tab its group's active tab again, then focus the remembered group. */
+/** Make every remembered tab its group's active tab again, then focus the remembered group (by index and screen slot, tabFocus.ts). */
 async function restoreTabs(memo: TabMemo): Promise<void> {
   const all = vscode.window.tabGroups.all;
   for (const [g, tab] of memo.actives) {
-    const gi = all.indexOf(g);
     const ti = tab ? g.tabs.indexOf(tab) : -1;
-    if (gi >= 0 && ti >= 0 && g.activeTab !== tab) await focusTab(gi, ti);
+    if (all.includes(g) && ti >= 0 && g.activeTab !== tab) await revealTabByIndex(g, ti, TAB_FOCUS);
   }
-  const ai = all.indexOf(memo.group);
-  if (ai >= 0 && ai < FOCUS_GROUP_CMDS.length && vscode.window.tabGroups.activeTabGroup !== memo.group) {
-    await vscode.commands.executeCommand(FOCUS_GROUP_CMDS[ai]);
+  if (all.includes(memo.group) && vscode.window.tabGroups.activeTabGroup !== memo.group) {
+    await focusGroupBySlot(memo.group, TAB_FOCUS);
   }
 }
 
 /**
- * Make `tab` its group's active tab and focus the group (continuity.ts): the group's
- * screen-slot focus command, confirmed (focusTabGroup), then the openEditorAtIndex
- * handler with the index as argument, so a tab past the ninth is reached without
- * showing the tabs before it.
+ * Make `tab` its group's active tab and focus the group (continuity.ts), by its index
+ * in the group focused by its screen slot (tabFocus.ts), so a tab past the ninth is
+ * reached without showing the tabs before it.
  */
 async function revealTab(group: vscode.TabGroup, tab: vscode.Tab): Promise<void> {
   const ti = group.tabs.indexOf(tab);
   if (ti < 0) return; // closed meanwhile
-  await focusTabGroup(group);
-  await vscode.commands.executeCommand("workbench.action.openEditorAtIndex", ti);
+  await revealTabByIndex(group, ti, TAB_FOCUS);
 }
 
 /** Focus `group` by its screen slot (viewColumn); throws unless it became the active group. */
 function focusTabGroup(group: vscode.TabGroup): Promise<void> {
-  return focusBySlot(group, FOCUS_GROUP_CMDS, (cmd) => vscode.commands.executeCommand(cmd), () => vscode.window.tabGroups.activeTabGroup);
+  return focusGroupBySlot(group, TAB_FOCUS);
 }
 
 /** A Claude Code editor tab (the anthropic.claude-code `claudeVSCodePanel` webview). */
@@ -4818,7 +4805,7 @@ async function jumpToSession(v: SessionView): Promise<void> {
     dbg.error = String(e);
   }
   writeTabDebug(dbg);
-  await promptNoTabMatch(v);
+  if (!dbg.matched) await promptNoTabMatch(v); // a matched tab that could not be shown is in tabs-debug.json
 }
 
 /**

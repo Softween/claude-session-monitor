@@ -1144,6 +1144,91 @@ describe("active login and Use this account", () => {
   });
 });
 
+describe("a session's tab: shown by its index", () => {
+  const FOCUS = [
+    "workbench.action.focusFirstEditorGroup",
+    "workbench.action.focusSecondEditorGroup",
+    "workbench.action.focusThirdEditorGroup",
+  ];
+  type FakeTab = { label: string; isActive: boolean };
+  type FakeGroup = { viewColumn: number; isActive: boolean; tabs: FakeTab[]; activeTab: FakeTab | undefined };
+  let restoreEditor: (() => void) | undefined;
+  afterEach(() => {
+    restoreEditor?.();
+    restoreEditor = undefined;
+  });
+
+  /**
+   * Editor groups listed in creation order (tabGroups.all) with VS Code's command
+   * semantics: focus…EditorGroup picks the group at its screen slot (viewColumn),
+   * openEditorAtIndex shows a tab of the active group (the index as argument, or
+   * 1-9 in the command name), nextEditorInGroup the tab after the active one.
+   * Every tab that becomes active is recorded as shown; the first group is active.
+   */
+  async function fakeEditor(layout: Array<{ viewColumn: number; labels: string[] }>) {
+    const vscode: any = await import("vscode");
+    const tabGroups = vscode.window.tabGroups;
+    const saved = { all: tabGroups.all, active: tabGroups.activeTabGroup };
+    const groups: FakeGroup[] = layout.map(({ viewColumn, labels }) => {
+      const tabs = labels.map((label, i) => ({ label, isActive: i === 0 }));
+      return { viewColumn, isActive: false, tabs, activeTab: tabs[0] };
+    });
+    const shown: string[] = [];
+    const calls: string[] = [];
+    const focus = (g: FakeGroup): void => {
+      for (const x of groups) x.isActive = x === g;
+      tabGroups.activeTabGroup = g;
+    };
+    const show = (g: FakeGroup, i: number): void => {
+      const tab = g.tabs[i];
+      if (!tab) return;
+      for (const t of g.tabs) t.isActive = t === tab;
+      g.activeTab = tab;
+      shown.push(tab.label);
+    };
+    tabGroups.all = groups;
+    focus(groups[0]);
+    const exec = vi.spyOn(vscode.commands, "executeCommand").mockImplementation(async (id: any, ...args: any[]) => {
+      if (!String(id).startsWith("workbench.action.")) return undefined;
+      calls.push([id, ...args].join(" "));
+      const g: FakeGroup = tabGroups.activeTabGroup;
+      const slot = FOCUS.indexOf(id);
+      const named = /^workbench\.action\.openEditorAtIndex(\d)$/.exec(id);
+      if (slot >= 0) {
+        const target = groups.find((x) => x.viewColumn === slot + 1);
+        if (target) focus(target);
+      } else if (id === "workbench.action.openEditorAtIndex") show(g, args[0]);
+      else if (named) show(g, Number(named[1]) - 1);
+      else if (id === "workbench.action.nextEditorInGroup") show(g, g.tabs.indexOf(g.activeTab!) + 1);
+      return undefined;
+    });
+    restoreEditor = () => {
+      exec.mockRestore();
+      tabGroups.all = saved.all;
+      tabGroups.activeTabGroup = saved.active;
+    };
+    return { groups, shown, calls };
+  }
+
+  it("a click shows the session's tab past the ninth by its index, in the group at its on-screen slot", async () => {
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    // tabGroups.all is creation order: the middle group was split off after the one to its right.
+    const files = Array.from({ length: 15 }, (_, i) => `file-${i}.ts`);
+    const e = await fakeEditor([
+      { viewColumn: 1, labels: ["notes.md"] },
+      { viewColumn: 3, labels: ["right.md", "spec.md"] },
+      { viewColumn: 2, labels: [...files, "Review the payment retri…", "file-16.ts"] },
+    ]);
+    const title = "Review the payment retries flow";
+    rec.commands.get("claudeSessionMonitor.openSession")!({ provider: "claude", sessionId: "pay", title, matchLabels: [title] });
+    await vi.waitFor(() => expect(e.shown).not.toHaveLength(0));
+    await settleAsync();
+    expect(e.calls).toEqual(["workbench.action.focusSecondEditorGroup", "workbench.action.openEditorAtIndex 15"]);
+    expect(e.shown).toEqual(["Review the payment retri…"]);
+  });
+});
+
 describe("closingStatusMarkers setting", () => {
   // A your-turn Claude session whose final reply ends in an ordinary "✅ ..." line.
   function seedYourTurn(): void {

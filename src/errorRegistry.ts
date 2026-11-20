@@ -4,8 +4,11 @@
  * seen and a running count across windows and activations. Each window adds its
  * new occurrences under an O_EXCL lock file (holder checked for liveness) and
  * rewrites the file atomically. An entry is never shortened; past MAX_ERRORS
- * distinct errors the one seen longest ago is dropped. No vscode import.
+ * distinct errors the one seen longest ago is dropped. Only a missing file starts
+ * an empty registry: a file that cannot be read, or is of another version or shape
+ * (a newer window's), is left as it is. No vscode import.
  */
+import * as fs from "fs";
 import type { ErrorRecord } from "./safeStage";
 
 export const MAX_ERRORS = 500;
@@ -30,7 +33,7 @@ export interface SaveDeps {
   file: string;
   shared(): boolean; // false in observer mode (observerMode.ts sharedFiles): nothing is written
   lock(file: string): (() => void) | null;
-  read(file: string): string | undefined;
+  read(file: string): string | undefined; // undefined only for a missing file, any other error throws (readIfThere)
   write(file: string, text: string): void; // atomic
 }
 
@@ -50,15 +53,21 @@ function isStored(v: unknown): v is StoredError {
   );
 }
 
-/** The valid entries of a parsed errors.json; nothing for anything else. */
-function entriesOf(raw: unknown): Record<string, StoredError> {
-  if (!isRecord(raw) || raw.v !== ERRORS_VERSION || !isRecord(raw.errors)) return {};
+/** The valid entries of a parsed errors.json; undefined for a file of another version or shape. */
+function entriesOf(raw: unknown): Record<string, StoredError> | undefined {
+  if (!isRecord(raw) || raw.v !== ERRORS_VERSION || !isRecord(raw.errors)) return undefined;
   return Object.fromEntries(Object.entries(raw.errors).filter(([, e]) => isStored(e))) as Record<string, StoredError>;
 }
 
-/** `prev` (a parsed errors.json) with `records` added: counts summed, the first stack kept, the oldest last-seen dropped past `max`. */
+/**
+ * `prev` (a parsed errors.json, undefined when there is none) with `records` added: counts summed, the first stack
+ * kept, the oldest last-seen dropped past `max`. Throws for a file of another version or shape: rewriting it would
+ * drop every entry it holds.
+ */
 export function mergeErrors(prev: unknown, records: readonly ErrorRecord[], ver: string, win: string, max = MAX_ERRORS): ErrorsFile {
-  const errors = { ...entriesOf(prev) };
+  const known = prev === undefined ? {} : entriesOf(prev);
+  if (!known) throw new Error(`errors.json is of another version or shape (this window writes version ${ERRORS_VERSION}): left as it is`);
+  const errors = { ...known };
   for (const r of records) {
     const old = errors[r.key];
     const first = iso(r.firstMs);
@@ -73,22 +82,32 @@ export function mergeErrors(prev: unknown, records: readonly ErrorRecord[], ver:
   return { v: ERRORS_VERSION, errors: Object.fromEntries(kept.map((k) => [k, errors[k]])) };
 }
 
-/** Adds `records` to errors.json under its lock; false in observer mode or while another window holds the lock (the records stay unsaved). */
+/**
+ * Adds `records` to errors.json under its lock; false in observer mode or while another window holds the lock (the
+ * records stay unsaved). Throws, leaving the file as it is and the records unsaved, when the file cannot be read, is
+ * not JSON or is of another version or shape; the stage guard that runs this logs each such error once.
+ */
 export function saveErrors(records: readonly ErrorRecord[], ver: string, win: string, deps: SaveDeps): boolean {
   if (!records.length) return true;
   if (!deps.shared()) return false;
   const release = deps.lock(`${deps.file}.lock`);
   if (!release) return false;
   try {
-    let prev: unknown;
-    try {
-      prev = JSON.parse(deps.read(deps.file) ?? "null");
-    } catch {
-      prev = undefined; // unreadable: written atomically, so only a hand edit gets here
-    }
+    const text = deps.read(deps.file);
+    const prev: unknown = text === undefined ? undefined : JSON.parse(text);
     deps.write(deps.file, `${JSON.stringify(mergeErrors(prev, records, ver, win), null, 1)}\n`);
     return true;
   } finally {
     release();
+  }
+}
+
+/** A file's text; undefined only when there is no such file, any other read error throws (SaveDeps.read). */
+export function readIfThere(file: string): string | undefined {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw e;
   }
 }

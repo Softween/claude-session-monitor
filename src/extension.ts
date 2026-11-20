@@ -29,7 +29,7 @@ import { backgroundByDue, fmtClock, timingNote } from "./closingBuckets";
 import { resolveClaudeBinary } from "./claudeBinary";
 import { stageGuard } from "./safeStage";
 import { DebugLog } from "./debugLog";
-import { saveErrors } from "./errorRegistry";
+import { readIfThere, saveErrors } from "./errorRegistry";
 import { SUMMARY_EVERY_SEC, SessionDrops, liveKeys, sessionSummary } from "./sessionLog";
 import { DurationRing, HEALTH_EVERY_MS, removeHealth, timed, writeHealth, type HealthDeps } from "./health";
 import { OverseerBeat, nodeBeatDeps, overseerBin } from "./overseerBeat";
@@ -4442,7 +4442,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // overseer heartbeat for all of them (overseerBeat.ts; only where overseer is installed).
   const saveStageErrors = (): void => {
     const records = stages.unsaved();
-    const deps = { file: ERRORS_FILE, shared: () => allowed("sharedFiles"), lock: (file: string) => acquireSwitchLock(file), read: readText, write: writePrivateTextAtomic };
+    const deps = { file: ERRORS_FILE, shared: () => allowed("sharedFiles"), lock: (file: string) => acquireSwitchLock(file), read: readIfThere, write: writePrivateTextAtomic };
     if (records.length && saveErrors(records, version, win, deps)) stages.saved(records);
   };
   const health: HealthDeps = {

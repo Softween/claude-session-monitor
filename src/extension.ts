@@ -4236,6 +4236,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     executeCommand: (id, ...args) => vscode.commands.executeCommand(id, ...args),
     snapshotTabs,
     activeTab: () => vscode.window.tabGroups.activeTabGroup.activeTab,
+    activeClaudeLabel: () => {
+      const tab = vscode.window.tabGroups.activeTabGroup.activeTab;
+      return tab && isClaudePanelTab(tab) ? tab.label : undefined;
+    },
     restoreTabs,
     yieldTo: () => continuity?.pending() === true,
   });

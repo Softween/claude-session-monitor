@@ -1449,6 +1449,7 @@ export interface TokenScanOpts {
   bucketsFile?: string;
   backfillCap?: number; // overridable for tests
   fileReadCap?: number; // overridable for tests
+  persist?: boolean; // false: the totals still count the unread tail, but neither cache file is written (observer mode)
 }
 
 export function scanTokenUsage(
@@ -1608,15 +1609,17 @@ export function scanTokenUsage(
     for (const k of offsetKeys) if (!known.has(k)) delete offsets[k];
   }
 
-  try {
-    atomicWrite(offsetsFile, JSON.stringify(offsets));
-  } catch {
-    /* ignore */
-  }
-  try {
-    atomicWrite(bucketsFile, JSON.stringify(store));
-  } catch {
-    /* ignore */
+  if (opts.persist !== false) {
+    try {
+      atomicWrite(offsetsFile, JSON.stringify(offsets));
+    } catch {
+      /* ignore */
+    }
+    try {
+      atomicWrite(bucketsFile, JSON.stringify(store));
+    } catch {
+      /* ignore */
+    }
   }
 
   const nowHour = Math.floor(now / 3600);

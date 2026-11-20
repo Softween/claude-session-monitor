@@ -356,9 +356,9 @@ export class TabWaker<M> {
   }
 
   /**
-   * Why the next wake has to wait, or undefined: the gate (tab automation, memory,
-   * the spawn budget), then the command, then the user (timed sweep only), read
-   * last so the idle time is fresh when the wake starts.
+   * Why the next wake has to wait, or undefined: the gate (tab automation, Claude Code,
+   * memory, the spawn budget), then the command, then the user (timed sweep only),
+   * read last so the idle time is fresh when the wake starts.
    */
   private async blocker(manual: boolean): Promise<string | undefined> {
     const held = await this.deps.gate.admit();
@@ -445,7 +445,7 @@ export class TabWaker<M> {
     }
   }
 
-  /** Put the tabs back unless the wake was cancelled or the gate holds right now (tab automation, the setting, memory). */
+  /** Put the tabs back unless the wake was cancelled or the gate holds right now (tab automation, the setting, Claude Code, memory). */
   private async restore(memo: M, p: PendingEntry, signal: AbortSignal): Promise<void> {
     const held = signal.aborted ? errText(signal.reason) : (await this.deps.gate.beforeRestore())?.reason;
     if (held !== undefined) {

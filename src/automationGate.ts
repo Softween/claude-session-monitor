@@ -5,14 +5,17 @@
  * The automations: limit-stopped tab wakes (wakeTabs.ts), continuity requests
  * (continuity.ts), the resume and command sweeps, auto-resume after a limit reset
  * and remote typing. Each goes only while tab automation and its own setting are
- * on.
+ * on and Claude Code passes the compatibility check: every Claude Code command the
+ * automations call exists, and a tab showing a listed Claude session is a
+ * `claudeVSCodePanel` webview. A Claude Code version newer than the one the
+ * automations were checked against is only logged, it turns nothing off.
  *
  * A wake shows a tab whose `claude` process then starts, so wakes (continuity's
  * included) also wait while memory is tight (kern.memorystatus_vm_pressure_level at
  * warn or above, or the pulse daemon at ORANGE or RED where it is installed) and
  * once this window woke 3 tabs in 5 minutes; each such refusal backs the next try
  * off, 30 s doubling up to 10 min. Right before a wake puts the tabs back the
- * switches and memory are checked again. A configuration change that
+ * switches, Claude Code and memory are checked again. A configuration change that
  * turns an automation off aborts its AbortSignal: a wake's wait and restore and a
  * running sweep stop.
  *
@@ -21,6 +24,8 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { labelsMatchStrict } from "./view";
+import { OPEN_COMMAND } from "./wakeTabs";
 
 export const SECTION = "claudeSessionMonitor";
 export const MASTER_SETTING = "tabAutomation";
@@ -37,6 +42,14 @@ export const OWN_SETTING: Readonly<Record<Automation, string | undefined>> = {
   remoteTyping: "remote.typeFallback",
 };
 
+export const CLAUDE_CODE_ID = "anthropic.claude-code";
+/** Every Claude Code command a tab automation calls; the compatibility check needs each one. */
+export const CLAUDE_CODE_COMMANDS: readonly string[] = [OPEN_COMMAND];
+/** The webview view type of Claude Code's panel tabs (VS Code reports it with a `mainThreadWebview-` prefix). */
+export const CLAUDE_PANEL_VIEW_TYPE = "claudeVSCodePanel";
+/** The newest Claude Code version the automations were checked against; a newer one is logged once. */
+export const CHECKED_CLAUDE_CODE = "2.1.327";
+
 export const PRESSURE_WARN = 2; // kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical
 const PULSE_HOLD: readonly string[] = ["ORANGE", "RED"];
 export const PULSE_MAX_AGE_MS = 2 * 60_000;
@@ -45,7 +58,7 @@ export const BUDGET_WINDOW_MS = 5 * 60_000; // ...in any 5 minutes
 export const BACKOFF_MS = 30_000; // after a refused wake, doubling with each refusal in a row...
 export const BACKOFF_MAX_MS = 10 * 60_000; // ...up to 10 minutes
 
-/** What holds a wake back: an automation switched off, memory, or the spawn budget. */
+/** What holds a wake back: an automation switched off or Claude Code incompatible (off), memory, or the spawn budget. */
 export interface Hold {
   kind: "off" | "memory" | "budget";
   reason: string;
@@ -59,10 +72,21 @@ export interface WakeGate {
   admit(): Promise<Hold | undefined>;
   /** The wake starts: it counts against this window's budget. */
   spend(): void;
-  /** Right before a wake puts the tabs back: the switches and memory (not the budget). */
+  /** Right before a wake puts the tabs back: the switches, Claude Code and memory (not the budget). */
   beforeRestore(): Promise<Hold | undefined>;
   /** Aborted once a configuration change turns the feature or tab automation off. */
   signal(): AbortSignal;
+}
+
+export interface ClaudeCodeInfo {
+  version: string;
+  active: boolean; // its commands are registered only once it runs
+}
+
+/** A tab whose input has a view type (a webview or a custom editor). */
+export interface TabView {
+  label: string;
+  viewType: string;
 }
 
 export interface GateDeps {
@@ -72,6 +96,36 @@ export interface GateDeps {
   featureOn(a: Automation): boolean; // the Claude provider and the automation's own setting
   pressureLevel(): Promise<number | undefined>; // kern.memorystatus_vm_pressure_level; undefined: unavailable
   pulseStage(): Promise<string | undefined>; // readPulseStage
+  claudeCode(): ClaudeCodeInfo | undefined; // undefined: not installed
+  commands(): PromiseLike<readonly string[]>; // vscode.commands.getCommands(true)
+  tabViews(): TabView[]; // this window's tabs that have a view type
+  claudeTitles(): string[]; // the listed Claude sessions' titles
+}
+
+/** A failed compatibility check; `loud`: logged, `notice`: shown in the panel. */
+interface Miss {
+  reason: string;
+  loud: boolean;
+  notice: boolean;
+}
+
+/** `a` is a later dotted version than `b` ("2.1.400" > "2.1.327"); anything after a "-" is ignored. */
+export function newerVersion(a: string, b: string): boolean {
+  const parts = (v: string): number[] => v.split("-")[0].split(".").map((n) => Number.parseInt(n, 10) || 0);
+  const x = parts(a);
+  const y = parts(b);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] ?? 0) - (y[i] ?? 0);
+    if (d !== 0) return d > 0;
+  }
+  return false;
+}
+
+/** View types of the tabs that show a listed Claude session (label = its title, Claude Code's truncation included) but are no Claude Code panel. */
+export function strayViewTypes(tabs: readonly TabView[], titles: readonly string[]): string[] {
+  return tabs
+    .filter((t) => !t.viewType.endsWith(CLAUDE_PANEL_VIEW_TYPE) && titles.some((title) => labelsMatchStrict(t.label, title)))
+    .map((t) => t.viewType);
 }
 
 /** The pulse daemon's stage in its state file's text; undefined when unparsable, without a stage, or more than 2 minutes off. */
@@ -98,6 +152,11 @@ export async function readPulseStage(nowMs: number, home: string = os.homedir())
 
 export class AutomationGate {
   private readonly controllers = new Map<Automation, AbortController>();
+  private commandMiss: Miss | undefined = { reason: "Claude Code is not checked yet", loud: false, notice: false };
+  private waiting = false; // Claude Code is installed but not running yet
+  private checking: Promise<void> | undefined;
+  private logged: string | undefined; // the last compatibility result logged (undefined: compatible)
+  private warnedVersion: string | undefined;
   private wakes: number[] = []; // wakes started in the budget window (epoch ms)
   private refusals = 0; // wakes refused in a row
   private backoff: { until: number; hold: Hold } | undefined;
@@ -106,7 +165,21 @@ export class AutomationGate {
 
   /** Why automation `a` may not show, move or type now, or undefined. */
   blocker(a: Automation): string | undefined {
-    return this.offReason(a);
+    return this.offReason(a) ?? this.compat()?.reason;
+  }
+
+  /** The panel notice while tab automation is on but Claude Code fails the compatibility check, else undefined. */
+  notice(): string | undefined {
+    const miss = this.compat();
+    return miss?.notice && this.deps.masterOn() ? `tab automation off: ${miss.reason}` : undefined;
+  }
+
+  /** Check Claude Code's commands and version: at activation and whenever the installed extensions change. */
+  checkCompat(): Promise<void> {
+    this.checking ??= this.runCheck().finally(() => {
+      this.checking = undefined;
+    });
+    return this.checking;
   }
 
   /** The AbortSignal of `a`'s work in progress: aborted once a configuration change turns `a` or tab automation off. */
@@ -149,6 +222,41 @@ export class AutomationGate {
     if (!this.deps.masterOn()) return "tab automation is off";
     if (!this.deps.featureOn(a)) return `${OWN_SETTING[a] ?? "the Claude provider"} is off`;
     return undefined;
+  }
+
+  private async runCheck(): Promise<void> {
+    const cc = this.deps.claudeCode();
+    this.waiting = cc !== undefined && !cc.active;
+    if (cc && cc.version !== this.warnedVersion && newerVersion(cc.version, CHECKED_CLAUDE_CODE)) {
+      this.warnedVersion = cc.version;
+      this.deps.log(`compat: Claude Code ${cc.version} is newer than ${CHECKED_CLAUDE_CODE}, the newest version the tab automations were checked against`);
+    }
+    if (!cc) this.commandMiss = { reason: "the Claude Code extension is not installed", loud: true, notice: false };
+    else if (!cc.active) this.commandMiss = { reason: "Claude Code has not started yet", loud: false, notice: false };
+    else {
+      const ids = await Promise.resolve(this.deps.commands()).catch(() => undefined);
+      const missing = CLAUDE_CODE_COMMANDS.filter((id) => !ids?.includes(id));
+      this.commandMiss = !ids
+        ? { reason: "the command list could not be read", loud: true, notice: false }
+        : missing.length
+          ? { reason: `Claude Code ${cc.version} has no ${missing.join(", ")} command`, loud: true, notice: true }
+          : undefined;
+    }
+    this.compat(); // logs a change
+  }
+
+  /** The compatibility result now (the tab half is read each time); a change of a loud result is logged once. */
+  private compat(): Miss | undefined {
+    if (this.waiting && this.deps.claudeCode()?.active) void this.checkCompat();
+    const stray = this.commandMiss ? [] : strayViewTypes(this.deps.tabViews(), this.deps.claudeTitles());
+    const miss =
+      this.commandMiss ??
+      (stray.length ? { reason: `a Claude session's tab has view type ${stray[0]}, not ${CLAUDE_PANEL_VIEW_TYPE}`, loud: true, notice: true } : undefined);
+    if ((!miss || miss.loud) && miss?.reason !== this.logged) {
+      this.logged = miss?.reason;
+      this.deps.log(miss ? `compat: tab automation off: ${miss.reason}` : "compat: Claude Code passed the check, tab automation on");
+    }
+    return miss;
   }
 
   private async wakeHold(a: Automation): Promise<Hold | undefined> {

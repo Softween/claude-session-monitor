@@ -57,7 +57,7 @@ export interface Served {
   ts: number; // epoch seconds
 }
 
-/** Why the next show would wait right now: the user, or the automation gate (off: tab automation or the setting). */
+/** Why the next show would wait right now: the user, or the automation gate (off: tab automation, the setting or Claude Code). */
 export type Gate = "ok" | "user-active" | Hold["kind"];
 
 /** The content of ext/<key>.json. */
@@ -430,7 +430,7 @@ export class ContinuityServer<G, T> {
 
   /**
    * Put the shown tab's group back on its former tab and refocus the former group, unless the user moved meanwhile
-   * or types in this window, the show was cancelled, or the gate holds right now (tab automation, the setting, memory).
+   * or types in this window, the show was cancelled, or the gate holds right now (tab automation, the setting, Claude Code, memory).
    */
   private async restore(memo: RevealMemo<G, T>, signal: AbortSignal): Promise<void> {
     if (this.deps.windowFocused()) {

@@ -53,7 +53,7 @@ import { nothingTyped, typeIntoPrompt, type TypeResult } from "./keystrokeTyping
 import { acquireSwitchLock, autoRotateOn, remoteSwitch as routeRemoteSwitch } from "./accountSwitch";
 import { activateRestartGuard } from "./restartGuard";
 import { observerMode } from "./observerMode";
-import { AutomationGate, readPulseStage, type Automation } from "./automationGate";
+import { AutomationGate, CLAUDE_CODE_ID, readPulseStage, type Automation } from "./automationGate";
 import {
   KIND_LABEL,
   RESET_KINDS,
@@ -3055,11 +3055,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
         cfg().get<number>("cpuHogThreshold", 60),
         countProviders(allViews),
         providerFilter,
-        enabledProviders().map((provider) =>
-          provider === "codex"
-            ? codexSnapshot.health
-            : { provider: "claude", state: "ready" as const, updatedAt: Date.now() / 1000 },
-        ),
+        enabledProviders().map((provider) => {
+          if (provider === "codex") return codexSnapshot.health;
+          const notice = automationGate.notice(); // Claude Code failed the compatibility check
+          return { provider: "claude", state: notice ? ("degraded" as const) : ("ready" as const), message: notice, updatedAt: Date.now() / 1000 };
+        }),
         views.length
           ? ""
           : enabledProviders().length === 0
@@ -3403,13 +3403,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
   type FocusedTypeResult = TypeResult;
 
   /**
-   * Type `text` + Enter into the session whose tab is already active: (optionally
-   * bring VS Code forward,) focus the Claude input, then type in chunks
-   * (keystrokeTyping.ts): before every chunk and before Enter this window must be
-   * focused, the session's tab active, VS Code frontmost and the Claude prompt
-   * input focused, else typing stops without Enter. `alive` aborts between steps.
-   * Shared by the typing sweep (activates VS Code, panel label match) and the
-   * remote keystroke path (no activation, strict match).
+   * Type `text` + Enter into the session whose tab the caller just showed by its
+   * index (tabFocus.ts), which also moves the keyboard focus into it: (optionally
+   * bring VS Code forward,) then type in chunks (keystrokeTyping.ts): before every
+   * chunk and before Enter this window must be focused, the session's tab active,
+   * VS Code frontmost and the Claude prompt input focused, else typing stops
+   * without Enter. `alive` aborts between steps. Claude Code's focus command is
+   * never called: in Claude Code 2.1.327 it is an @-mention command that can open
+   * a new panel. Shared by the typing sweep (activates VS Code, panel label match)
+   * and the remote keystroke path (no activation, strict match).
    */
   async function typeIntoFocusedSession(
     text: string,
@@ -3422,11 +3424,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
       await activateEditorApp();
       await sleep(150);
     }
-    try {
-      await vscode.commands.executeCommand("claude-vscode.focus");
-    } catch {
-      /* ignore */
-    }
     await sleep(220);
     if (!alive()) return aborted;
     return typeIntoPrompt(text, { submitDelayMs: submitDelayMs ?? 150, alive, windowFocused, tabActive: opts.tabActive });
@@ -3438,9 +3435,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
    * window's one tab matching its title (labelsMatchStrict, truncated labels
    * included, no other listed session matching it), and this window is focused,
    * i.e. VS Code is already frontmost (it is never activated), and the automation gate lets
-   * remote typing through. The tab is then made active and re-verified, and the typing
-   * osascript checks the frontmost app itself. Never prompts. `skip` = nothing was
-   * typed; only a failed keystroke is final.
+   * remote typing through. The tab is then shown by its index and re-verified, and the
+   * typing osascript checks the frontmost app itself. Never prompts. `skip` = nothing
+   * was typed; only a failed keystroke is final.
    */
   async function typeIntoSession(v: SessionView, text: string): Promise<PathAttempt> {
     const skip = (reason: string, detail?: string): PathAttempt => ({ ok: false, skip: true, reason, detail });
@@ -3457,10 +3454,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     const s = sanitizeRemoteLine(text);
     if (!s.ok) return { ok: false, skip: false, reason: s.reason };
     const signal = automationGate.signal("remoteTyping");
-    if (!tab.active) {
-      await focusTab(tab.gi, tab.ti);
-      await sleep(500);
-    }
+    await focusTab(tab.gi, tab.ti); // also when active: showing it moves the keyboard focus into the tab
+    await sleep(500);
     const r = await typeIntoFocusedSession(s.line, undefined, () => !disposed && !resumeActive && !signal.aborted, {
       activate: false,
       tabActive: () => findSessionTab(v, rivals)?.active === true,
@@ -3594,16 +3589,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
           stopResume(`Claude Sessions: ${opts.doneLabel} stopped: ${held}.`);
           return;
         }
-        if (!tab.active) await focusTab(tab.gi, tab.ti);
+        await focusTab(tab.gi, tab.ti); // by its index; also when active, so the keyboard focus moves into the tab
         await sleep(500);
         if (!resumeActive) return;
 
         if (!auto) {
-          try {
-            await vscode.commands.executeCommand("claude-vscode.focus");
-          } catch {
-            /* ignore */
-          }
           vscode.window
             .showInformationMessage(`${opts.doneLabel} ${i}/${queue.length}: "${truncate(v.title, 40)}" · press Enter`, "Stop")
             .then((x) => {
@@ -4317,8 +4307,23 @@ export function activate(ctx: vscode.ExtensionContext): void {
     featureOn: (a) => claudeEnabled() && automationOn[a](),
     pressureLevel: probes.pressureLevel,
     pulseStage: () => readPulseStage(Date.now()),
+    claudeCode: () => {
+      const cc = vscode.extensions.getExtension(CLAUDE_CODE_ID);
+      return cc ? { version: String((cc.packageJSON as { version?: unknown } | undefined)?.version ?? ""), active: cc.isActive } : undefined;
+    },
+    commands: () => vscode.commands.getCommands(true),
+    tabViews: () =>
+      vscode.window.tabGroups.all.flatMap((g) =>
+        g.tabs.flatMap((t) => {
+          const viewType = (t.input as { viewType?: unknown } | undefined)?.viewType;
+          return typeof viewType === "string" ? [{ label: t.label, viewType }] : [];
+        }),
+      ),
+    claudeTitles: () => lastAllViews.filter((v) => v.provider === "claude").map((v) => v.title),
   });
+  void automationGate.checkCompat();
   ctx.subscriptions.push(
+    vscode.extensions.onDidChange(() => void automationGate.checkCompat()), // a Claude Code update
     vscode.workspace.onDidChangeConfiguration((e) => {
       automationGate.configChanged((setting) => e.affectsConfiguration(setting));
       // Turning the wake on starts it without a restart (start() does nothing while it is off).

@@ -262,7 +262,7 @@ vi.mock("../src/remoteBridge", async (orig) => {
 
 import * as ext from "../src/extension";
 import { keeperWaiting } from "../src/cliVault";
-import { ContinuityServer } from "../src/continuity";
+import { ContinuityServer, storageKey } from "../src/continuity";
 import { TabWaker } from "../src/wakeTabs";
 
 beforeEach(() => {
@@ -2113,5 +2113,94 @@ describe("observer mode in an Extension Development Host", () => {
     expect(rec.spawns).toEqual([]);
     expect(rec.execFiles).toEqual([]);
     expect(writesUnderHome()).toEqual([]);
+  });
+});
+
+describe("the debug log: activation line, session summary, drop events and errors.json", () => {
+  const MON = `${HOME}/.claude/session-monitor`;
+  const logLines = (): any[] =>
+    fs.existsSync(`${MON}/csm-debug.log`)
+      ? fs.readFileSync(`${MON}/csm-debug.log`, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l))
+      : [];
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("the activation writes one line with the version, the pid and the window key first, and every line carries them", () => {
+    const storage = `${HOME}/workspaceStorage/0123abcd`;
+    lastCtx = { ...mkCtx(), storageUri: { fsPath: `${storage}/softween.claude-code-session-monitor` }, extension: { packageJSON: { version: "9.9.9" } } };
+    ext.activate(lastCtx);
+    const win = storageKey(storage);
+    const out = logLines();
+    const at = out.findIndex((l) => l.feature === "activation");
+    expect(out.filter((l) => l.feature === "activation")).toEqual([
+      { ts: expect.any(String), pid: process.pid, win, ver: "9.9.9", feature: "activation", lvl: "info", msg: `activated: version 9.9.9 pid ${process.pid} window ${win}` },
+    ]);
+    expect(out.length - at).toBeGreaterThan(1); // the activation logged more, after its first line
+    for (const l of out) expect(Object.keys(l)).toEqual(["ts", "pid", "win", "ver", "feature", "lvl", "msg"]);
+    for (const l of out.slice(at)) expect(l).toMatchObject({ pid: process.pid, win, ver: "9.9.9" });
+  });
+
+  it("a window without a folder is empty-<pid>", () => {
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    expect(logLines().find((l) => l.feature === "activation")).toMatchObject({ win: `empty-${process.pid}`, ver: "0.0.0" });
+  });
+
+  it("logs the session count every 5 minutes instead of every 20 s", () => {
+    vi.useFakeTimers();
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    const summaries = (): number => logLines().filter((l) => l.msg.startsWith("sessions=")).length;
+    expect(summaries()).toBe(1); // the first refresh
+    vi.advanceTimersByTime(4 * 60_000);
+    expect(summaries()).toBe(1);
+    vi.advanceTimersByTime(61_000);
+    expect(summaries()).toBe(2);
+  });
+
+  it("one line when 5 or more live sessions are gone within 60 s", () => {
+    const now = Date.now() / 1000;
+    const dir = `${HOME}/.claude/projects/-repo`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(MON, { recursive: true });
+    const sids = [0, 1, 2, 3, 4, 5].map((i) => `${String(i).repeat(8)}-0000-4000-8000-000000000000`);
+    const record = (sid: string, state: string, ts: number): void =>
+      fs.writeFileSync(`${MON}/${sid}.json`, JSON.stringify({ session_id: sid, provider: "claude", state, ts, cwd: "/repo", transcript_path: `${dir}/${sid}.jsonl`, pid: process.pid }));
+    for (const sid of sids) {
+      const line = { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "work" }] }, timestamp: new Date((now - 40) * 1000).toISOString() };
+      fs.writeFileSync(`${dir}/${sid}.jsonl`, JSON.stringify(line) + "\n");
+      record(sid, "working", now - 30);
+    }
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    const refresh = rec.commands.get("claudeSessionMonitor.refresh")!;
+    for (const sid of sids) record(sid, "ended", now);
+    refresh();
+    refresh();
+    const events = logLines().filter((l) => l.msg.includes("live sessions gone within 60 s"));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ feature: "sessions", lvl: "info" });
+    expect(events[0].msg).toMatch(/^sessions: 6 live sessions gone within 60 s, 0 still live \(/);
+    for (const sid of sids) expect(events[0].msg).toContain(sid.slice(0, 8));
+  });
+
+  it("errors.json gets the first stack and the count of a failing stage, saved after the first refresh and at dispose", () => {
+    vi.spyOn(ContinuityServer.prototype, "observe").mockImplementation(() => {
+      throw new Error("continuity broke");
+    });
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    const file = `${MON}/health/errors.json`;
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).errors["continuity: Error: continuity broke"].count).toBe(1);
+    const refresh = rec.commands.get("claudeSessionMonitor.refresh")!;
+    refresh();
+    refresh();
+    disposeCtx(lastCtx);
+    lastCtx = undefined;
+    const entry = JSON.parse(fs.readFileSync(file, "utf8")).errors["continuity: Error: continuity broke"];
+    expect(entry).toMatchObject({ stage: "continuity", count: 3, ver: "0.0.0", win: `empty-${process.pid}` });
+    expect(entry.stack).toMatch(/^Error: continuity broke\n\s+at /);
+    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
   });
 });

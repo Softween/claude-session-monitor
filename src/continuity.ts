@@ -57,8 +57,12 @@ export interface Served {
   ts: number; // epoch seconds
 }
 
-/** Why the next show would wait right now: the user, or the automation gate (off: tab automation, the setting or Claude Code). */
-export type Gate = "ok" | "user-active" | Hold["kind"];
+/**
+ * Why the next show would wait right now: the user, or the automation gate (off: tab automation, the setting or
+ * Claude Code; memory: memory pressure or the spawn budget). The continuity daemon keeps a request waiting while
+ * the gate is user-active or memory; any other gate lets it expire.
+ */
+export type Gate = "ok" | "user-active" | "memory" | "off";
 
 /** The content of ext/<key>.json. */
 export interface Heartbeat {
@@ -149,10 +153,15 @@ export function tryOf(prev: Served | undefined): number {
   return prev?.result === "no-process" ? 2 : 1;
 }
 
-/** Why the next show would wait: the user, only while this window is focused and input is not idle (unreadable idle: focus alone), else what the automation gate holds. */
+/**
+ * Why the next show would wait: the user, only while this window is focused and input is not idle (unreadable idle:
+ * focus alone), else what the automation gate holds. A spawn-budget hold (and its backoff) reads as memory, so the
+ * daemon keeps the request until the budget frees up instead of letting it expire (an expired request counts as a
+ * failed attempt there).
+ */
 export function gateOf(focused: boolean, idleMs: number | undefined, held: Hold["kind"] | undefined): Gate {
   if (focused && !(idleMs !== undefined && idleMs >= IDLE_MIN_MS)) return "user-active";
-  return held ?? "ok";
+  return held === "budget" ? "memory" : (held ?? "ok");
 }
 
 /**

@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.38.3",
+  "version": "2.39.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -358,7 +358,7 @@
         "claudeSessionMonitor.autoRotate": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Automatically switch Claude Code to the account with the most headroom when the active account reaches `#claudeSessionMonitor.rotateAtPercent#` on its busiest window and another account has at least 20 points more headroom. At most once per 10 minutes. macOS only; needs `trackAllAccounts` and a captured login for each account."
+          "markdownDescription": "Automatically switch Claude Code to the account with the most headroom when the active account reaches `#claudeSessionMonitor.rotateAtPercent#` on its busiest window and another account has at least 20 points more headroom. At most once per 10 minutes. macOS only; needs `trackAllAccounts` and a captured login for each account. Stays off while claude-switch is installed, because claude-switch rotates accounts itself."
         },
         "claudeSessionMonitor.rotateAtPercent": {
           "type": "number",
@@ -501,7 +501,7 @@
           "type": "boolean",
           "scope": "application",
           "default": true,
-          "markdownDescription": "Let a remote `send` or `resume` switch to a session's Claude Code tab and type into it (macOS keystrokes) when the session has no VS Code terminal here. Only when this VS Code window is focused (VS Code is never brought to the front), the tab is the window's one tab matching the session title (Claude Code's truncated labels included, never one another session's title matches too) and VS Code is still the frontmost app at the keystroke; otherwise `send` goes to the session's inbox. Off never types."
+          "markdownDescription": "Let a remote `send` or `resume` switch to a session's Claude Code tab and type into it (macOS keystrokes) when the session has no VS Code terminal here. Only when this VS Code window is focused (VS Code is never brought to the front), the tab is the window's one tab matching the session title (Claude Code's truncated labels included, never one another session's title matches too) and VS Code is still the frontmost app at the keystroke; otherwise `send` goes to the session's inbox. Off never types. It types in chunks of at most 200 characters and stops, without pressing Return, as soon as the Claude Code prompt input loses the focus."
         }
       }
     },

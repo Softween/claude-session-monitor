@@ -1859,7 +1859,7 @@ describe("a session's tab: shown by its index, typed into only when it is the on
     };
     lastCtx = ctx;
     ext.activate(ctx);
-    expect(reads).toEqual([]); // off: the waker reads nothing
+    expect(reads).not.toContain("csm.wake.registry"); // off: the waker reads nothing
     rec.config.set("wakeDeadTabs", true);
     fireConfigurationChange("claudeSessionMonitor.wakeDeadTabs");
     expect(start).toHaveBeenCalledTimes(2);

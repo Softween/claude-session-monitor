@@ -201,6 +201,8 @@ vi.mock("../src/remoteBridge", async (orig) => {
 
 import * as ext from "../src/extension";
 import { keeperWaiting } from "../src/cliVault";
+import { ContinuityServer } from "../src/continuity";
+import { TabWaker } from "../src/wakeTabs";
 
 beforeEach(() => {
   fs.rmSync(HOME, { recursive: true, force: true });
@@ -638,6 +640,131 @@ describe("extension activate()", () => {
 
   it("deactivate() does not throw", () => {
     expect(() => ext.deactivate()).not.toThrow();
+  });
+});
+
+describe("a failing refresh stage or feature start does not stop the others", () => {
+  const MON = `${HOME}/.claude/session-monitor`;
+  const SID = "s-stage";
+  // csm-debug.log lines that mention `text`.
+  const logged = (text: string): number =>
+    fs.existsSync(`${MON}/csm-debug.log`)
+      ? fs.readFileSync(`${MON}/csm-debug.log`, "utf8").split("\n").filter((l) => l.includes(text)).length
+      : 0;
+  const rowIds = (payload: any): string[] => payload.groups.flatMap((g: any) => g.rows.map((r: any) => r.id));
+  const refresh = () => rec.commands.get("claudeSessionMonitor.refresh")!();
+  let samples = 0; // `ps -axo` runs: the resource sampler, the last stage of a refresh
+
+  beforeEach(() => {
+    rec.execFileImpl = (args) => {
+      if (args[0] !== "ps" || args[1]?.[0] !== "-axo") return false;
+      samples++;
+      args[args.length - 1](null, "", "");
+      return true;
+    };
+    samples = 0;
+    // A your-turn session with a live pid: every refresh has its row and a process to sample.
+    const now = Date.now() / 1000;
+    const iso = (s: number) => new Date(s * 1000).toISOString();
+    const dir = `${HOME}/.claude/projects/-repo`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(MON, { recursive: true });
+    const tx = `${dir}/${SID}.jsonl`;
+    const lines = [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "run the tests" }] }, timestamp: iso(now - 40) },
+      { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "Done." }], stop_reason: "end_turn" }, timestamp: iso(now - 30) },
+    ];
+    fs.writeFileSync(tx, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    fs.writeFileSync(`${MON}/${SID}.json`, JSON.stringify({ session_id: SID, provider: "claude", state: "idle", ts: now - 35, cwd: "/repo", transcript_path: tx, pid: process.pid }));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // Activates with a workspace state (so the limits payload is built) and resolves both views;
+  // setting broken.sessions / broken.limits makes that view's postMessage throw.
+  function activateWithViews(): { sessions: any[]; limits: any[]; broken: { sessions: boolean; limits: boolean } } {
+    const ctx = mkCtx();
+    ctx.workspaceState = { get: (_k: string, def?: unknown) => def, update: () => Promise.resolve() };
+    lastCtx = ctx;
+    ext.activate(ctx);
+    const sessions: any[] = [];
+    const limits: any[] = [];
+    const broken = { sessions: false, limits: false };
+    const resolve = (id: string, post: (m: any) => void) =>
+      rec.webviews.find((w) => w.id === id)!.p.resolveWebviewView({
+        webview: { options: {}, html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: post },
+      });
+    resolve("claudeSessionMonitor.view", (m) => {
+      if (broken.sessions) throw new Error("sessions view gone");
+      sessions.push(m);
+    });
+    resolve("claudeSessionMonitor.limits", (m) => {
+      if (m?.type === "burn") return;
+      if (broken.limits) throw new Error("limits view gone");
+      limits.push(m);
+    });
+    return { sessions, limits, broken };
+  }
+
+  it("a throwing continuity stage still lets the sessions payload, the tab waker and the sampler run, and is logged once", () => {
+    vi.spyOn(ContinuityServer.prototype, "observe").mockImplementation(() => {
+      throw new Error("continuity broke");
+    });
+    const wake = vi.spyOn(TabWaker.prototype, "observe");
+    const { sessions } = activateWithViews(); // the first refresh runs inside activate()
+    expect(rowIds(sessions[sessions.length - 1])).toContain(`claude:${SID}`);
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(samples).toBe(1);
+    refresh();
+    expect(wake).toHaveBeenCalledTimes(2);
+    expect(logged("continuity broke")).toBe(1);
+  });
+
+  it("a throwing limits payload is logged once while the sessions payload and the later stages still run", () => {
+    const cont = vi.spyOn(ContinuityServer.prototype, "observe");
+    const wake = vi.spyOn(TabWaker.prototype, "observe");
+    const { sessions, limits, broken } = activateWithViews();
+    expect(limits.length).toBeGreaterThan(0);
+    broken.limits = true;
+    const before = [sessions.length, cont.mock.calls.length, wake.mock.calls.length];
+    refresh();
+    refresh();
+    expect([sessions.length, cont.mock.calls.length, wake.mock.calls.length]).toEqual(before.map((n) => n + 2));
+    expect(logged("limits view gone")).toBe(1);
+  });
+
+  it("a throwing sessions push is logged once while the limits payload and the later stages still run", () => {
+    const cont = vi.spyOn(ContinuityServer.prototype, "observe");
+    const wake = vi.spyOn(TabWaker.prototype, "observe");
+    const { sessions, limits, broken } = activateWithViews();
+    broken.sessions = true;
+    const before = [limits.length, cont.mock.calls.length, wake.mock.calls.length];
+    expect(() => refresh()).not.toThrow();
+    refresh();
+    expect([limits.length, cont.mock.calls.length, wake.mock.calls.length]).toEqual(before.map((n) => n + 2));
+    expect(logged("sessions view gone")).toBe(1);
+    broken.sessions = false; // the view is back: the next refresh delivers the sessions payload again
+    const shown = sessions.length;
+    refresh();
+    expect(sessions.length).toBe(shown + 1);
+    expect(rowIds(sessions[sessions.length - 1])).toContain(`claude:${SID}`);
+  });
+
+  it("a feature that throws at activation leaves the others registered and the first refresh running", () => {
+    vi.spyOn(TabWaker.prototype, "start").mockImplementation(() => {
+      throw new Error("waker start broke");
+    });
+    const cont = vi.spyOn(ContinuityServer.prototype, "observe");
+    let views: ReturnType<typeof activateWithViews> | undefined;
+    expect(() => {
+      views = activateWithViews();
+    }).not.toThrow();
+    expect(rec.commands.has("claudeSessionMonitor.remoteStatus")).toBe(true); // the remote bridge, started before
+    expect(cont).toHaveBeenCalledTimes(1); // the continuity server, started after, observed by the first refresh
+    expect(rec.commands.has("claudeSessionMonitor.openRestartGuard")).toBe(true); // the restart guard, started last
+    expect(rowIds(views!.sessions[views!.sessions.length - 1])).toContain(`claude:${SID}`);
+    expect(logged("waker start broke")).toBe(1);
   });
 });
 

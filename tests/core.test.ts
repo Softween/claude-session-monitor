@@ -358,6 +358,30 @@ describe("collectSessions", () => {
     expect(views.find((v) => v.sessionId === "f")?.title).toBe("Discovered");
   });
 
+  it("a malformed hook record (a non-string cwd) drops only its own session, and is reported", () => {
+    const good = writeTranscript("good.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 40) },
+      { type: "assistant", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 30) },
+    ]);
+    const bad = writeTranscript("bad.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 40) },
+    ]);
+    const hooks = new Map<string, HookStatus>([
+      ["good", { session_id: "good", state: "idle", ts: NOW - 29, cwd: "/repo", transcript_path: good }],
+      ["bad", { session_id: "bad", state: "idle", ts: NOW - 29, cwd: 42 as unknown as string, transcript_path: bad }],
+    ]);
+    const failed: string[] = [];
+    const views = collectSessions({
+      now: NOW,
+      hookStatuses: hooks,
+      maxAgeSec: 24 * 3600,
+      hideEndedOlderThanSec: 24 * 3600,
+      onError: (sessionId) => failed.push(sessionId),
+    });
+    expect(views.map((v) => v.sessionId)).toEqual(["good"]);
+    expect(failed).toEqual(["bad"]);
+  });
+
   it("rejects a machine-blob hook.prompt/lastPrompt and falls through the title chain", () => {
     const p = writeTranscript("blob.jsonl", [
       {

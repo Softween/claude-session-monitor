@@ -931,6 +931,41 @@ describe("active login and Use this account", () => {
     expect(posted[posted.length - 1].useResult.text).toContain("does not list this account");
   });
 
+  it("a remote switch with claude-switch installed answers 'started' at once, runs claude-switch use, and the account list shows the result later", async () => {
+    installSwitchCli();
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    writePanel(UA, "a@x.com");
+    const sw = fakeSwitch();
+    const { posted } = activateWithLimitsView();
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
+    expect(await rec.bridgeDeps.execute({ id: "c1", type: "switchAccount", account: "b@x.com" })).toEqual({
+      ok: true,
+      message: "started: claude-switch use b@x.com; the account list shows the result when it finishes",
+    });
+    expect(sw.calls).toEqual([["use", "b@x.com"]]); // still running: the phone already has its answer
+    expect(posted[posted.length - 1].usePending).toBe("b@x.com");
+    writeLogin(UB, "b@x.com");
+    writePanel(UB, "b@x.com");
+    sw.exit(0, 0, "active: b@x.com (Max)\n");
+    await vi.waitFor(() => expect(registry().activeId).toBe(UB));
+    expect(rec.bridgeDeps.accounts().accounts.find((a: any) => a.id === UB)?.active).toBe(true);
+  });
+
+  it("a remote switch refuses, without running claude-switch, while panel.json is older than 5 minutes", async () => {
+    installSwitchCli();
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    writePanel(UA, "a@x.com", Date.now() / 1000 - 400);
+    const sw = fakeSwitch();
+    const { posted } = activateWithLimitsView();
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0));
+    const out = await rec.bridgeDeps.execute({ id: "c2", type: "switchAccount", account: "b@x.com" });
+    expect(out.ok).toBe(false);
+    expect(out.message).toMatch(/^claude-switch's panel\.json is 40\d s old \(over 5 min\); not switching$/);
+    expect(sw.calls).toEqual([]);
+  });
+
   // Fake timers and Date only: setImmediate stays real, so settleAsync() lets file reads finish.
   const fakeClock = () => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
 
@@ -1301,9 +1336,12 @@ describe("a session's tab: shown by its index, typed into only when it is the on
     const typedInto: Array<string | undefined> = [];
     rec.execFileImpl = (args) => {
       if (args[0] !== "osascript") return false;
-      const keystroke = (args[1] as string[]).some((line) => line.startsWith("keystroke "));
+      const lines = args[1] as string[];
+      const keystroke = lines.some((line) => line.startsWith("keystroke "));
+      // The focus read before every chunk and before Enter (keystrokeTyping.ts): the Claude Code prompt input is focused.
+      const readsFocus = lines.some((line) => line.includes("AXFocusedUIElement"));
       if (keystroke) typedInto.push(e.activeLabel());
-      args[args.length - 1](null, keystroke ? "typed" : "", "");
+      args[args.length - 1](null, keystroke || lines.some((line) => line === "key code 36" || line.includes("key code 36")) ? "typed" : readsFocus ? "com.microsoft.VSCode\nAXTextArea\nMessage input" : "", "");
       return true;
     };
     return typedInto;

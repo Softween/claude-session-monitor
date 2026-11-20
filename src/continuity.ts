@@ -119,6 +119,11 @@ export function storageKey(storage: string): string {
   return crypto.createHash("sha256").update(storage).digest("hex").slice(0, 16);
 }
 
+/** This window's key in the continuity heartbeat, the debug log and the health file: storageKey, or `empty-<pid>` without a storage directory. */
+export function windowKey(storage: string | undefined, pid: number): string {
+  return storage === undefined ? `empty-${pid}` : storageKey(storage);
+}
+
 /** The requests of requests.json this window may serve now, in the daemon's order. */
 export function servable(raw: unknown, storage: string, nowMs: number, served: ReadonlyMap<string, Served>): OpenRequest[] {
   if (!isRecord(raw) || raw.v !== CHANNEL_VERSION || !Array.isArray(raw.requests)) return [];
@@ -316,7 +321,7 @@ export class ContinuityServer<G, T> {
   }
 
   private heartbeatFile(storage: string): string {
-    return path.join(this.deps.dir, "ext", `${storageKey(storage)}.json`);
+    return path.join(this.deps.dir, "ext", `${windowKey(storage, this.deps.pid)}.json`);
   }
 
   private begin(): void {
@@ -327,7 +332,7 @@ export class ContinuityServer<G, T> {
       return;
     }
     this.results = servedFrom(parseJson(this.deps.read(this.heartbeatFile(storage))), storage);
-    this.deps.log(`continuity: channel on key=${storageKey(storage)} pid=${this.deps.pid} served=${this.results.size}`);
+    this.deps.log(`continuity: channel on key=${windowKey(storage, this.deps.pid)} pid=${this.deps.pid} served=${this.results.size}`);
   }
 
   /** This window's servable requests become the queue; a missing or unparsable file has none. */

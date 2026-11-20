@@ -22,6 +22,7 @@ function fileDeps(): SaveDeps {
   dirs.push(dir);
   return {
     file: path.join(dir, "health", "errors.json"),
+    shared: () => true,
     lock: (f) => acquireSwitchLock(f),
     read: (f) => (fs.existsSync(f) ? fs.readFileSync(f, "utf8") : undefined),
     write: (f, text) => {
@@ -100,6 +101,12 @@ describe("saveErrors", () => {
     fs.unlinkSync(`${deps.file}.lock`);
     expect(saveErrors([rec("wake: Error: x", 2, T0)], "2.40.0", "w1", deps)).toBe(true);
     expect(JSON.parse(fs.readFileSync(deps.file, "utf8")).errors["wake: Error: x"].count).toBe(2);
+  });
+
+  it("observer mode writes nothing and leaves the records unsaved", () => {
+    const deps = { ...fileDeps(), shared: () => false };
+    expect(saveErrors([rec("wake: Error: x", 2, T0)], "2.40.0", "w1", deps)).toBe(false);
+    expect(fs.existsSync(path.dirname(deps.file))).toBe(false);
   });
 
   it("does nothing without records", () => {

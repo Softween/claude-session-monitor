@@ -452,6 +452,56 @@ describe("readEffortSettings / effort + model surfacing", () => {
     expect(fs.readFileSync(arr, "utf8")).toBe("[1,2,3]");
   });
 
+  it("writeGlobalEffort replaces the settings by a rename, keeping their mode and leaving no temp file", () => {
+    const f = path.join(tmp, "settings.json");
+    fs.writeFileSync(f, JSON.stringify({ effortLevel: "low", hooks: { Stop: [] } }));
+    fs.chmodSync(f, 0o640);
+    const inode = fs.statSync(f).ino;
+    expect(writeGlobalEffort("max", f)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(f, "utf8"))).toEqual({ effortLevel: "max", hooks: { Stop: [] } });
+    expect(fs.statSync(f).ino).not.toBe(inode); // a new file renamed over the old one, never rewritten in place
+    expect(fs.statSync(f).mode & 0o777).toBe(0o640); // the user's mode, not forced to 0600
+    expect(fs.readdirSync(tmp)).toEqual(["settings.json"]);
+  });
+
+  it("writeGlobalEffort keeps a symlinked settings file a symlink to the updated target", () => {
+    const realDir = path.join(tmp, "dotfiles");
+    const linkDir = path.join(tmp, "claude");
+    fs.mkdirSync(realDir);
+    fs.mkdirSync(linkDir);
+    const target = path.join(realDir, "settings.json");
+    const link = path.join(linkDir, "settings.json");
+    fs.writeFileSync(target, JSON.stringify({ effortLevel: "low", model: "opus" }));
+    fs.chmodSync(target, 0o600);
+    fs.symlinkSync(target, link);
+    const inode = fs.statSync(target).ino;
+    expect(writeGlobalEffort("high", link)).toBe(true);
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(link)).toBe(target);
+    expect(JSON.parse(fs.readFileSync(target, "utf8"))).toEqual({ effortLevel: "high", model: "opus" });
+    expect(fs.statSync(target).ino).not.toBe(inode);
+    expect(fs.statSync(target).mode & 0o777).toBe(0o600);
+    expect(fs.readdirSync(realDir)).toEqual(["settings.json"]);
+    expect(fs.readdirSync(linkDir)).toEqual(["settings.json"]);
+  });
+
+  it("a failing rename leaves the old settings byte-identical and removes the temp file", () => {
+    const f = path.join(tmp, "settings.json");
+    const before = Buffer.from(JSON.stringify({ effortLevel: "low", permissions: { deny: ["Bash(rm:*)"] } }, null, 4));
+    fs.writeFileSync(f, before);
+    const renames: string[][] = [];
+    const failingRename = {
+      rename: (from: string, to: string) => {
+        renames.push([path.dirname(from), to]);
+        throw new Error("EIO: rename failed");
+      },
+    };
+    expect(writeGlobalEffort("max", f, failingRename)).toBe(false);
+    expect(renames).toEqual([[fs.realpathSync(tmp), fs.realpathSync(f)]]); // the temp file sat next to the real target
+    expect(fs.readFileSync(f).equals(before)).toBe(true);
+    expect(fs.readdirSync(tmp)).toEqual(["settings.json"]);
+  });
+
   it("surfaces the transcript model and the injected global effort onto the view", () => {
     const p = writeTranscript("me.jsonl", [
       { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 20) },

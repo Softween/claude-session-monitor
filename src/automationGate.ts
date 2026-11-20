@@ -24,6 +24,7 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { FOCUS_COMMAND } from "./promptFocus";
 import { labelsMatchStrict } from "./view";
 import { OPEN_COMMAND } from "./wakeTabs";
 
@@ -43,8 +44,8 @@ export const OWN_SETTING: Readonly<Record<Automation, string | undefined>> = {
 };
 
 export const CLAUDE_CODE_ID = "anthropic.claude-code";
-/** Every Claude Code command a tab automation calls; the compatibility check needs each one. */
-export const CLAUDE_CODE_COMMANDS: readonly string[] = [OPEN_COMMAND];
+/** Every Claude Code command a tab automation calls (the wake, typing's refocus step); the compatibility check needs each one. */
+export const CLAUDE_CODE_COMMANDS: readonly string[] = [OPEN_COMMAND, FOCUS_COMMAND];
 /** The webview view type of Claude Code's panel tabs (VS Code reports it with a `mainThreadWebview-` prefix). */
 export const CLAUDE_PANEL_VIEW_TYPE = "claudeVSCodePanel";
 /** The newest Claude Code version the automations were checked against; a newer one is logged once. */
@@ -239,7 +240,7 @@ export class AutomationGate {
       this.commandMiss = !ids
         ? { reason: "the command list could not be read", loud: true, notice: false }
         : missing.length
-          ? { reason: `Claude Code ${cc.version} has no ${missing.join(", ")} command`, loud: true, notice: true }
+          ? { reason: `Claude Code ${cc.version} has no ${missing.join(" or ")} command`, loud: true, notice: true }
           : undefined;
     }
     this.compat(); // logs a change

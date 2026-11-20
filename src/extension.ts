@@ -50,6 +50,7 @@ import { focusGroupBySlot, revealTabByIndex, type TabFocusDeps } from "./tabFocu
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
 import { submitAnswer } from "./answers";
 import { nothingTyped, typeIntoPrompt, type TypeResult } from "./keystrokeTyping";
+import { FOCUS_COMMAND, FOCUS_SETTLE_MS, focusCommandBlocker, typingLine, waitForActive } from "./promptFocus";
 import { acquireSwitchLock, autoRotateOn, remoteSwitch as routeRemoteSwitch } from "./accountSwitch";
 import { activateRestartGuard } from "./restartGuard";
 import { observerMode } from "./observerMode";
@@ -3404,29 +3405,64 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   /**
    * Type `text` + Enter into the session whose tab the caller just showed by its
-   * index (tabFocus.ts), which also moves the keyboard focus into it: (optionally
-   * bring VS Code forward,) then type in chunks (keystrokeTyping.ts): before every
-   * chunk and before Enter this window must be focused, the session's tab active,
-   * VS Code frontmost and the Claude prompt input focused, else typing stops
-   * without Enter. `alive` aborts between steps. Claude Code's focus command is
-   * never called: in Claude Code 2.1.327 it is an @-mention command that can open
-   * a new panel. Shared by the typing sweep (activates VS Code, panel label match)
-   * and the remote keystroke path (no activation, strict match).
+   * index (tabFocus.ts): wait up to 1 s until it is the active tab of the active
+   * group, (optionally bring VS Code forward,) then type in chunks
+   * (keystrokeTyping.ts): before every chunk and before Enter this window must be
+   * focused, the session's tab active, VS Code frontmost and the Claude prompt
+   * input focused, else typing stops without Enter. When the first check finds the
+   * focus elsewhere, Claude Code's focus command runs once if that is safe
+   * (refocusPrompt). `alive` aborts between steps. Each attempt logs its path
+   * (promptFocus.ts). Shared by the typing sweep (activates VS Code, panel label
+   * match) and the remote keystroke path (no activation, strict match).
    */
   async function typeIntoFocusedSession(
     text: string,
     submitDelayMs: number | undefined,
     alive: () => boolean,
-    opts: { activate: boolean; tabActive: () => boolean },
+    opts: { activate: boolean; tabActive: () => boolean; label: string },
   ): Promise<FocusedTypeResult> {
-    const aborted: FocusedTypeResult = { ok: false, reason: "aborted", detail: "stopped" };
+    const done = (r: FocusedTypeResult): FocusedTypeResult => {
+      log(typingLine(opts.label, r));
+      return r;
+    };
+    if (!(await waitForActive(opts.tabActive))) {
+      return done({ ok: false, reason: "tab-mismatch", detail: "the session's tab did not become the active tab within 1 s" });
+    }
     if (opts.activate) {
       await activateEditorApp();
       await sleep(150);
     }
     await sleep(220);
-    if (!alive()) return aborted;
-    return typeIntoPrompt(text, { submitDelayMs: submitDelayMs ?? 150, alive, windowFocused, tabActive: opts.tabActive });
+    if (!alive()) return done({ ok: false, reason: "aborted", detail: "stopped" });
+    const refocus = (): Promise<string | undefined> => refocusPrompt(opts.tabActive);
+    return done(await typeIntoPrompt(text, { submitDelayMs: submitDelayMs ?? 150, alive, windowFocused, tabActive: opts.tabActive, refocus }));
+  }
+
+  /**
+   * Claude Code's focus command, only while it can do nothing but focus the target panel's prompt input
+   * (promptFocus.ts): the target Claude panel is the active editor, no text editor is active and no other
+   * Claude panel is visible. Then, once a visible Claude sidebar's focus retries are over, the target's
+   * group gets the keyboard focus back. Undefined once that ran, else why not.
+   */
+  async function refocusPrompt(targetActive: () => boolean): Promise<string | undefined> {
+    const group = vscode.window.tabGroups.activeTabGroup;
+    const active = group.activeTab;
+    const blocked = focusCommandBlocker({
+      targetActive: targetActive(),
+      claudePanel: active !== undefined && isClaudePanelTab(active),
+      textEditor: vscode.window.activeTextEditor !== undefined,
+      otherClaudePanels: vscode.window.tabGroups.all.filter((g) => g !== group && g.activeTab !== undefined && isClaudePanelTab(g.activeTab)).length,
+    });
+    if (blocked) return `${FOCUS_COMMAND} not run: ${blocked}`;
+    try {
+      await vscode.commands.executeCommand(FOCUS_COMMAND);
+      await sleep(FOCUS_SETTLE_MS);
+      if (!targetActive()) return `the session's tab is no longer active after ${FOCUS_COMMAND}`;
+      await focusTabGroup(group);
+    } catch (e) {
+      return `${FOCUS_COMMAND} failed: ${String(e)}`;
+    }
+    return undefined;
   }
 
   /**
@@ -3455,10 +3491,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (!s.ok) return { ok: false, skip: false, reason: s.reason };
     const signal = automationGate.signal("remoteTyping");
     await focusTab(tab.gi, tab.ti); // also when active: showing it moves the keyboard focus into the tab
-    await sleep(500);
     const r = await typeIntoFocusedSession(s.line, undefined, () => !disposed && !resumeActive && !signal.aborted, {
       activate: false,
       tabActive: () => findSessionTab(v, rivals)?.active === true,
+      label: `remote ${v.key}`,
     });
     if (r.ok) return { ok: true };
     // Only a failed keystroke or typing stopped midway is final: every other reason typed nothing.
@@ -3590,7 +3626,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
           return;
         }
         await focusTab(tab.gi, tab.ti); // by its index; also when active, so the keyboard focus moves into the tab
-        await sleep(500);
         if (!resumeActive) return;
 
         if (!auto) {
@@ -3603,11 +3638,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
           const t = await typeIntoFocusedSession(text, opts.submitDelayMs, () => resumeActive, {
             activate: true,
             tabActive: () => findSessionTab(v, rivals)?.active === true,
+            label: `${opts.doneLabel} ${v.key}`,
           });
           if (!t.ok && t.reason === "aborted") return;
           if (!t.ok && (t.reason === "not-frontmost" || t.reason === "tab-mismatch")) {
-            skipped++;
-            log(`${opts.doneLabel} skip ${v.key}: ${t.detail}`);
+            skipped++; // logged by typeIntoFocusedSession
           } else {
             if (!t.ok) {
               if (t.reason === "accessibility") {

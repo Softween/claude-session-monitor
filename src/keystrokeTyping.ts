@@ -2,6 +2,8 @@
 // keystrokes, in chunks, and re-checks the target before every chunk and before
 // Return. A click into the integrated terminal, an editor or another app while
 // it types costs at most one chunk (no Return), never a command run in a shell.
+// When the first check finds the keyboard focus off the prompt input, the
+// caller's refocus step (promptFocus.ts) may run once before it checks again.
 // No vscode import: the focus reader, the keystroke runs and the clock are
 // injected, so every abort path is unit-tested.
 import { execFile } from "child_process";
@@ -52,6 +54,11 @@ export interface TypeTarget {
   windowFocused(): boolean;
   /** The session's tab is the active one. */
   tabActive(): boolean;
+  /**
+   * Tried once, when the first check finds the keyboard focus off the prompt
+   * input: puts it there and resolves undefined, or resolves why it may not run.
+   */
+  refocus?(): Promise<string | undefined>;
 }
 
 /**
@@ -60,7 +67,8 @@ export interface TypeTarget {
  * failed `keystroke` it is final. Every other reason typed nothing.
  */
 export type TypeFailReason = "aborted" | "not-frontmost" | "tab-mismatch" | "not-prompt" | "accessibility" | "keystroke" | "interrupted";
-export type TypeResult = { ok: true } | { ok: false; reason: TypeFailReason; detail: string };
+/** `refocused`: the target's refocus step ran before the first chunk. */
+export type TypeResult = { ok: true; refocused?: true } | { ok: false; reason: TypeFailReason; detail: string; refocused?: true };
 
 /** True when nothing was typed, so a remote command may try its next delivery path. */
 export function nothingTyped(reason: TypeFailReason): boolean {
@@ -87,7 +95,8 @@ export function isAccessibilityError(err: string): boolean {
  * Types `text` + Return into the Claude Code prompt input. Before every chunk
  * and before Return it reads the focused element and goes on only while the
  * caller still wants it, this window is focused, the session's tab is active,
- * VS Code is frontmost and the Claude Code prompt input has the focus.
+ * VS Code is frontmost and the Claude Code prompt input has the focus. Only the
+ * first check may run `target.refocus` (once) and check again.
  */
 export async function typeIntoPrompt(text: string, target: TypeTarget, deps: KeystrokeDeps = osascriptKeystrokes): Promise<TypeResult> {
   const total = Array.from(text).length;
@@ -118,13 +127,26 @@ export async function typeIntoPrompt(text: string, target: TypeTarget, deps: Key
     if (k.notFrontmost) return fail("not-frontmost", k.err);
     return fail(sent === 0 && isAccessibilityError(k.err) ? "accessibility" : "keystroke", k.err || "keystroke failed");
   };
+  let first = true;
+  let refocused = false;
+  const checkFirst = async (): Promise<TypeResult | null> => {
+    const stop = await check();
+    if (!first) return stop;
+    first = false;
+    if (!target.refocus || stop?.ok !== false || stop.reason !== "not-prompt") return stop;
+    const refused = await target.refocus();
+    if (refused !== undefined) return { ...stop, detail: `${stop.detail}; ${refused}` };
+    refocused = true;
+    return check();
+  };
+  const tagged = (r: TypeResult): TypeResult => (refocused ? { ...r, refocused: true } : r);
   for (const part of chunkText(text)) {
-    const stop = (await check()) ?? ran(await deps.keystroke(part));
-    if (stop) return stop;
+    const stop = (await checkFirst()) ?? ran(await deps.keystroke(part));
+    if (stop) return tagged(stop);
     sent += Array.from(part).length;
   }
   await deps.sleep(target.submitDelayMs);
-  return (await check()) ?? ran(await deps.pressReturn()) ?? { ok: true };
+  return tagged((await checkFirst()) ?? ran(await deps.pressReturn()) ?? { ok: true });
 }
 
 function appleStr(s: string): string {

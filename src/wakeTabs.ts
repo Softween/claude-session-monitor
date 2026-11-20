@@ -14,7 +14,7 @@
  * by then. Nothing is ever sent to a session.
  * A continuity request (continuity.ts) goes first: no tab is woken while one is
  * served or waits. Every wake and every restore passes the automation gate
- * (automationGate.ts: tab automation, memory), and turning the
+ * (automationGate.ts: tab automation, memory, the spawn budget), and turning the
  * setting or tab automation off cancels a wake's wait and restore.
  *
  * No `vscode` import: extension.ts injects the editor side (WakeDeps).
@@ -338,6 +338,7 @@ export class TabWaker<M> {
       this.postpone(reason);
       return "postponed";
     }
+    this.deps.gate.spend();
     const result = await this.wake(next);
     if (result === "cancelled") return "postponed"; // no try used: the setting or tab automation went off during the wake
     this.settle(next, result === "woken");
@@ -355,9 +356,9 @@ export class TabWaker<M> {
   }
 
   /**
-   * Why the next wake has to wait, or undefined: the gate (tab automation, memory),
-   * then the command, then the user (timed sweep only), read last so the idle
-   * time is fresh when the wake starts.
+   * Why the next wake has to wait, or undefined: the gate (tab automation, memory,
+   * the spawn budget), then the command, then the user (timed sweep only), read
+   * last so the idle time is fresh when the wake starts.
    */
   private async blocker(manual: boolean): Promise<string | undefined> {
     const held = await this.deps.gate.admit();
@@ -444,7 +445,7 @@ export class TabWaker<M> {
     }
   }
 
-  /** Put the tabs back unless the wake was cancelled or the gate holds right now (tab automation, the setting). */
+  /** Put the tabs back unless the wake was cancelled or the gate holds right now (tab automation, the setting, memory). */
   private async restore(memo: M, p: PendingEntry, signal: AbortSignal): Promise<void> {
     const held = signal.aborted ? errText(signal.reason) : (await this.deps.gate.beforeRestore())?.reason;
     if (held !== undefined) {

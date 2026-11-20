@@ -53,7 +53,7 @@ import { nothingTyped, typeIntoPrompt, type TypeResult } from "./keystrokeTyping
 import { acquireSwitchLock, autoRotateOn, remoteSwitch as routeRemoteSwitch } from "./accountSwitch";
 import { activateRestartGuard } from "./restartGuard";
 import { observerMode } from "./observerMode";
-import { AutomationGate, type Automation } from "./automationGate";
+import { AutomationGate, readPulseStage, type Automation } from "./automationGate";
 import {
   KIND_LABEL,
   RESET_KINDS,
@@ -4312,9 +4312,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
   };
   const automationGate = new AutomationGate({
     log,
+    now: () => Date.now(),
     masterOn: () => cfg().get<boolean>("tabAutomation", true) !== false,
     featureOn: (a) => claudeEnabled() && automationOn[a](),
     pressureLevel: probes.pressureLevel,
+    pulseStage: () => readPulseStage(Date.now()),
   });
   ctx.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {

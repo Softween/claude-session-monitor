@@ -14,8 +14,9 @@
  * would hold the next show back, and the newest 50 results. At most two tries per
  * request; a request goes before a limit-stopped tab wake (wakeTabs.ts) and the two
  * never show tabs at the same time. Every show and every restore passes the automation
- * gate (automationGate.ts: tab automation, memory), and turning the setting or tab
- * automation off cancels a show's wait and restore. Nothing is typed or sent into a session.
+ * gate (automationGate.ts: tab automation, memory, the spawn budget shared with the
+ * tab wakes), and turning the setting or tab automation off cancels a show's wait and
+ * restore. Nothing is typed or sent into a session.
  *
  * No `vscode` import: extension.ts injects the editor side (ServerDeps).
  */
@@ -389,6 +390,7 @@ export class ContinuityServer<G, T> {
     const memo: RevealMemo<G, T> = { activeGroup: this.deps.activeGroup(), group, groupTab: this.deps.activeTabOf(group), tab };
     const signal = this.deps.gate.signal();
     const started = this.deps.now();
+    this.deps.gate.spend();
     let error: string | undefined;
     try {
       await this.deps.reveal(group, tab);
@@ -428,7 +430,7 @@ export class ContinuityServer<G, T> {
 
   /**
    * Put the shown tab's group back on its former tab and refocus the former group, unless the user moved meanwhile
-   * or types in this window, the show was cancelled, or the gate holds right now (tab automation, the setting).
+   * or types in this window, the show was cancelled, or the gate holds right now (tab automation, the setting, memory).
    */
   private async restore(memo: RevealMemo<G, T>, signal: AbortSignal): Promise<void> {
     if (this.deps.windowFocused()) {
@@ -453,7 +455,7 @@ export class ContinuityServer<G, T> {
     }
   }
 
-  /** The gate right now, then the heartbeat; `attempt`: a show follows. */
+  /** The gate right now, then the heartbeat; `attempt`: a show follows, so a memory or budget hold backs the next try off. */
   private async beat(attempt = false): Promise<Gate> {
     const focused = this.deps.windowFocused();
     const idle = focused ? await this.deps.idleMs() : undefined;

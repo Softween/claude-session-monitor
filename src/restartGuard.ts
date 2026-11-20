@@ -14,7 +14,9 @@
  * VS Code loads a custom editor's document only once its tab is shown: a tab
  * opened in the background, or restored by a window reload and not shown since,
  * does not veto. So the guard tab is shown once without taking focus, and the
- * tab that was active in its group is put back as soon as it is resolved.
+ * tab that was active in its group is put back as soon as it is resolved, if the
+ * guard still covers it. At activation the guard first waits for a 2 s pause in
+ * input while the window is focused.
  */
 import * as fs from "fs";
 import * as path from "path";
@@ -27,6 +29,7 @@ const SETTING = "restartGuard";
 const GUARD_FILE_TEXT =
   "Kept open by Agent Session Monitor so VS Code asks before it restarts extensions (claudeSessionMonitor.restartGuard).\n";
 const RESOLVE_TIMEOUT_MS = 10_000;
+const PAUSE_MS = 2_000; // at activation: no input for this long, or the window not focused
 const MRU_BACK_COMMAND = "workbench.action.openPreviousRecentlyUsedEditorInGroup";
 
 /** The guard tab's page: static text, no scripts. */
@@ -113,7 +116,8 @@ export class GuardEditorProvider implements vscode.CustomTextEditorProvider {
 /** What the guard needs from extension.ts. */
 export interface GuardDeps {
   log(msg: string): void;
-  focusGroup(index: number): Thenable<unknown>; // focuses editor group `index` of tabGroups.all
+  focusGroup(group: vscode.TabGroup): Thenable<unknown>; // focuses `group` by its on-screen slot (tabFocus.ts)
+  idleMs(): Promise<number | undefined>; // since the last keyboard or mouse input; undefined: unreadable
 }
 
 /** Opens `tab`'s guard editor in its own group, or the guard file in the first group. */
@@ -127,17 +131,29 @@ async function openGuard(tab: vscode.Tab | undefined, fileUri: () => vscode.Uri,
 }
 
 /**
- * Makes `prev` its group's active tab again with one most-recently-used step,
- * then gives the focus back to `focused`. It never walks a group's tabs: that
- * would show every tab in between for a moment, and showing a Claude Code tab
- * that a window reload restored can start its session.
+ * While the guard tab still covers `prev` (it is the active tab of their group),
+ * makes `prev` the active tab again with one most-recently-used step, then gives
+ * the focus back to the group that has it now; a tab chosen meanwhile stays in
+ * front. Groups are focused by their on-screen slot. It never walks a group's
+ * tabs: that would show every tab in between for a moment, and showing a Claude
+ * Code tab that a window reload restored can start its session.
  */
-async function putBack(group: vscode.TabGroup, prev: vscode.Tab | undefined, focused: vscode.TabGroup, deps: GuardDeps): Promise<void> {
-  if (!prev || group.activeTab === prev) return;
-  const all = vscode.window.tabGroups.all;
-  await deps.focusGroup(all.indexOf(group));
+async function putBack(group: vscode.TabGroup, prev: vscode.Tab | undefined, deps: GuardDeps): Promise<void> {
+  const active = group.activeTab;
+  if (!prev || !active || active === prev || !isGuardTab(active)) return;
+  const focused = vscode.window.tabGroups.activeTabGroup;
+  await deps.focusGroup(group);
   await vscode.commands.executeCommand(MRU_BACK_COMMAND);
-  if (focused !== group) await deps.focusGroup(all.indexOf(focused));
+  if (focused !== group) await deps.focusGroup(focused);
+}
+
+/** Resolves once the window is not focused or had no input for 2 s; an unreadable idle time does not wait. */
+async function untilPaused(deps: GuardDeps): Promise<void> {
+  for (;;) {
+    const idle = await deps.idleMs();
+    if (idle === undefined || idle >= PAUSE_MS || !vscode.window.state.focused) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, PAUSE_MS - idle));
+  }
 }
 
 /**
@@ -149,13 +165,12 @@ async function ensureGuard(provider: GuardEditorProvider, fileUri: () => vscode.
   const groups = vscode.window.tabGroups;
   const tab = findGuardTab(groups.all);
   if (tab && provider.live) return;
-  const focused = groups.activeTabGroup;
-  const group = tab?.group ?? groups.all.find((g) => g.viewColumn === vscode.ViewColumn.One) ?? focused;
+  const group = tab?.group ?? groups.all.find((g) => g.viewColumn === vscode.ViewColumn.One) ?? groups.activeTabGroup;
   const prev = group.activeTab;
   const resolved = provider.nextResolve(RESOLVE_TIMEOUT_MS);
   await openGuard(tab, fileUri, true);
   const ok = await resolved;
-  await putBack(group, prev, focused, deps);
+  await putBack(group, prev, deps);
   const late = ok ? "" : `, not resolved within ${RESOLVE_TIMEOUT_MS / 1000} s`;
   deps.log(`restart guard: ${tab ? "restored tab shown once" : "tab opened"}${late}`);
 }
@@ -173,6 +188,7 @@ async function closeGuard(log: (msg: string) => void): Promise<void> {
  * while the setting is on opens again the next time the window is not focused
  * (right away when it is not focused already): nothing moves while you work in
  * the window, and a restart is not left unguarded until the next activation.
+ * At activation the guard opens after a pause in input (untilPaused).
  */
 export function activateRestartGuard(ctx: vscode.ExtensionContext, deps: GuardDeps): void {
   const provider = new GuardEditorProvider();
@@ -182,8 +198,9 @@ export function activateRestartGuard(ctx: vscode.ExtensionContext, deps: GuardDe
   const run = (what: string, job: () => Promise<void>): void => {
     queue = queue.then(job).catch((e: unknown) => deps.log(`restart guard: ${what} failed: ${e instanceof Error ? e.message : String(e)}`));
   };
-  const apply = (): void => {
-    if (enabled()) run("open", () => ensureGuard(provider, fileUri, deps));
+  const apply = (atActivation = false): void => {
+    const open = (): Promise<void> => ensureGuard(provider, fileUri, deps);
+    if (enabled()) run("open", atActivation ? () => untilPaused(deps).then(open) : open);
     else run("close", () => closeGuard(deps.log));
   };
   let reopenPending = false; // a guard tab was closed while the setting is on
@@ -208,5 +225,5 @@ export function activateRestartGuard(ctx: vscode.ExtensionContext, deps: GuardDe
     }),
     vscode.window.onDidChangeWindowState(reopenIfDue),
   );
-  apply();
+  apply(true);
 }

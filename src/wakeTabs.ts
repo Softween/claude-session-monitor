@@ -10,7 +10,8 @@
  * activation the remembered sessions that run nowhere and whose last assistant
  * entry is a 429 API error at most 24 h old become pending; a sweep shows them one
  * at a time through Claude Code's `claude-vscode.editor.open`, waits for the
- * process, then puts the tabs and focus back. Nothing is ever sent to a session.
+ * process, then puts the tabs and focus back unless the user works in the window
+ * by then. Nothing is ever sent to a session.
  * A continuity request (continuity.ts) goes first: no tab is woken while one is
  * served or waits.
  *
@@ -38,6 +39,8 @@ export const IDLE_MIN_MS = 20_000;
 export const PRESSURE_CRITICAL = 4; // kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical
 export const WAIT_LIVE_MS = 20_000;
 export const POLL_MS = 500;
+const REVEAL_WAIT_MS = 1_000; // Claude Code shows the tab only after editor.open returns
+const REVEAL_POLL_MS = 50;
 const MAX_ATTEMPTS = 2; // failed wakes per session
 const MAX_FAILS_IN_ROW = 2; // then the sweep stops until the next activation
 const STOP_MAX_AGE_MS = 24 * 3600_000;
@@ -88,6 +91,7 @@ export interface WakeDeps<M> {
   executeCommand(id: string, ...args: unknown[]): PromiseLike<unknown>;
   snapshotTabs(): M; // each group's active tab and the active group
   activeTab(): unknown;
+  activeClaudeLabel(): string | undefined; // the active tab's label when it is a Claude Code tab
   restoreTabs(snapshot: M): Promise<void>;
   yieldTo?(): boolean; // a continuity request (continuity.ts) is served or waits: it goes first
 }
@@ -347,17 +351,28 @@ export class TabWaker<M> {
     return keep[0];
   }
 
-  /** Why the next wake has to wait, or undefined (idle counts only for the timed sweep). */
+  /**
+   * Why the next wake has to wait, or undefined: memory, then the command, then the
+   * user (timed sweep only), read last so the idle time is fresh when the wake starts.
+   */
   private async blocker(manual: boolean): Promise<string | undefined> {
-    if (!manual) {
-      const idle = await this.deps.idleMs();
-      if (idle === undefined ? this.deps.windowFocused() : idle < IDLE_MIN_MS) return "user active";
-    }
     const level = await this.deps.pressureLevel();
     if (level !== undefined && level >= PRESSURE_CRITICAL) return `memory pressure ${level}`;
     if (!(await this.deps.commandExists(OPEN_COMMAND))) return `no ${OPEN_COMMAND} command`;
+    if (!manual && (await this.recentInput())) return "user active";
     if (this.deps.yieldTo?.()) return "continuity request first"; // last: nothing awaits between it and the wake
     return undefined;
+  }
+
+  /** Input in the last 20 s; with the idle time unreadable, a focused window counts as input. */
+  private async recentInput(): Promise<boolean> {
+    const idle = await this.deps.idleMs();
+    return idle === undefined ? this.deps.windowFocused() : idle < IDLE_MIN_MS;
+  }
+
+  /** The user works in this window: input in the last 20 s while it is focused. */
+  private async userAtWindow(): Promise<boolean> {
+    return (await this.recentInput()) && this.deps.windowFocused();
   }
 
   private postpone(reason: string): void {
@@ -368,7 +383,10 @@ export class TabWaker<M> {
     this.deps.log(`wake: postponed (${reason}), ${this.pending.length} pending`);
   }
 
-  /** Show `p`'s tab, wait up to 20 s for its process, then put the tabs back if the woken tab is still active. */
+  /**
+   * Show `p`'s tab, wait up to 20 s for its process, then put the tabs back if the
+   * woken tab is still active and the user does not work in this window.
+   */
   private async wake(p: PendingEntry): Promise<boolean> {
     const memo = this.deps.snapshotTabs();
     const started = this.deps.now();
@@ -379,13 +397,29 @@ export class TabWaker<M> {
     } catch (e) {
       error = errText(e);
     }
-    const woken = this.deps.activeTab();
-    const pid = error === undefined ? await this.waitLive(p.sid, started) : undefined;
-    if (this.deps.activeTab() === woken) await this.restore(memo);
+    const [woken, pid]: [unknown, number | undefined] =
+      error === undefined ? await Promise.all([this.shownTab(p), this.waitLive(p.sid, started)]) : [this.deps.activeTab(), undefined];
+    const userActive = await this.userAtWindow();
+    if (this.deps.activeTab() === woken) {
+      if (userActive) this.deps.log(`wake: ${short(p.sid)} tabs left as they are, the user is active in this window`);
+      else await this.restore(memo);
+    }
     const secs = ((this.deps.now() - started) / 1000).toFixed(1);
     if (pid !== undefined) this.deps.log(`wake: ${short(p.sid)} live after ${secs}s pid=${pid}`);
     else this.deps.log(`wake: ${short(p.sid)} failed after ${secs}s (${error ?? "no process"}), attempt ${p.attempts + 1}/${MAX_ATTEMPTS}`);
     return pid !== undefined;
+  }
+
+  /** The active tab once a Claude Code tab labelled with `p`'s title is (Claude Code shows it after the command returns), else after 1 s. */
+  private async shownTab(p: PendingEntry): Promise<unknown> {
+    const title = this.deps.titleOf(p.sid) ?? p.title;
+    const shown = (): boolean => {
+      const label = this.deps.activeClaudeLabel();
+      return title !== undefined && label !== undefined && labelsMatchStrict(label, title);
+    };
+    const until = this.deps.now() + REVEAL_WAIT_MS;
+    while (!shown() && this.deps.now() < until) await sleep(REVEAL_POLL_MS);
+    return this.deps.activeTab();
   }
 
   private async waitLive(sid: string, since: number): Promise<number | undefined> {

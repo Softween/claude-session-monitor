@@ -50,9 +50,11 @@ import { focusGroupBySlot, revealTabByIndex, type TabFocusDeps } from "./tabFocu
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
 import { submitAnswer } from "./answers";
 import { nothingTyped, typeIntoPrompt, type TypeResult } from "./keystrokeTyping";
+import { FOCUS_COMMAND, FOCUS_SETTLE_MS, focusCommandBlocker, typingLine, waitForActive } from "./promptFocus";
 import { acquireSwitchLock, autoRotateOn, remoteSwitch as routeRemoteSwitch } from "./accountSwitch";
 import { activateRestartGuard } from "./restartGuard";
 import { observerMode } from "./observerMode";
+import { AutomationGate, CLAUDE_CODE_ID, readPulseStage, type Automation } from "./automationGate";
 import {
   KIND_LABEL,
   RESET_KINDS,
@@ -2091,6 +2093,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   };
   let resumeTimer: ReturnType<typeof setTimeout> | undefined;
   let resumeActive = false;
+  let endSweep: (() => void) | undefined; // detaches the running sweep from its automation gate signal
   let autoResumeTimer: ReturnType<typeof setTimeout> | undefined;
   let autoResumeAt = 0;
   let lastIdleRamWarn = 0;
@@ -2142,10 +2145,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
       autoResumeTimer = undefined;
       autoResumeAt = 0;
       if (disposed || !claudeEnabled() || resumeActive) return;
+      const held = automationGate.blocker("autoResume");
+      if (held) {
+        log(`auto-resume skipped: ${held}`);
+        return;
+      }
       const queue = inThisWindow(sweepQueue(lastAllViews, autoResumeOverrides(), autoResumeAll()));
       if (!queue.length) return; // every window sweeps its own sessions; one without any stays silent
       vscode.window.showInformationMessage("Claude Sessions: limit reset — starting auto resume sweep.");
-      startResumeSweep(queue);
+      startResumeSweep(queue, "autoResume");
     }, delay);
   }
 
@@ -2176,6 +2184,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   const stopResume = (msg?: string) => {
     resumeActive = false;
+    endSweep?.();
+    endSweep = undefined;
     if (resumeTimer) {
       clearTimeout(resumeTimer);
       resumeTimer = undefined;
@@ -3046,11 +3056,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
         cfg().get<number>("cpuHogThreshold", 60),
         countProviders(allViews),
         providerFilter,
-        enabledProviders().map((provider) =>
-          provider === "codex"
-            ? codexSnapshot.health
-            : { provider: "claude", state: "ready" as const, updatedAt: Date.now() / 1000 },
-        ),
+        enabledProviders().map((provider) => {
+          if (provider === "codex") return codexSnapshot.health;
+          const notice = automationGate.notice(); // Claude Code failed the compatibility check
+          return { provider: "claude", state: notice ? ("degraded" as const) : ("ready" as const), message: notice, updatedAt: Date.now() / 1000 };
+        }),
         views.length
           ? ""
           : enabledProviders().length === 0
@@ -3394,33 +3404,65 @@ export function activate(ctx: vscode.ExtensionContext): void {
   type FocusedTypeResult = TypeResult;
 
   /**
-   * Type `text` + Enter into the session whose tab is already active: (optionally
-   * bring VS Code forward,) focus the Claude input, then type in chunks
+   * Type `text` + Enter into the session whose tab the caller just showed by its
+   * index (tabFocus.ts): wait up to 1 s until it is the active tab of the active
+   * group, (optionally bring VS Code forward,) then type in chunks
    * (keystrokeTyping.ts): before every chunk and before Enter this window must be
    * focused, the session's tab active, VS Code frontmost and the Claude prompt
-   * input focused, else typing stops without Enter. `alive` aborts between steps.
-   * Shared by the typing sweep (activates VS Code, panel label match) and the
-   * remote keystroke path (no activation, strict match).
+   * input focused, else typing stops without Enter. When the first check finds the
+   * focus elsewhere, Claude Code's focus command runs once if that is safe
+   * (refocusPrompt). `alive` aborts between steps. Each attempt logs its path
+   * (promptFocus.ts). Shared by the typing sweep (activates VS Code, panel label
+   * match) and the remote keystroke path (no activation, strict match).
    */
   async function typeIntoFocusedSession(
     text: string,
     submitDelayMs: number | undefined,
     alive: () => boolean,
-    opts: { activate: boolean; tabActive: () => boolean },
+    opts: { activate: boolean; tabActive: () => boolean; label: string },
   ): Promise<FocusedTypeResult> {
-    const aborted: FocusedTypeResult = { ok: false, reason: "aborted", detail: "stopped" };
+    const done = (r: FocusedTypeResult): FocusedTypeResult => {
+      log(typingLine(opts.label, r));
+      return r;
+    };
+    if (!(await waitForActive(opts.tabActive))) {
+      return done({ ok: false, reason: "tab-mismatch", detail: "the session's tab did not become the active tab within 1 s" });
+    }
     if (opts.activate) {
       await activateEditorApp();
       await sleep(150);
     }
-    try {
-      await vscode.commands.executeCommand("claude-vscode.focus");
-    } catch {
-      /* ignore */
-    }
     await sleep(220);
-    if (!alive()) return aborted;
-    return typeIntoPrompt(text, { submitDelayMs: submitDelayMs ?? 150, alive, windowFocused, tabActive: opts.tabActive });
+    if (!alive()) return done({ ok: false, reason: "aborted", detail: "stopped" });
+    const refocus = (): Promise<string | undefined> => refocusPrompt(opts.tabActive);
+    return done(await typeIntoPrompt(text, { submitDelayMs: submitDelayMs ?? 150, alive, windowFocused, tabActive: opts.tabActive, refocus }));
+  }
+
+  /**
+   * Claude Code's focus command, only while it can do nothing but focus the target panel's prompt input
+   * (promptFocus.ts): the target Claude panel is the active editor, no text editor is active and no other
+   * Claude panel is visible. Then, once a visible Claude sidebar's focus retries are over, the target's
+   * group gets the keyboard focus back. Undefined once that ran, else why not.
+   */
+  async function refocusPrompt(targetActive: () => boolean): Promise<string | undefined> {
+    const group = vscode.window.tabGroups.activeTabGroup;
+    const active = group.activeTab;
+    const blocked = focusCommandBlocker({
+      targetActive: targetActive(),
+      claudePanel: active !== undefined && isClaudePanelTab(active),
+      textEditor: vscode.window.activeTextEditor !== undefined,
+      otherClaudePanels: vscode.window.tabGroups.all.filter((g) => g !== group && g.activeTab !== undefined && isClaudePanelTab(g.activeTab)).length,
+    });
+    if (blocked) return `${FOCUS_COMMAND} not run: ${blocked}`;
+    try {
+      await vscode.commands.executeCommand(FOCUS_COMMAND);
+      await sleep(FOCUS_SETTLE_MS);
+      if (!targetActive()) return `the session's tab is no longer active after ${FOCUS_COMMAND}`;
+      await focusTabGroup(group);
+    } catch (e) {
+      return `${FOCUS_COMMAND} failed: ${String(e)}`;
+    }
+    return undefined;
   }
 
   /**
@@ -3428,13 +3470,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
    * when typing is allowed (`remote.typeFallback`), the session's tab is this
    * window's one tab matching its title (labelsMatchStrict, truncated labels
    * included, no other listed session matching it), and this window is focused,
-   * i.e. VS Code is already frontmost (it is never activated). The tab is then made active and
-   * re-verified, and the typing osascript checks the frontmost app itself. Never
-   * prompts. `skip` = nothing was typed; only a failed keystroke is final.
+   * i.e. VS Code is already frontmost (it is never activated), and the automation gate lets
+   * remote typing through. The tab is then shown by its index and re-verified, and the
+   * typing osascript checks the frontmost app itself. Never prompts. `skip` = nothing
+   * was typed; only a failed keystroke is final.
    */
   async function typeIntoSession(v: SessionView, text: string): Promise<PathAttempt> {
     const skip = (reason: string, detail?: string): PathAttempt => ({ ok: false, skip: true, reason, detail });
     if (!remoteFlag("remote.typeFallback")) return skip("typing disabled (remote.typeFallback is off)");
+    const held = automationGate.blocker("remoteTyping");
+    if (held) return skip(`typing disabled (${held})`);
     if (process.platform !== "darwin") return skip("keystrokes need macOS");
     if (v.provider !== "claude" || !v.capabilities.bulkInput) return skip("this session has no typable Claude input");
     if (resumeActive) return skip("a typing sweep is running");
@@ -3444,13 +3489,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (!windowFocused()) return skip(TYPED_REASON["not-frontmost"], "this VS Code window is not focused");
     const s = sanitizeRemoteLine(text);
     if (!s.ok) return { ok: false, skip: false, reason: s.reason };
-    if (!tab.active) {
-      await focusTab(tab.gi, tab.ti);
-      await sleep(500);
-    }
-    const r = await typeIntoFocusedSession(s.line, undefined, () => !disposed && !resumeActive, {
+    const signal = automationGate.signal("remoteTyping");
+    await focusTab(tab.gi, tab.ti); // also when active: showing it moves the keyboard focus into the tab
+    const r = await typeIntoFocusedSession(s.line, undefined, () => !disposed && !resumeActive && !signal.aborted, {
       activate: false,
       tabActive: () => findSessionTab(v, rivals)?.active === true,
+      label: `remote ${v.key}`,
     });
     if (r.ok) return { ok: true };
     // Only a failed keystroke or typing stopped midway is final: every other reason typed nothing.
@@ -3507,7 +3551,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
    * (never overlaps, never double-types).
    */
   /** The resume sweep over `queue`: resumePrompt typed into each session, staggered (resumeAll, auto-resume). */
-  function startResumeSweep(queue: SessionView[]): void {
+  function startResumeSweep(queue: SessionView[], feature: Automation = "typingSweep"): void {
     const c = cfg();
     // Collapse newlines so a single resumePrompt value can never encode more
     // than one Return keystroke (osascript `keystroke` submits on each \n).
@@ -3516,14 +3560,21 @@ export function activate(ctx: vscode.ExtensionContext): void {
       staggerSec: Math.max(5, c.get<number>("resumeStaggerSeconds", 60)),
       doneLabel: "resume",
       autoType: c.get<boolean>("resumeAutoType", true),
+      feature,
     });
   }
 
   function startTypingSweep(
     queue: SessionView[],
     text: string,
-    opts: { staggerSec: number; doneLabel: string; submitDelayMs?: number; autoType?: boolean },
+    opts: { staggerSec: number; doneLabel: string; submitDelayMs?: number; autoType?: boolean; feature?: Automation },
   ): void {
+    const feature = opts.feature ?? "typingSweep";
+    const off = automationGate.blocker(feature);
+    if (off) {
+      vscode.window.showInformationMessage(`Claude Sessions: ${opts.doneLabel} is off: ${off}.`);
+      return;
+    }
     // These commands type Claude slash-commands into the focused Claude input.
     // Keep this guard even when the caller already filtered by capability so a
     // mixed-provider command argument can never receive unattended keystrokes.
@@ -3540,6 +3591,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     let typed = 0;
     let skipped = 0;
     resumeActive = true;
+    // Turning tab automation or the sweep's own setting off stops it at once (automationGate.ts).
+    const signal = automationGate.signal(feature);
+    const onAbort = (): void => stopResume(`Claude Sessions: ${opts.doneLabel} stopped: ${String(signal.reason)}.`);
+    signal.addEventListener("abort", onAbort, { once: true });
+    endSweep = () => signal.removeEventListener("abort", onAbort);
 
     // Self-chaining: each step is fully awaited before the next is scheduled, so
     // a slow step (jump + osascript) can never overlap another and type twice.
@@ -3564,16 +3620,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
         return;
       }
       try {
-        if (!tab.active) await focusTab(tab.gi, tab.ti);
-        await sleep(500);
+        const held = automationGate.blocker(feature); // right before the tab is shown
+        if (held) {
+          stopResume(`Claude Sessions: ${opts.doneLabel} stopped: ${held}.`);
+          return;
+        }
+        await focusTab(tab.gi, tab.ti); // by its index; also when active, so the keyboard focus moves into the tab
         if (!resumeActive) return;
 
         if (!auto) {
-          try {
-            await vscode.commands.executeCommand("claude-vscode.focus");
-          } catch {
-            /* ignore */
-          }
           vscode.window
             .showInformationMessage(`${opts.doneLabel} ${i}/${queue.length}: "${truncate(v.title, 40)}" · press Enter`, "Stop")
             .then((x) => {
@@ -3583,11 +3638,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
           const t = await typeIntoFocusedSession(text, opts.submitDelayMs, () => resumeActive, {
             activate: true,
             tabActive: () => findSessionTab(v, rivals)?.active === true,
+            label: `${opts.doneLabel} ${v.key}`,
           });
           if (!t.ok && t.reason === "aborted") return;
           if (!t.ok && (t.reason === "not-frontmost" || t.reason === "tab-mismatch")) {
-            skipped++;
-            log(`${opts.doneLabel} skip ${v.key}: ${t.detail}`);
+            skipped++; // logged by typeIntoFocusedSession
           } else {
             if (!t.ok) {
               if (t.reason === "accessibility") {
@@ -3787,6 +3842,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       }
       if (!value) return;
       startTypingSweep(queue, `/model ${value}`, {
+        feature: "typingSweep",
         staggerSec: Math.max(3, cfg().get<number>("commandStaggerSeconds", 8)),
         doneLabel: "set model",
         submitDelayMs: 500,
@@ -3811,6 +3867,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         `Claude Sessions: effortLevel set to "${level}"; sweeping /effort into ${queue.length} open session(s).`,
       );
       startTypingSweep(queue, `/effort ${level}`, {
+        feature: "typingSweep",
         staggerSec: Math.max(3, cfg().get<number>("commandStaggerSeconds", 8)),
         doneLabel: "set effort",
         submitDelayMs: 500,
@@ -4270,6 +4327,46 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // After a restart, show each limit-stopped Claude Code tab once so its process runs
   // again (wakeTabs.ts). Started before the first refresh, which updates its registry.
   const probes = nodeProbes();
+  // Every tab automation asks this gate right before it shows or moves a tab or types (automationGate.ts).
+  const automationOn: Record<Automation, () => boolean> = {
+    wake: () => cfg().get<boolean>("wakeDeadTabs", false) === true,
+    continuity: () => cfg().get<boolean>("continuityChannel", false) === true,
+    autoResume: () => autoResumeAll() || Object.values(autoResumeOverrides()).some((o) => o.enabled),
+    typingSweep: () => true,
+    remoteTyping: () => remoteFlag("remote.typeFallback"),
+  };
+  const automationGate = new AutomationGate({
+    log,
+    now: () => Date.now(),
+    masterOn: () => cfg().get<boolean>("tabAutomation", true) !== false,
+    featureOn: (a) => claudeEnabled() && automationOn[a](),
+    pressureLevel: probes.pressureLevel,
+    pulseStage: () => readPulseStage(Date.now()),
+    claudeCode: () => {
+      const cc = vscode.extensions.getExtension(CLAUDE_CODE_ID);
+      return cc ? { version: String((cc.packageJSON as { version?: unknown } | undefined)?.version ?? ""), active: cc.isActive } : undefined;
+    },
+    commands: () => vscode.commands.getCommands(true),
+    tabViews: () =>
+      vscode.window.tabGroups.all.flatMap((g) =>
+        g.tabs.flatMap((t) => {
+          const viewType = (t.input as { viewType?: unknown } | undefined)?.viewType;
+          return typeof viewType === "string" ? [{ label: t.label, viewType }] : [];
+        }),
+      ),
+    claudeTitles: () => lastAllViews.filter((v) => v.provider === "claude").map((v) => v.title),
+  });
+  void automationGate.checkCompat();
+  ctx.subscriptions.push(
+    vscode.extensions.onDidChange(() => void automationGate.checkCompat()), // a Claude Code update
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      automationGate.configChanged((setting) => e.affectsConfiguration(setting));
+      // Turning the wake on starts it without a restart (start() does nothing while it is off).
+      if (e.affectsConfiguration("claudeSessionMonitor.wakeDeadTabs") || e.affectsConfiguration("claudeSessionMonitor.enableClaude")) {
+        stages.safe("tab wake start", () => tabWaker?.start(true));
+      }
+    }),
+  );
   tabWaker = stages.safe("tab wake start", () => new TabWaker<TabMemo>({
     ...probes,
     enabled: () => allowed("wake") && claudeEnabled() && cfg().get<boolean>("wakeDeadTabs", false) === true,
@@ -4288,7 +4385,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
       return tab && isClaudePanelTab(tab) ? tab.label : undefined;
     },
     restoreTabs,
+    claudeTabLabels: () => vscode.window.tabGroups.all.flatMap((g) => g.tabs.filter(isClaudePanelTab).map((t) => t.label)),
     yieldTo: () => continuity?.pending() === true,
+    gate: automationGate.wakeGate("wake"),
   }));
   stages.safe("tab wake start", () => tabWaker?.start());
   ctx.subscriptions.push(
@@ -4321,6 +4420,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     activeTabOf: (group) => group.activeTab,
     reveal: revealTab,
     focusGroup: focusTabGroup,
+    gate: automationGate.wakeGate("continuity"),
   }));
   ctx.subscriptions.push({ dispose: () => continuity?.dispose() });
 

@@ -188,3 +188,50 @@ describe("nothingTyped", () => {
     expect(nothingTyped("keystroke")).toBe(false);
   });
 });
+
+describe("the refocus step", () => {
+  /** A target whose refocus step is logged into `calls` and answers with `refused` (undefined: it ran). */
+  const refocusing = (calls: string[], refused?: string) =>
+    target({
+      refocus: async () => {
+        calls.push("refocus");
+        return refused;
+      },
+    });
+
+  it("is not tried while the prompt input already has the focus", async () => {
+    const { deps, calls } = fake(() => PROMPT);
+    expect(await typeIntoPrompt("resume", refocusing(calls), deps)).toEqual({ ok: true });
+    expect(calls).toEqual(["focus", "type resume", "sleep 150", "focus", "return"]);
+  });
+
+  it("runs once when the first check finds the focus elsewhere; typing follows once the prompt input has it", async () => {
+    const { deps, calls } = fake((n) => (n === 1 ? EDITOR : PROMPT));
+    expect(await typeIntoPrompt("resume", refocusing(calls), deps)).toEqual({ ok: true, refocused: true });
+    expect(calls).toEqual(["focus", "refocus", "focus", "type resume", "sleep 150", "focus", "return"]);
+  });
+
+  it("when it may not run, nothing is typed and the result says why", async () => {
+    const { deps, calls } = fake(() => EDITOR);
+    const r = await typeIntoPrompt("resume", refocusing(calls, "claude-vscode.focus not run: a text editor is active"), deps);
+    expect(r).toMatchObject({ ok: false, reason: "not-prompt" });
+    expect(r.ok ? "" : r.detail).toContain("Editor content");
+    expect(r.ok ? "" : r.detail).toContain("; claude-vscode.focus not run: a text editor is active");
+    expect(r.refocused).toBeUndefined();
+    expect(calls).toEqual(["focus", "refocus"]);
+  });
+
+  it("when the focus is still elsewhere after it, nothing is typed", async () => {
+    const { deps, calls } = fake(() => TERMINAL);
+    const r = await typeIntoPrompt("resume", refocusing(calls), deps);
+    expect(r).toMatchObject({ ok: false, reason: "not-prompt", refocused: true });
+    expect(calls).toEqual(["focus", "refocus", "focus"]);
+  });
+
+  it("only the first check may run it: a click elsewhere later stops typing as before", async () => {
+    const { deps, calls } = fake((n) => (n === 1 ? PROMPT : TERMINAL));
+    const r = await typeIntoPrompt("x".repeat(250), refocusing(calls), deps);
+    expect(r).toMatchObject({ ok: false, reason: "interrupted" });
+    expect(calls).toEqual(["focus", `type ${"x".repeat(200)}`, "focus"]);
+  });
+});

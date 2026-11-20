@@ -458,6 +458,12 @@
           "default": false,
           "description": "When Claude sessions hit the usage limit (or the Claude 5h window is at 99%+), automatically run the staggered resume sweep ~90s after the window resets. A remote `autoResume` command can switch a single limited session in or out of the sweep."
         },
+        "claudeSessionMonitor.tabAutomation": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Let the monitor show, move and type into tabs on its own: limit-stopped tab wakes, continuity requests, resume and command sweeps, auto-resume after a limit reset and remote typing. Each of them also needs its own setting. Turning this off stops all of them at once, including a wake, a tab restore or a sweep already in progress."
+        },
         "claudeSessionMonitor.wakeDeadTabs": {
           "type": "boolean",
           "default": false,
@@ -468,7 +474,7 @@
           "type": "boolean",
           "default": false,
           "scope": "application",
-          "markdownDescription": "Show the dormant Claude Code tabs that the `continuity` daemon asks this window for, so their process runs again. After VS Code restarts, a restored Claude Code tab gets its process only once it is shown; the daemon (part of the `~/.claude` tooling, not of this extension) decides which of them are owed a resume and in which order, and writes requests to `~/.claude/state/continuity/requests.json`. Every 10 s the monitor reads the ones addressed to this window and, from 60 s after the window starts, makes each session's existing tab (the Claude Code tab whose label is the request's title) the active tab of its group, waits for the process and puts your tabs and focus back unless you moved or are typing in the meantime. It never creates a tab: a request whose tab is gone gets `no-tab`. One tab per step, at least 10 s apart, only while this window is unfocused or input has been idle for 20 s and not under critical memory pressure, ahead of the limit-stopped tabs of `wakeDeadTabs`; at most two tries per request. A heartbeat with each result goes to `~/.claude/state/continuity/ext/`. Nothing is typed or sent into a session. Independent of `wakeDeadTabs`; without the daemon nothing is shown."
+          "markdownDescription": "Show the dormant Claude Code tabs that the `continuity` daemon asks this window for, so their process runs again. After VS Code restarts, a restored Claude Code tab gets its process only once it is shown; the daemon (part of the `~/.claude` tooling, not of this extension) decides which of them are owed a resume and in which order, and writes requests to `~/.claude/state/continuity/requests.json`. Every 10 s the monitor reads the ones addressed to this window and, from 60 s after the window starts, makes each session's existing tab (the Claude Code tab whose label is the request's title) the active tab of its group, waits for the process and puts your tabs and focus back unless you moved or are typing in the meantime. It never creates a tab: a request whose tab is gone gets `no-tab`. One tab per step, at least 10 s apart, only while this window is unfocused or input has been idle for 20 s and memory is not under pressure, at most 3 tabs per 5 minutes together with the `wakeDeadTabs` wakes, ahead of the limit-stopped tabs of `wakeDeadTabs`; at most two tries per request. A heartbeat with each result goes to `~/.claude/state/continuity/ext/`. Nothing is typed or sent into a session. Independent of `wakeDeadTabs`; without the daemon nothing is shown."
         },
         "claudeSessionMonitor.restartGuard": {
           "type": "boolean",

@@ -2118,8 +2118,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
       autoResumeTimer = undefined;
       autoResumeAt = 0;
       if (disposed || !claudeEnabled() || resumeActive) return;
-      const queue = sweepQueue(lastAllViews, autoResumeOverrides(), autoResumeAll());
-      if (!queue.length) return;
+      const queue = inThisWindow(sweepQueue(lastAllViews, autoResumeOverrides(), autoResumeAll()));
+      if (!queue.length) return; // every window sweeps its own sessions; one without any stays silent
       vscode.window.showInformationMessage("Claude Sessions: limit reset — starting auto resume sweep.");
       startResumeSweep(queue);
     }, delay);
@@ -3426,6 +3426,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     return lastAllViews.filter((o) => o.sessionId !== v.sessionId).flatMap((o) => matchCandidates(o));
   }
 
+  /** The sessions among `views` whose one matching tab (findSessionTab) is in this window: the typing sweep's queue. */
+  function inThisWindow(views: SessionView[]): SessionView[] {
+    return views.filter((v) => findSessionTab(v, rivalLabels(v)) !== null);
+  }
+
   /**
    * Remote path (a): write `text` + Return straight into the VS Code terminal
    * that hosts the session (process-tree match first, else the one terminal
@@ -3486,9 +3491,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     // These commands type Claude slash-commands into the focused Claude input.
     // Keep this guard even when the caller already filtered by capability so a
     // mixed-provider command argument can never receive unattended keystrokes.
-    queue = queue.filter((v) => v.provider === "claude" && v.capabilities.bulkInput);
+    // Only sessions whose one matching tab is in this window are queued.
+    queue = inThisWindow(queue.filter((v) => v.provider === "claude" && v.capabilities.bulkInput));
     if (!queue.length) {
-      vscode.window.showInformationMessage(`Claude Sessions: no open sessions to ${opts.doneLabel}.`);
+      vscode.window.showInformationMessage(`Claude Sessions: no open sessions in this window to ${opts.doneLabel}.`);
       return;
     }
     stopResume();
@@ -3512,8 +3518,17 @@ export function activate(ctx: vscode.ExtensionContext): void {
         return;
       }
       const v = queue[i++];
+      const rivals = rivalLabels(v);
+      const tab = findSessionTab(v, rivals);
+      if (!tab) {
+        // Its tab closed, or no longer is the one match, since the sweep began: skip it, never prompt.
+        skipped++;
+        log(`${opts.doneLabel} skip ${v.key}: ${NO_TAB_MESSAGE}`);
+        if (resumeActive) resumeTimer = setTimeout(runOne, 0); // nothing was shown or typed
+        return;
+      }
       try {
-        await jumpToSession(v);
+        if (!tab.active) await focusTab(tab.gi, tab.ti);
         await sleep(500);
         if (!resumeActive) return;
 
@@ -3531,10 +3546,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         } else {
           const t = await typeIntoFocusedSession(text, opts.submitDelayMs, () => resumeActive, {
             activate: true,
-            tabActive: () => {
-              const a = activeTabLabel();
-              return !!a && matchCandidates(v).some((c) => labelsMatch(a, c));
-            },
+            tabActive: () => findSessionTab(v, rivals)?.active === true,
           });
           if (!t.ok && t.reason === "aborted") return;
           if (!t.ok && (t.reason === "not-frontmost" || t.reason === "tab-mismatch")) {
@@ -3745,8 +3757,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
       });
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.setEffortAll", async () => {
-      const queue = lastAllViews.filter(
-        (v) => v.provider === "claude" && v.capabilities.bulkInput && groupOf(v) !== "ended",
+      const queue = inThisWindow(
+        lastAllViews.filter((v) => v.provider === "claude" && v.capabilities.bulkInput && groupOf(v) !== "ended"),
       );
       const level = await vscode.window.showQuickPick(["low", "medium", "high", "xhigh", "max"], {
         placeHolder: "Reasoning effort to set for every open session",
@@ -4946,10 +4958,6 @@ function debounce(fn: () => void, ms: number): CancelableDebounced {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-function activeTabLabel(): string | undefined {
-  return vscode.window.tabGroups.activeTabGroup?.activeTab?.label;
 }
 
 function activateEditorApp(): Promise<void> {

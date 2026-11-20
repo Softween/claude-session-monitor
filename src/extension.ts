@@ -31,6 +31,8 @@ import { stageGuard } from "./safeStage";
 import { DebugLog } from "./debugLog";
 import { saveErrors } from "./errorRegistry";
 import { SUMMARY_EVERY_SEC, SessionDrops, liveKeys, sessionSummary } from "./sessionLog";
+import { DurationRing, HEALTH_EVERY_MS, removeHealth, timed, writeHealth, type HealthDeps } from "./health";
+import { OverseerBeat, nodeBeatDeps, overseerBin } from "./overseerBeat";
 import { REFRESH_GAP_MS, codexSignature, monitorEventMatters, projectsEventMatters, throttle } from "./refreshGate";
 import { sendToSession } from "./peerSend";
 import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, type ActiveCandidate } from "./activeAccount";
@@ -194,10 +196,9 @@ import {
 /** The debug log, ~/.claude/session-monitor/csm-debug.log: one JSON line per message, from every window (debugLog.ts). */
 const LOG_FILE = `${MONITOR_DIR}/csm-debug.log`;
 const debugLog = new DebugLog({ file: LOG_FILE, pid: process.pid, lock: (file) => acquireSwitchLock(file) });
-/** The folder of errors.json (errorRegistry.ts). */
+/** The windows' health files (health.ts) and errors.json (errorRegistry.ts). */
 const HEALTH_DIR = path.join(MONITOR_DIR, "health");
 const ERRORS_FILE = path.join(HEALTH_DIR, "errors.json");
-const OBSERVE_EVERY_MS = 30_000;
 
 function ensurePrivateDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -2015,6 +2016,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastSessLog = 0;
   const sessionDrops = new SessionDrops(); // one log line when 5+ live sessions are gone within 60 s
   let lastRefreshMs = 0; // start of the last refresh from any path; timer, watcher and Codex poll refreshes wait REFRESH_GAP_MS after it
+  const refreshMs = new DurationRing(); // the recent refresh durations, for the health file's p95
   let tokenUsage: TokenUsage | null = null;
   let officialUsage: OfficialUsage | null = null;
   let officialUsageAcct: string | null = null; // account officialUsage was fetched for (the active card only shows its own)
@@ -3189,7 +3191,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
     );
   }
 
+  /** Every refresh is timed: the health file reports the 95th percentile of the recent ones (health.ts). */
   function refresh(): void {
+    timed(refreshMs, refreshOnce);
+  }
+
+  function refreshOnce(): void {
     if (disposed) return;
     lastRefreshMs = Date.now();
     const now = Date.now() / 1000;
@@ -4318,11 +4325,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
   ctx.subscriptions.push({ dispose: () => continuity?.dispose() });
 
   // Ask before an extension restart stops every session in this window (restartGuard.ts).
-  if (allowed("restartGuard")) stages.safe("restart guard start", () => activateRestartGuard(ctx, {
+  const restartGuard = allowed("restartGuard") ? stages.safe("restart guard start", () => activateRestartGuard(ctx, {
     log,
     focusGroup: focusTabGroup,
     idleMs: probes.idleMs,
-  }));
+  })) : undefined;
   // The commands of a feature observer mode keeps off say so instead of "command not found".
   for (const { command, feature } of observer.offCommands()) {
     ctx.subscriptions.push(vscode.commands.registerCommand(command, () => observer.actionAllowed(feature)));
@@ -4330,18 +4337,49 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   stages.safe("first refresh", refresh);
 
-  // New occurrences of the errors the stage guard caught go to errors.json every 30 s and at dispose (errorRegistry.ts).
+  // Now, every 30 s and at dispose: new occurrences of the errors the stage guard caught go to errors.json
+  // (errorRegistry.ts), this window's health file is rewritten (health.ts), and one window sends the
+  // overseer heartbeat for all of them (overseerBeat.ts; only where overseer is installed).
   const saveStageErrors = (): void => {
     const records = stages.unsaved();
     const deps = { file: ERRORS_FILE, shared: () => allowed("sharedFiles"), lock: (file: string) => acquireSwitchLock(file), read: readText, write: writePrivateTextAtomic };
     if (records.length && saveErrors(records, version, win, deps)) stages.saved(records);
   };
-  stages.safe("error registry", saveStageErrors);
-  const observeTimer = setInterval(() => stages.safe("error registry", saveStageErrors), OBSERVE_EVERY_MS);
+  const health: HealthDeps = {
+    dir: HEALTH_DIR,
+    win,
+    pid: process.pid,
+    version,
+    nowMs: () => Date.now(),
+    enabled: () => ({
+      sessions: claudeEnabled() || codexEnabled(),
+      limits: claudeEnabled(),
+      remote: remoteBridge?.running === true,
+      autoResume: allowed("autoResume") && claudeEnabled() && autoResumeAll(),
+      continuity: allowed("continuity") && claudeEnabled() && cfg().get<boolean>("continuityChannel", false) === true,
+      wake: allowed("wake") && claudeEnabled() && cfg().get<boolean>("wakeDeadTabs", false) === true,
+      restartGuard: allowed("restartGuard") && cfg().get<boolean>("restartGuard", false) === true,
+    }),
+    failures: () => stages.lastFailures(),
+    refresh: refreshMs,
+    guardArmed: () => restartGuard?.armed() === true,
+    shared: () => allowed("sharedFiles"),
+    write: writePrivateTextAtomic,
+    remove: (file) => fs.rmSync(file, { force: true }),
+  };
+  const overseer = new OverseerBeat(nodeBeatDeps(HEALTH_DIR, overseerBin(), () => allowed("sharedFiles"), log));
+  const observe = (): void => {
+    stages.safe("error registry", saveStageErrors);
+    stages.safe("health", () => writeHealth(health));
+    void overseer.tick().catch((e: unknown) => stages.fail("overseer", e));
+  };
+  observe();
+  const observeTimer = setInterval(observe, HEALTH_EVERY_MS);
   ctx.subscriptions.push({
     dispose: () => {
       clearInterval(observeTimer);
       stages.safe("error registry", saveStageErrors);
+      stages.safe("health", () => removeHealth(health));
     },
   });
 }

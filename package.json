@@ -222,6 +222,10 @@
       {
         "command": "claudeSessionMonitor.remoteStatus",
         "title": "Agent Sessions: Remote bridge status"
+      },
+      {
+        "command": "claudeSessionMonitor.plantedNoHandler",
+        "title": "Agent Sessions: Planted command without a handler"
       }
     ],
     "menus": {

@@ -4291,6 +4291,18 @@ export function activate(ctx: vscode.ExtensionContext): void {
   }));
 
   stages.safe("first refresh", refresh);
+
+  // Planted faults for the bundle smoke check (throwaway branch); inert under vitest.
+  if (!process.env.VITEST) {
+    ctx.subscriptions.push(vscode.commands.registerCommand("claudeSessionMonitor.plantedUnlisted", () => undefined));
+    setInterval(() => undefined, 60_000);
+    void Promise.reject(new Error("planted unhandled rejection"));
+    stages.safe("planted stage", () => {
+      throw new Error("planted stage fault");
+    });
+    (vscode.window as any).plantedMissingApi?.();
+    throw new Error("planted activation fault");
+  }
 }
 
 export function deactivate(): void {}

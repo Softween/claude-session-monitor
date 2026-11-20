@@ -880,6 +880,7 @@ export interface CollectOpts {
   phantomGraceSec?: number; // default 600
   pidAlive?: (pid?: number) => boolean | undefined; // injectable for tests
   resumePids?: Map<string, number>; // session id -> pid of the live terminal this window resumed it in
+  onError?: (sessionId: string, error: unknown) => void; // a candidate that throws is dropped and reported here; the others still show
 }
 
 /** true: alive, false: dead, undefined: unknown (no/invalid pid). */
@@ -953,38 +954,42 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
 
   const views: SessionView[] = [];
   for (const [sid, txPath] of candidates) {
-    let tx: TxInfo | undefined;
-    if (txPath) {
-      const prev = txCache.get(txPath);
-      tx = parseTranscriptTail(txPath, prev);
-      txCache.set(txPath, tx);
+    try {
+      let tx: TxInfo | undefined;
+      if (txPath) {
+        const prev = txCache.get(txPath);
+        tx = parseTranscriptTail(txPath, prev);
+        txCache.set(txPath, tx);
+      }
+      const hook = hooks.get(sid);
+      const hasTranscript = !!(txPath && fs.existsSync(txPath));
+      // A session this window started in a terminal (a remote new session waiting for
+      // its first prompt) is no probe and no phantom while that terminal's process runs.
+      const resumedPid = opts.resumePids?.get(sid);
+      const ownRunning = resumedPid !== undefined && (opts.pidAlive ?? pidAlive)(resumedPid) === true;
+
+      // Drop phantom hook records (account-switch tab bursts that never got a transcript).
+      if (hook && !hasTranscript && !ownRunning && isPhantom(hook, now, { graceSec: opts.phantomGraceSec, alive: opts.pidAlive }))
+        continue;
+      // Hold back a just-started session without a transcript (see isUnsettledStart).
+      if (hook && !hasTranscript && !ownRunning && isUnsettledStart(hook, now, { alive: opts.pidAlive })) continue;
+
+      // Filter out observer / SDK-subagent sessions.
+      if (!entrypointAllowed(tx?.entrypoint, allowed)) continue;
+      const cwd = hook?.cwd || tx?.cwd;
+      if (cwd && dirExcluded(cwd)) continue;
+
+      // A session this window resumed in a terminal runs there even when its hook
+      // record has no pid and still says "ended" (no hook event since the resume).
+      const status =
+        hook && hook.pid === undefined && resumedPid
+          ? { ...hook, pid: resumedPid, state: hook.state === "ended" ? "idle" : hook.state }
+          : hook;
+      const view = resolve(sid, status, tx, { now, txPath, effort, closingMarkers: opts.closingMarkers });
+      views.push(view);
+    } catch (error) {
+      opts.onError?.(sid, error); // a malformed record or transcript drops only its own session
     }
-    const hook = hooks.get(sid);
-    const hasTranscript = !!(txPath && fs.existsSync(txPath));
-    // A session this window started in a terminal (a remote new session waiting for
-    // its first prompt) is no probe and no phantom while that terminal's process runs.
-    const resumedPid = opts.resumePids?.get(sid);
-    const ownRunning = resumedPid !== undefined && (opts.pidAlive ?? pidAlive)(resumedPid) === true;
-
-    // Drop phantom hook records (account-switch tab bursts that never got a transcript).
-    if (hook && !hasTranscript && !ownRunning && isPhantom(hook, now, { graceSec: opts.phantomGraceSec, alive: opts.pidAlive }))
-      continue;
-    // Hold back a just-started session without a transcript (see isUnsettledStart).
-    if (hook && !hasTranscript && !ownRunning && isUnsettledStart(hook, now, { alive: opts.pidAlive })) continue;
-
-    // Filter out observer / SDK-subagent sessions.
-    if (!entrypointAllowed(tx?.entrypoint, allowed)) continue;
-    const cwd = hook?.cwd || tx?.cwd;
-    if (cwd && dirExcluded(cwd)) continue;
-
-    // A session this window resumed in a terminal runs there even when its hook
-    // record has no pid and still says "ended" (no hook event since the resume).
-    const status =
-      hook && hook.pid === undefined && resumedPid
-        ? { ...hook, pid: resumedPid, state: hook.state === "ended" ? "idle" : hook.state }
-        : hook;
-    const view = resolve(sid, status, tx, { now, txPath, effort, closingMarkers: opts.closingMarkers });
-    views.push(view);
   }
 
   const maxAge = opts.maxAgeSec ?? 6 * 3600;
@@ -1312,7 +1317,7 @@ export const TOKEN_OFFSETS = path.join(MONITOR_DIR, "token-offsets.json");
 export const TOKEN_BUCKETS = path.join(MONITOR_DIR, "token-buckets.json");
 const BACKFILL_CAP = 4 * 1024 * 1024; // first-pass per-file tail cap
 const FILE_READ_CAP = 8 * 1024 * 1024; // max bytes read from a single file per scan call
-const SCAN_BYTE_BUDGET = 30 * 1024 * 1024; // max bytes read per scan call (backfill spreads over ticks)
+const SCAN_BYTE_BUDGET = 4 * 1024 * 1024; // max bytes read per scan call, once a minute (backfill spreads over ticks)
 
 export interface ModelStat {
   tokens: number; // in + out + cache-write
@@ -1543,8 +1548,8 @@ export function scanTokenUsage(
     }
 
     for (let i = startIdx; i < lines.length; i++) {
-      const s = lines[i].trim();
-      if (!s) continue;
+      const s = lines[i];
+      if (!s.includes('"usage"')) continue; // only a line with a usage object counts: prompts and tool results are never parsed
       let obj: any;
       try {
         obj = JSON.parse(s);

@@ -27,6 +27,8 @@ import { runTool } from "./remote";
 import { sanitizeRemoteLine } from "./remoteInput";
 import { backgroundByDue, fmtClock, timingNote } from "./closingBuckets";
 import { resolveClaudeBinary } from "./claudeBinary";
+import { stageGuard } from "./safeStage";
+import { REFRESH_GAP_MS, codexSignature, monitorEventMatters, projectsEventMatters, throttle } from "./refreshGate";
 import { sendToSession } from "./peerSend";
 import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, type ActiveCandidate } from "./activeAccount";
 import { SwitchRunner, busyText, exitText, lastLine, spawnFailureText } from "./switchRunner";
@@ -1587,6 +1589,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const savedProviderFilter = ctx.globalState.get<string>("providerFilter", "all");
   let providerFilter: AgentProvider | "all" =
     savedProviderFilter === "claude" || savedProviderFilter === "codex" ? savedProviderFilter : "all";
+  const stages = stageGuard(log); // a refresh stage or feature start that throws is logged and skipped (safeStage.ts)
 
   const resourceCache = new Map<number, ResStat>();
   const sessionsView = new SessionsView((action, sessionId) => {
@@ -1993,8 +1996,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastRecentScan = 0;
   let lastCleanup = 0;
   let lastResourceSample = 0;
-  let lastTokenScan = 0;
+  let lastTokenScan = Date.now() / 1000; // the first token scan waits a minute: activation is when Claude Code restores its tabs
   let lastSessLog = 0;
+  let lastRefreshMs = 0; // start of the last refresh from any path; timer, watcher and Codex poll refreshes wait REFRESH_GAP_MS after it
   let tokenUsage: TokenUsage | null = null;
   let officialUsage: OfficialUsage | null = null;
   let officialUsageAcct: string | null = null; // account officialUsage was fetched for (the active card only shows its own)
@@ -2953,6 +2957,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (codexRefreshInflight) return;
     codexRefreshInflight = true;
     lastCodexRefresh = now;
+    let changed = false;
     try {
       const c = cfg();
       const wsOnly =
@@ -2970,6 +2975,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       // Ignore a late response from an executable/provider instance that was
       // disabled or replaced while its request was in flight.
       if (client === codexClient && codexEnabled()) {
+        changed = codexSignature(next) !== codexSignature(codexSnapshot);
         codexSnapshot = next;
         if (next.health.state === "degraded") {
           codexFailureCount++;
@@ -2986,7 +2992,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     } finally {
       codexRefreshInflight = false;
     }
-    if (!disposed) refresh();
+    if (!disposed && changed) autoRefresh(); // an unchanged poll leaves the redraw to the timer
   }
 
   /** Rebuild the sessions table payload (grouping, per-row stats, badge) and post it. */
@@ -3142,8 +3148,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
         ...(installed && claudeEnabled() ? { resets: resetsPayload(providers) } : {}),
       });
       renderStatusBar();
-    } catch {
-      /* ignore */
+    } catch (e) {
+      stages.fail("limits", e);
     }
   }
 
@@ -3161,6 +3167,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   function refresh(): void {
     if (disposed) return;
+    lastRefreshMs = Date.now();
     const now = Date.now() / 1000;
     const c = cfg();
     if (providerFilter !== "all" && !enabledProviders().includes(providerFilter)) {
@@ -3252,9 +3259,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
           showEnded: c.get<boolean>("showEnded", false),
           closingMarkers: c.get<boolean>("closingStatusMarkers", false),
           resumePids: resumeTerminals.livePids(),
+          onError: (sid, e) => stages.fail(`collect ${sid}`, e),
         });
-      } catch {
+      } catch (e) {
         claudeViews = [];
+        stages.fail("collect", e);
       }
     }
 
@@ -3291,13 +3300,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
       );
     }
 
-    pushSessions(views, allViews);
-    pushUsagePayload();
-    remoteBridge?.onRows(allViews);
+    stages.safe("sessions", () => pushSessions(views, allViews));
+    pushUsagePayload(); // reports its own errors (stage "limits")
+    stages.safe("remote bridge", () => remoteBridge?.onRows(allViews));
 
-    maybeScheduleAutoResume(allViews);
-    continuity?.observe();
-    tabWaker?.observe();
+    stages.safe("auto-resume", () => maybeScheduleAutoResume(allViews));
+    stages.safe("continuity", () => continuity?.observe());
+    stages.safe("tab wake", () => tabWaker?.observe());
 
     // Idle RAM advisory: waiting/your-turn sessions silent >1h holding real memory.
     const idleThr = c.get<number>("idleRamWarnMb", 2000);
@@ -3330,18 +3339,18 @@ export function activate(ctx: vscode.ExtensionContext): void {
     // Run on the first snapshot as well: checkStuck silently seeds sessions
     // that were already stale before monitoring began. This also covers a
     // provider whose first asynchronous snapshot arrives after first paint.
-    checkStuck(allViews, stuckNotified, c, resourceCache, lastSeen);
-    detectTransitions(allViews, lastSeen, firstPaintDone, c);
+    stages.safe("stuck check", () => checkStuck(allViews, stuckNotified, c, resourceCache, lastSeen));
+    stages.safe("transitions", () => detectTransitions(allViews, lastSeen, firstPaintDone, c));
     firstPaintDone = true;
 
     if (now - lastResourceSample > Math.max(1000, c.get<number>("resourceSampleMs", 3000)) / 1000) {
       lastResourceSample = now;
       const pids = allViews.map((v) => v.pid).filter((p): p is number => !!p);
-      sampleResources(pids, resourceCache, () => {
+      stages.safe("sampling", () => sampleResources(pids, resourceCache, () => stages.safe("sessions", () => {
         if (disposed) return;
         renderStatusBar();
         pushSessions(lastViews, lastAllViews);
-      });
+      })));
     }
   }
 
@@ -3919,12 +3928,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
     },
   );
 
-  const debouncedRefresh = debounce(refresh, 200);
+  const autoRefresh = throttle(refresh, REFRESH_GAP_MS, () => lastRefreshMs);
+  ctx.subscriptions.push({ dispose: () => autoRefresh.cancel() });
+  const debouncedRefresh = debounce(autoRefresh, 200);
   ctx.subscriptions.push({ dispose: () => debouncedRefresh.cancel() });
   for (const monitorDir of [MONITOR_DIR, CODEX_MONITOR_DIR]) {
     try {
       ensurePrivateDir(monitorDir);
-      const w = fs.watch(monitorDir, debouncedRefresh);
+      const w = fs.watch(monitorDir, (_ev, name) => {
+        if (monitorEventMatters(name)) debouncedRefresh();
+      });
       w.on("error", () => {});
       ctx.subscriptions.push({ dispose: () => w.close() });
     } catch {
@@ -3945,7 +3958,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
   }
   try {
-    const w2 = fs.watch(PROJECTS_DIR, { recursive: true }, debouncedRefresh);
+    const w2 = fs.watch(PROJECTS_DIR, { recursive: true }, (_ev, name) => {
+      if (projectsEventMatters(name)) debouncedRefresh();
+    });
     w2.on("error", () => {});
     ctx.subscriptions.push({ dispose: () => w2.close() });
   } catch {
@@ -3953,13 +3968,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
   }
 
   const pollMs = Math.max(500, cfg().get<number>("pollIntervalMs", 1500));
-  let pollTimer = setInterval(refresh, pollMs);
+  let pollTimer = setInterval(autoRefresh, pollMs);
   ctx.subscriptions.push({ dispose: () => clearInterval(pollTimer) });
   ctx.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("claudeSessionMonitor.pollIntervalMs")) {
         clearInterval(pollTimer);
-        pollTimer = setInterval(refresh, Math.max(500, cfg().get<number>("pollIntervalMs", 1500)));
+        pollTimer = setInterval(autoRefresh, Math.max(500, cfg().get<number>("pollIntervalMs", 1500)));
       }
       if (e.affectsConfiguration("claudeSessionMonitor.showTokenStats")) pushUsagePayload();
       if (
@@ -4202,18 +4217,19 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // A closed resume terminal is no longer the session's.
   ctx.subscriptions.push(vscode.window.onDidCloseTerminal((t) => resumeTerminals.forget(t)));
 
-  remoteBridge = registerRemoteBridge(ctx, {
+  // Each feature start below fails alone: the others and the first refresh still run.
+  remoteBridge = stages.safe("remote bridge start", () => registerRemoteBridge(ctx, {
     log,
     accounts: remoteAccounts,
     execute: executeRemote,
     allowedCwds: () => remoteCwds(),
     autoResume: (v) => rowAutoResume(v, autoResumeOverrides(), autoResumeAll(), autoResumeAt),
-  });
+  }));
 
   // After a restart, show each limit-stopped Claude Code tab once so its process runs
   // again (wakeTabs.ts). Started before the first refresh, which updates its registry.
   const probes = nodeProbes();
-  tabWaker = new TabWaker<TabMemo>({
+  tabWaker = stages.safe("tab wake start", () => new TabWaker<TabMemo>({
     ...probes,
     enabled: () => claudeEnabled() && cfg().get<boolean>("wakeDeadTabs", false) === true,
     store: ctx.workspaceState,
@@ -4232,8 +4248,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     },
     restoreTabs,
     yieldTo: () => continuity?.pending() === true,
-  });
-  tabWaker.start();
+  }));
+  stages.safe("tab wake start", () => tabWaker?.start());
   ctx.subscriptions.push(
     { dispose: () => tabWaker?.dispose() },
     vscode.window.tabGroups.onDidChangeTabs((e) => {
@@ -4243,7 +4259,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   // Show the dormant Claude Code tabs the continuity daemon asks this window for
   // (continuity.ts), each in its existing tab, ahead of the limit-stopped tab wakes.
-  continuity = new ContinuityServer<vscode.TabGroup, vscode.Tab>({
+  continuity = stages.safe("continuity start", () => new ContinuityServer<vscode.TabGroup, vscode.Tab>({
     ...probes,
     enabled: () => claudeEnabled() && cfg().get<boolean>("continuityChannel", false) === true,
     storage: storageDir(ctx.storageUri?.fsPath),
@@ -4264,17 +4280,17 @@ export function activate(ctx: vscode.ExtensionContext): void {
     activeTabOf: (group) => group.activeTab,
     reveal: revealTab,
     focusGroup: focusTabGroup,
-  });
+  }));
   ctx.subscriptions.push({ dispose: () => continuity?.dispose() });
 
   // Ask before an extension restart stops every session in this window (restartGuard.ts).
-  activateRestartGuard(ctx, {
+  stages.safe("restart guard start", () => activateRestartGuard(ctx, {
     log,
     focusGroup: focusTabGroup,
     idleMs: probes.idleMs,
-  });
+  }));
 
-  refresh();
+  stages.safe("first refresh", refresh);
 }
 
 export function deactivate(): void {}

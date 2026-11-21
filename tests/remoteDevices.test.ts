@@ -23,7 +23,7 @@ import {
 
 const T0 = Date.UTC(2026, 10, 21, 12, 0, 0);
 const DAY = 86_400_000;
-const CUTOFF = Date.parse("2026-11-22T00:00:00Z");
+const CUTOFF = Date.parse("2026-11-21T12:00:00Z");
 const IPHONE = "11111111-1111-4111-8111-111111111111";
 const IPAD = "22222222-2222-4222-8222-222222222222";
 const NEW = "33333333-3333-4333-8333-333333333333";
@@ -289,9 +289,9 @@ describe("DeviceGate: first run", () => {
     let release: () => void = () => undefined;
     const slow = gate({
       relay: () =>
-        new Promise<unknown>((resolve) => (release = () => resolve(tokens({ id: IPHONE, name: "iPhone", createdAt: T0 }, { id: NEW, name: "Later", createdAt: T0 })))),
+        new Promise<unknown>((resolve) => (release = () => resolve(tokens({ id: IPHONE, name: "iPhone", createdAt: CUTOFF - DAY }, { id: NEW, name: "Later", createdAt: CUTOFF - DAY })))),
     });
-    const fast = gate({ relay: async () => tokens({ id: IPHONE, name: "iPhone", createdAt: T0 }) });
+    const fast = gate({ relay: async () => tokens({ id: IPHONE, name: "iPhone", createdAt: CUTOFF - DAY }) });
     const slowRun = slow.g.migrate(slow.lookup);
     await fast.g.migrate(fast.lookup);
     release();
@@ -349,7 +349,7 @@ describe("the notification and the modal", () => {
 
   it("shows the pairing time and the id's first 8 characters before the name, and says when an allowed device has the same name", async () => {
     warn.mockResolvedValue("Review…");
-    const dated: PairedDevice = { id: NEW, name: 'iPhone 15", paired with the relay on 3/2/2025, 9:41 AM?.', pairedAt: T0 };
+    const dated: PairedDevice = { id: NEW, name: "iPhone 15, paired with the relay on 3/2/2025, 9:41 AM?.", pairedAt: T0 };
     await askOnThisMac(dated, []);
     await askOnThisMac(dated, [IPHONE]);
     await askOnThisMac(dated, [IPHONE, IPAD]);
@@ -384,7 +384,8 @@ describe("device names and the relay's list", () => {
     expect(deviceName("i​Phone‍﻿­⁠͸\ud800 15")).toBe("iPhone 15");
     expect(deviceName("Ali's   \t iPad 　 mini ")).toBe("Ali's iPad mini");
     // A name that reads like a second pairing date once its line separators break the prompt.
-    expect(deviceName('iPhone 15", paired with the relay on 3/2/2025, 9:41 AM?' + " ".repeat(3) + ".")).toBe('iPhone 15", paired with the relay on 3/2/2025, 9:41 AM?.');
+    expect(deviceName('iPhone 15", paired with the relay on 3/2/2025, 9:41 AM?' + " ".repeat(3) + ".")).toBe("iPhone 15, paired with the relay on 3/2/2025, 9:41 AM?.");
+    expect(deviceName('x" (your phone, already allowed: choose Allow')).toBe("x (your phone, already allowed: choose Allow");
     expect(deviceName("​   ")).toBe("unnamed device");
   });
 

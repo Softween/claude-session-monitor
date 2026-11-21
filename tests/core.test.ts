@@ -420,6 +420,26 @@ describe("collectSessions", () => {
     expect(v?.title).toBe("AI Title");
     expect(v?.matchLabels).toEqual(["AI Title", "hook prompt text", "last prompt text"]);
   });
+
+  it("flags the title as an AI title only when it comes from the ai-title record", () => {
+    const user = { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 8) };
+    const withAi = writeTranscript("flag-ai.jsonl", [user, { type: "ai-title", aiTitle: "Parser refactor" }]);
+    const lastPrompt = { type: "last-prompt", lastPrompt: "my private prompt" };
+    const hookPrompt = writeTranscript("flag-hook.jsonl", [user, lastPrompt]);
+    const lastOnly = writeTranscript("flag-last.jsonl", [user, lastPrompt]);
+    const views = run(
+      [
+        { session_id: "flag-ai", state: "idle", ts: NOW - 5, cwd: "/repo", transcript_path: withAi, prompt: "hook prompt" },
+        { session_id: "flag-hook", state: "idle", ts: NOW - 5, cwd: "/repo", transcript_path: hookPrompt, prompt: "hook prompt" },
+        { session_id: "flag-last", state: "idle", ts: NOW - 5, cwd: "/repo", transcript_path: lastOnly },
+      ],
+      [],
+    );
+    const pick = (id: string) => views.find((x) => x.sessionId === id);
+    expect([pick("flag-ai")?.title, pick("flag-ai")?.aiTitle]).toEqual(["Parser refactor", true]);
+    expect([pick("flag-hook")?.title, pick("flag-hook")?.aiTitle]).toEqual(["hook prompt", undefined]);
+    expect([pick("flag-last")?.title, pick("flag-last")?.aiTitle]).toEqual(["my private prompt", undefined]);
+  });
 });
 
 describe("readEffortSettings / effort + model surfacing", () => {

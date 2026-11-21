@@ -25,7 +25,7 @@ export const PENDING = "device check pending";
 export const UNREADABLE = "device list unreadable on this Mac";
 export const DEVICE_NAME_MAX = 60;
 /** The first run allows only devices the relay paired before this moment (its own createdAt); later ones are asked about. */
-export const DEVICE_MIGRATION_CUTOFF = Date.parse("2026-11-22T00:00:00Z");
+export const DEVICE_MIGRATION_CUTOFF = Date.parse("2026-11-21T12:00:00Z");
 const CUTOFF_TEXT = new Date(DEVICE_MIGRATION_CUTOFF).toISOString();
 const DEVICE_ID_MAX = 128;
 const REVIEW = "Review…";
@@ -95,9 +95,9 @@ const serialize = (store: DeviceStore): string => JSON.stringify(store, null, 2)
 // Control, format (zero-width, bidirectional), private-use, unassigned and lone surrogate code points, and the line and paragraph separators.
 const HIDDEN_RE = /[\p{C}\p{Zl}\p{Zp}]/gu;
 
-/** A relay-sent device name as this Mac shows it: no hidden characters, single spaces, at most 60 characters. */
+/** A relay-sent device name as this Mac shows it: no hidden characters or double quotes, single spaces, at most 60 characters. */
 export function deviceName(raw: unknown): string {
-  const chars = [...(typeof raw === "string" ? raw : "").replace(HIDDEN_RE, "").replace(/\s+/g, " ").trim()];
+  const chars = [...(typeof raw === "string" ? raw : "").replace(HIDDEN_RE, "").replace(/"/g, "").replace(/\s+/g, " ").trim()];
   if (!chars.length) return "unnamed device";
   return chars.length > DEVICE_NAME_MAX ? chars.slice(0, DEVICE_NAME_MAX - 1).join("").trimEnd() + "…" : chars.join("");
 }

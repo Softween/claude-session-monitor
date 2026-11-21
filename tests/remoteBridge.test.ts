@@ -674,9 +674,11 @@ describe("RemoteBridge signed commands", () => {
     const run = vi.spyOn(RemoteForwarder.prototype, "run");
     const execute = vi.fn(ran);
     const bridge = startBridge(execute);
+    let claimed: FleetCommand[] = [];
     try {
       await bridge.restart();
       await vi.waitFor(() => expect(r.results).toHaveLength(1));
+      claimed = run.mock.calls.map(([cmd]) => cmd); // read before mockRestore, which clears them
     } finally {
       bridge.dispose();
       run.mockRestore();
@@ -684,7 +686,7 @@ describe("RemoteBridge signed commands", () => {
 
     // What the forwarder claims and runs here or hands to the window holding the session: the relay gives only its id, device and time.
     const rebuilt = { id: "c1", type: "resume", sessionId: "signed-session", deviceId: "phone", createdAt: now };
-    expect(run.mock.calls.map(([cmd]) => cmd)).toEqual([rebuilt]);
+    expect(claimed).toEqual([rebuilt]);
     expect(execute.mock.calls.map(([cmd]) => cmd)).toEqual([rebuilt]);
     expect(r.results[0].body).toEqual({ ok: true, message: "ran c1" });
   });

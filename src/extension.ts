@@ -44,7 +44,7 @@ import { ResumeRegistry, isClaudeCliCommand, isClaudeSessionCommand } from "./re
 import { allowedCwds, mergeSeen, withoutPaths } from "./remoteCwds";
 import { startNewSession } from "./remoteNewSession";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
-import { TabWaker, nodeProbes, summaryText } from "./wakeTabs";
+import { OPEN_COMMAND, TabWaker, nodeProbes, ownSessions, readLiveSessions, readParentPids, summaryText } from "./wakeTabs";
 import { ContinuityServer, continuityDir, readText, storageDir, windowKey, writeTextAtomic } from "./continuity";
 import { focusGroupBySlot, revealTabByIndex, type TabFocusDeps } from "./tabFocus";
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
@@ -4984,6 +4984,30 @@ function isClaudePanelTab(tab: vscode.Tab): boolean {
   return tab.input instanceof vscode.TabInputWebview && tab.input.viewType.endsWith("claudeVSCodePanel");
 }
 
+/**
+ * Show a Claude session whose `claude` process this window's Claude Code started (a
+ * child of this extension host, wakeTabs.ts ownSessions) through Claude Code, which
+ * knows the tab that hosts it: a session without an ai-title keeps its first prompt
+ * as tab label while its row shows the newest prompt, and several tabs can share a
+ * label. False when the session runs elsewhere or Claude Code could not show it.
+ */
+async function showHostedSession(v: SessionView, dbg: Record<string, unknown>): Promise<boolean> {
+  if (v.provider !== "claude") return false;
+  const live = readLiveSessions().filter((s) => s.sessionId === v.sessionId);
+  if (live.length === 0) return false;
+  const parents = await readParentPids();
+  if (!parents || ownSessions(live, parents, process.pid).length === 0) return false;
+  try {
+    await vscode.commands.executeCommand(OPEN_COMMAND, v.sessionId, undefined, undefined, undefined, undefined, { programmatic: true });
+  } catch (e) {
+    dbg.hostedError = String(e); // fall back to the tab labels
+    return false;
+  }
+  dbg.action = `${OPEN_COMMAND} (session runs in this window)`;
+  writeTabDebug(dbg);
+  return true;
+}
+
 async function jumpToSession(v: SessionView): Promise<void> {
   const dbg: any = {
     ts: new Date().toISOString(),
@@ -5009,6 +5033,7 @@ async function jumpToSession(v: SessionView): Promise<void> {
         })),
       });
     });
+    if (await showHostedSession(v, dbg)) return;
 
     for (let gi = 0; gi < groups.length; gi++) {
       const tabs = groups[gi].tabs;

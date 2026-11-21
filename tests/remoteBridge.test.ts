@@ -1,11 +1,17 @@
+import * as fs from "fs";
+import * as path from "path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const settings = vi.hoisted(() => new Map<string, unknown>());
+const settings = vi.hoisted(() => new Map<string, unknown>()); // user (global) values
+const workspaceSettings = vi.hoisted(() => new Map<string, unknown>()); // a workspace's .vscode/settings.json
 
 vi.mock("vscode", () => ({
   workspace: {
     getConfiguration: () => ({
-      inspect: (key: string) => (settings.has(key) ? { globalValue: settings.get(key) } : undefined),
+      inspect: (key: string) =>
+        settings.has(key) || workspaceSettings.has(key)
+          ? { globalValue: settings.get(key), workspaceValue: workspaceSettings.get(key) }
+          : undefined,
     }),
   },
   window: { showWarningMessage: () => Promise.resolve(undefined) },
@@ -13,10 +19,12 @@ vi.mock("vscode", () => ({
 
 import { nothingTyped } from "../src/keystrokeTyping";
 import type { PeerSendResult } from "../src/peerSend";
-import { RemoteBridge, TYPED_REASON, deliverText, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt } from "../src/remoteBridge";
+import { DEFAULT_ALLOWED_COMMANDS, REMOTE_COMMAND_TYPES } from "../src/remote";
+import { RemoteBridge, TYPED_REASON, deliverText, remoteAllowedCommands, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt } from "../src/remoteBridge";
 
 afterEach(() => {
   settings.clear();
+  workspaceSettings.clear();
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
@@ -35,10 +43,12 @@ const inboxOk: PeerSendResult = {
   confirmed: "in-transcript",
 };
 
-function paths(o: { terminal?: PathAttempt | Error; typed?: PathAttempt; uds?: PeerSendResult | Error }) {
+function paths(o: { text?: string; terminal?: PathAttempt | Error; typed?: PathAttempt; uds?: PeerSendResult | Error }) {
   const calls: string[] = [];
+  const inboxLines: string[] = []; // what the inbox was asked to deliver
   const run = () =>
     deliverText({
+      text: o.text ?? "run the tests",
       terminal: async () => {
         calls.push("terminal");
         if (o.terminal instanceof Error) throw o.terminal;
@@ -48,13 +58,14 @@ function paths(o: { terminal?: PathAttempt | Error; typed?: PathAttempt; uds?: P
         calls.push("typed");
         return o.typed ?? skip("no tab");
       },
-      uds: async () => {
+      uds: async (line: string) => {
         calls.push("uds");
+        inboxLines.push(line);
         if (o.uds instanceof Error) throw o.uds;
         return o.uds ?? inboxOk;
       },
     });
-  return { calls, run };
+  return { calls, inboxLines, run };
 }
 
 describe("deliverText: one delivery path per command", () => {
@@ -132,15 +143,63 @@ describe("deliverText: one delivery path per command", () => {
       message: "not delivered: terminal: no terminal; typed: no tab; inbox error: Error: socket gone",
     });
   });
+
+  it("checks the text before the inbox like the terminal and the keystrokes: a rejected text never reaches it", async () => {
+    for (const bad of ["!rm -rf ~", " /model opus", "#remember this", "tab\there", "esc \u001b[31m", "a".repeat(2001), " \r\n "]) {
+      const p = paths({ text: bad });
+      expect(await p.run()).toEqual({ ok: false, message: "not delivered via inbox: rejected input" });
+      expect(p.calls).toEqual(["terminal", "typed"]);
+    }
+    // An accepted text reaches the inbox as the same one line the other paths write or type.
+    const ok = paths({ text: "  fix the login\r\n\nthen run the tests \n" });
+    expect(await ok.run()).toEqual({ ok: true, message: "delivered via inbox (in-transcript, msg_id m1)" });
+    expect(ok.inboxLines).toEqual(["fix the login then run the tests"]);
+  });
 });
 
-describe("remoteFlag", () => {
-  it("reads the user value only and defaults to on", () => {
-    expect(remoteFlag("remote.acceptCommands")).toBe(true);
-    settings.set("remote.acceptCommands", false);
-    settings.set("remote.typeFallback", "false"); // not a boolean: ignored
+describe("remote settings", () => {
+  const defaults = ["resume", "kill", "resumeAll", "autoResume", "answer"];
+
+  it("remoteFlag reads the user value only and is off unless it is true", () => {
     expect(remoteFlag("remote.acceptCommands")).toBe(false);
-    expect(remoteFlag("remote.typeFallback")).toBe(true);
+    expect(remoteFlag("remote.typeFallback")).toBe(false);
+    workspaceSettings.set("remote.acceptCommands", true); // a workspace cannot turn them on
+    workspaceSettings.set("remote.typeFallback", true);
+    expect(remoteFlag("remote.acceptCommands")).toBe(false);
+    expect(remoteFlag("remote.typeFallback")).toBe(false);
+    settings.set("remote.acceptCommands", true);
+    settings.set("remote.typeFallback", "true"); // not a boolean: ignored
+    expect(remoteFlag("remote.acceptCommands")).toBe(true);
+    expect(remoteFlag("remote.typeFallback")).toBe(false);
+    settings.set("remote.acceptCommands", false);
+    expect(remoteFlag("remote.acceptCommands")).toBe(false);
+  });
+
+  it("remoteAllowedCommands reads the user list only; unset or not an array of strings means the default list", () => {
+    expect(remoteAllowedCommands()).toEqual(defaults);
+    workspaceSettings.set("remote.allowedCommands", ["send"]); // a workspace cannot widen it
+    expect(remoteAllowedCommands()).toEqual(defaults);
+    for (const bad of ["send", ["send", 1], { send: true }, null]) {
+      settings.set("remote.allowedCommands", bad);
+      expect(remoteAllowedCommands()).toEqual(defaults);
+    }
+    settings.set("remote.allowedCommands", ["send", "kill"]);
+    expect(remoteAllowedCommands()).toEqual(["send", "kill"]);
+    settings.set("remote.allowedCommands", []);
+    expect(remoteAllowedCommands()).toEqual([]);
+  });
+
+  it("package.json keeps commands and typing off by default and offers every command type, all but send, newSession and switchAccount by default", () => {
+    const props = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), "package.json"), "utf8")).contributes.configuration.properties;
+    for (const key of ["remote.acceptCommands", "remote.typeFallback"]) {
+      expect(props[`claudeSessionMonitor.${key}`]).toMatchObject({ type: "boolean", scope: "application", default: false });
+    }
+    const allowed = props["claudeSessionMonitor.remote.allowedCommands"];
+    expect(allowed).toMatchObject({ type: "array", scope: "application" });
+    expect([...REMOTE_COMMAND_TYPES].sort()).toEqual(["answer", "autoResume", "kill", "newSession", "resume", "resumeAll", "send", "switchAccount"]);
+    expect(allowed.items.enum).toEqual([...REMOTE_COMMAND_TYPES]);
+    expect(DEFAULT_ALLOWED_COMMANDS).toEqual(defaults);
+    expect(allowed.default).toEqual(defaults);
   });
 });
 
@@ -180,9 +239,14 @@ function relay(commands: unknown[], contentLength?: string) {
   return { calls, results };
 }
 
-function startBridge(execute: (cmd: FleetCommand) => Promise<CommandOutcome>): RemoteBridge {
+/** A bridge on the fake relay; `flags` are user settings (commands on unless a test passes its own). */
+function startBridge(
+  execute: (cmd: FleetCommand) => Promise<CommandOutcome>,
+  flags: Record<string, unknown> = { "remote.acceptCommands": true },
+): RemoteBridge {
   settings.set("remote.url", "https://relay.test");
   settings.set("remote.host", "mac");
+  for (const [key, value] of Object.entries(flags)) settings.set(key, value);
   const ctx = {
     extension: { packageJSON: { version: "0.0.0-test" } },
     secrets: { get: async () => JSON.stringify({ origin: "https://relay.test", token: "test-token" }) },
@@ -215,11 +279,10 @@ describe("RemoteBridge command loop", () => {
     expect(r.calls.every((c) => c.init.redirect === "error")).toBe(true);
   });
 
-  it("with acceptCommands off answers every command unrun and keeps uploading the snapshot", async () => {
-    settings.set("remote.acceptCommands", false);
+  it("with acceptCommands off answers every command unrun, before the allowlist, and keeps uploading the snapshot", async () => {
     const r = relay([{ id: "k1", type: "send", sessionId: "s1", text: "hi", createdAt: Date.now() }]);
     const execute = vi.fn(async () => ({ ok: true, message: "ran" }));
-    const bridge = startBridge(execute);
+    const bridge = startBridge(execute, { "remote.acceptCommands": false });
     await bridge.restart();
     await vi.waitFor(() => expect(r.results).toHaveLength(1));
     bridge.onRows([]);
@@ -228,6 +291,57 @@ describe("RemoteBridge command loop", () => {
 
     expect(r.results[0].body).toEqual({ ok: false, message: "remote commands disabled on this Mac" });
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("with no user value for acceptCommands runs nothing: commands are off by default", async () => {
+    const r = relay([{ id: "u1", type: "kill", sessionId: "s1", createdAt: Date.now() }]);
+    const execute = vi.fn(async () => ({ ok: true, message: "ran" }));
+    const bridge = startBridge(execute, {});
+    await bridge.restart();
+    await vi.waitFor(() => expect(r.results).toHaveLength(1));
+    bridge.dispose();
+
+    expect(r.results[0].body).toEqual({ ok: false, message: "remote commands disabled on this Mac" });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("runs only allowed types: by default send, newSession, switchAccount and unknown types are answered unrun", async () => {
+    const now = Date.now();
+    const types = ["resume", "send", "kill", "newSession", "resumeAll", "switchAccount", "autoResume", "answer", "reboot"];
+    const r = relay(types.map((type, i) => ({ id: `t${i}`, type, sessionId: "s1", createdAt: now })));
+    const executed: string[] = [];
+    const bridge = startBridge(async (cmd) => {
+      executed.push(cmd.type);
+      return { ok: false, message: "ran" }; // not ok, so the autoResume result does not wait for a snapshot first
+    });
+    await bridge.restart();
+    await vi.waitFor(() => expect(r.results).toHaveLength(types.length));
+    bridge.dispose();
+
+    expect(executed).toEqual(["resume", "kill", "resumeAll", "autoResume", "answer"]);
+    const answer = (type: string) => r.results.find((x) => x.id === `t${types.indexOf(type)}`)?.body;
+    for (const type of ["send", "newSession", "switchAccount", "reboot"]) {
+      expect(answer(type)).toEqual({ ok: false, message: `${type} is not allowed on this Mac` });
+    }
+  });
+
+  it("a user allowlist replaces the default one", async () => {
+    const now = Date.now();
+    const r = relay([
+      { id: "s1", type: "send", sessionId: "s1", text: "hi", createdAt: now },
+      { id: "k1", type: "kill", sessionId: "s1", createdAt: now },
+    ]);
+    const execute = vi.fn(async () => ({ ok: true, message: "ran" }));
+    const bridge = startBridge(execute, { "remote.acceptCommands": true, "remote.allowedCommands": ["send"] });
+    await bridge.restart();
+    await vi.waitFor(() => expect(r.results).toHaveLength(2));
+    bridge.dispose();
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(r.results).toEqual([
+      { id: "s1", body: { ok: true, message: "ran" } },
+      { id: "k1", body: { ok: false, message: "kill is not allowed on this Mac" } },
+    ]);
   });
 
   it("answers 'timed out' when a command runs past 60 s", async () => {
@@ -246,10 +360,13 @@ describe("RemoteBridge command loop", () => {
     const r = relay([{ id: "n1", type: "newSession", cwd: "/r/app", createdAt: Date.now() }]);
     let release: () => void = () => undefined;
     const gate = new Promise<void>((resolve) => (release = resolve));
-    const bridge = startBridge(async () => {
-      await gate;
-      return { ok: true, message: "new session s1 started in app" };
-    });
+    const bridge = startBridge(
+      async () => {
+        await gate;
+        return { ok: true, message: "new session s1 started in app" };
+      },
+      { "remote.acceptCommands": true, "remote.allowedCommands": ["newSession"] },
+    );
     await bridge.restart();
     const ingests = () => r.calls.filter((c) => c.url.endsWith("/fleet/ingest")).length;
     bridge.onRows([]);

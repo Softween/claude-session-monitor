@@ -14,6 +14,7 @@ import {
   clipBytes,
   commandRefusal,
   freePctFromMemoryPressure,
+  maskEmail,
   originMatches,
   parseStoredToken,
   nextBackoff,
@@ -106,7 +107,15 @@ describe("buildSnapshot", () => {
   });
 
   it("maps the row fields to the session object", () => {
-    const b = buildSnapshot({ host: "mac", rows: [row({ tokens: 1234, notifMessage: "needs approval" })], accounts, bestAccountId: "a1", machine, now: 5 });
+    const b = buildSnapshot({
+      host: "mac",
+      rows: [row({ tokens: 1234, notifMessage: "needs approval", aiTitle: true })],
+      accounts,
+      bestAccountId: "a1",
+      machine,
+      cwdRoots: ["/Users/x"],
+      now: 5,
+    });
     expect(b).toMatchObject({ v: 1, host: "mac", sentAt: 5 });
     expect(b.sessions[0]).toEqual({
       id: "s1",
@@ -124,7 +133,7 @@ describe("buildSnapshot", () => {
       limit: null,
       canResume: true,
       tokens: { ctxPct: null, total: 1234 },
-      account: "a@example.com",
+      account: "a***@example.com",
       waitReason: null,
       git: null,
       autoResume: null,
@@ -204,7 +213,7 @@ describe("buildSnapshot", () => {
     const b = buildSnapshot({ host: "mac", rows: [], accounts, bestAccountId: "a1", machine, now: 1 });
     expect(b.accounts[0]).toEqual({
       id: "a1",
-      email: "a@example.com",
+      email: "a***@example.com",
       tier: "$200 Max",
       active: true,
       best: true,
@@ -224,14 +233,89 @@ describe("buildSnapshot", () => {
 
   it("carries allowedCwds when given, at most 30, and leaves the field out otherwise", () => {
     const cwds = Array.from({ length: 35 }, (_, i) => `/r/p${i}`);
-    expect(buildSnapshot({ host: "mac", rows: [], accounts: [], machine, allowedCwds: cwds, now: 1 }).allowedCwds).toEqual(cwds.slice(0, 30));
-    expect(buildSnapshot({ host: "mac", rows: [], accounts: [], machine, allowedCwds: [], now: 1 }).allowedCwds).toEqual([]);
+    const roots = ["/r"];
+    expect(buildSnapshot({ host: "mac", rows: [], accounts: [], machine, allowedCwds: cwds, cwdRoots: roots, now: 1 }).allowedCwds).toEqual(cwds.slice(0, 30));
+    expect(buildSnapshot({ host: "mac", rows: [], accounts: [], machine, allowedCwds: [], cwdRoots: roots, now: 1 }).allowedCwds).toEqual([]);
     expect("allowedCwds" in buildSnapshot({ host: "mac", rows: [], accounts: [], machine, now: 1 })).toBe(false);
   });
 
   it("clipBytes leaves short strings alone", () => {
     expect(clipBytes("abc", 10)).toBe("abc");
     expect(Buffer.byteLength(clipBytes("a".repeat(100), 10))).toBeLessThanOrEqual(10);
+  });
+});
+
+describe("buildSnapshot: what leaves the machine", () => {
+  it("sends the full cwd only inside a remote.allowedCwds root, else the folder name", () => {
+    const rows = [
+      row({ sessionId: "in", cwd: "/Users/x/repo/app", cwdLabel: "app" }),
+      row({ sessionId: "root" }),
+      row({ sessionId: "sibling", cwd: "/Users/x/repo-x", cwdLabel: "repo-x" }),
+      row({ sessionId: "climb", cwd: "/Users/x/repo/../secret", cwdLabel: "secret" }),
+      row({ sessionId: "out", cwd: "/Users/x/private/notes", cwdLabel: "notes" }),
+      row({ sessionId: "none", cwd: undefined, cwdLabel: undefined }),
+    ];
+    const b = buildSnapshot({ host: "mac", rows, accounts, machine, cwdRoots: ["/Users/x/repo"], now: 1 });
+    expect(b.sessions.map((s) => [s.id, s.cwd, s.project])).toEqual([
+      ["in", "/Users/x/repo/app", "app"],
+      ["root", "/Users/x/repo", "repo"],
+      ["sibling", "repo-x", "repo-x"],
+      ["climb", "secret", "secret"],
+      ["out", "notes", "notes"],
+      ["none", null, null],
+    ]);
+    const noRoots = buildSnapshot({ host: "mac", rows, accounts, machine, now: 1 });
+    expect(noRoots.sessions.map((s) => s.cwd)).toEqual(["app", "repo", "repo-x", "secret", "notes", null]);
+  });
+
+  it("offers only the allowedCwds entries that lie inside a root", () => {
+    const allowedCwds = ["/Users/x/repo/app", "/Users/x/repo-x", "/Users/x/Downloads/tool", "/Users/x/repo"];
+    const b = buildSnapshot({ host: "mac", rows: [], accounts: [], machine, allowedCwds, cwdRoots: ["/Users/x/repo"], now: 1 });
+    expect(b.allowedCwds).toEqual(["/Users/x/repo/app", "/Users/x/repo"]);
+    expect(buildSnapshot({ host: "mac", rows: [], accounts: [], machine, allowedCwds, now: 1 }).allowedCwds).toEqual([]);
+  });
+
+  it("sends a title only when it is Claude's AI title, else \"Session in <folder>\"", () => {
+    const b = buildSnapshot({
+      host: "mac",
+      rows: [
+        row({ sessionId: "ai", title: "Refactor the parser", aiTitle: true }),
+        row({ sessionId: "prompt", title: "my prompt text with details" }),
+        row({ sessionId: "cx", provider: "codex", key: "codex:cx", title: "codex preview text" }),
+        row({ sessionId: "0123456789", title: "prompt without a folder", cwd: undefined, cwdLabel: undefined }),
+      ],
+      accounts,
+      machine,
+      now: 1,
+    });
+    expect(b.sessions.map((s) => s.title)).toEqual(["Refactor the parser", "Session in repo", "Session in repo", "Session 01234567"]);
+    for (const text of ["my prompt text", "codex preview", "without a folder"]) expect(JSON.stringify(b)).not.toContain(text);
+  });
+
+  it("masks every account email: the account list and each session's account", () => {
+    const people: SnapshotAccountInput[] = [
+      { id: "a1", email: "alice@example.com", plan: null, active: true, gauges: [] },
+      { id: "a2", email: "bob@example.org", plan: null, active: false, gauges: [] },
+      { id: "default", email: "this account", plan: null, active: false, gauges: [] },
+    ];
+    const b = buildSnapshot({ host: "mac", rows: [row()], accounts: people, machine, now: 1 });
+    expect(b.accounts.map((a) => [a.id, a.email])).toEqual([
+      ["a1", "a***@example.com"],
+      ["a2", "b***@example.org"],
+      ["default", "***"],
+    ]);
+    expect(b.sessions[0].account).toBe("a***@example.com");
+    expect(JSON.stringify(b)).not.toMatch(/alice|bob@/);
+  });
+});
+
+describe("maskEmail", () => {
+  it("keeps the first character and the domain; a value without @ becomes ***", () => {
+    expect(maskEmail("alice@example.com")).toBe("a***@example.com");
+    expect(maskEmail("élodie@example.fr")).toBe("é***@example.fr");
+    expect(maskEmail("@example.com")).toBe("***@example.com");
+    expect(maskEmail("this account")).toBe("***");
+    expect(maskEmail("")).toBe("***");
   });
 });
 
@@ -435,7 +519,16 @@ const fake = {
   aws: "AKIA" + "Q7".repeat(8),
   keyHeader: "-----BEGIN " + "RSA PRIVATE KEY" + "-----",
   hex: "0123456789abcdef".repeat(3),
+  hex32: "0123456789abcdef".repeat(2),
   base64: "Qm9" + "aGVsbG8gd29ybGQK".repeat(3) + "==",
+  openai: "sk-" + "proj-" + "Ab1Cd2".repeat(5),
+  githubOauth: "gho_" + "Zx9".repeat(12),
+  githubServer: "ghs_" + "Zx9".repeat(12),
+  githubPat: "github_" + "pat_" + "11AB22CD_" + "Ef3".repeat(8),
+  slackApp: "xoxa-" + "2-" + "1234abcd".repeat(2),
+  google: "AI" + "za" + "Sy" + "Ab1_Cd2-".repeat(5),
+  jwt: "ey" + "JhbGciOiJIUzI1NiJ9" + "." + "ey" + "JzdWIiOiIxIn0" + "." + "Ab1Cd2Ef3Gh4".repeat(3),
+  bearer: "Ab1Cd2Ef3Gh4Ij5Kl6",
 };
 
 describe("redactSecrets", () => {
@@ -447,19 +540,43 @@ describe("redactSecrets", () => {
     expect(redactSecrets(`${fake.keyHeader} body`)).toBe("[redacted] body");
   });
 
-  it("replaces 40+ character hex runs and mixed base64 runs", () => {
+  it("replaces common key formats: sk-, GitHub, Slack, Google, JWT and Bearer tokens", () => {
+    for (const key of [fake.openai, fake.githubOauth, fake.githubServer, fake.githubPat, fake.slackApp, fake.google, fake.jwt]) {
+      expect(redactSecrets(`value ${key} end`)).toBe("value [redacted] end");
+    }
+    expect(redactSecrets(`Authorization: Bearer ${fake.bearer}`)).toBe("Authorization: Bearer [redacted]");
+  });
+
+  it("replaces password values in assignments and JSON and keeps the key", () => {
+    expect(redactSecrets("mysql --password=hunter2 -u root")).toBe("mysql --password=[redacted] -u root");
+    expect(redactSecrets('{"user": "ann", "password": "hunter 2"}')).toBe('{"user": "ann", "password": "[redacted]"}');
+    expect(redactSecrets("PGPASSWORD='s3cret' psql")).toBe("PGPASSWORD='[redacted]' psql");
+    expect(redactSecrets("export DB_PASSWD=abc123")).toBe("export DB_PASSWD=[redacted]");
+    expect(redactSecrets("login pwd=abc user=ann")).toBe("login pwd=[redacted] user=ann");
+    expect(redactSecrets('password: "abc"')).toBe('password: "[redacted]"');
+  });
+
+  it("replaces 32+ character hex runs, also after _ or 0x, and mixed base64 runs", () => {
+    expect(redactSecrets(`key ${fake.hex32} end`)).toBe("key [redacted] end");
+    expect(redactSecrets(`api_key_${fake.hex32}`)).toBe("api_key_[redacted]");
+    expect(redactSecrets(`0x${fake.hex32}`)).toBe("[redacted]");
     expect(redactSecrets(`sha ${fake.hex}`)).toBe("sha [redacted]");
     expect(redactSecrets("a".repeat(40))).toBe("[redacted]"); // any 40+ hex run, even a dull one
     expect(redactSecrets(`blob ${fake.base64} tail`)).toBe("blob [redacted] tail");
   });
 
-  it("leaves ordinary text, short ids and digit-free paths alone", () => {
+  it("leaves ordinary text, short ids, session ids and digit-free paths alone", () => {
     for (const ok of [
       "fix the login bug in src/auth/login.ts",
       "commit 3f2a9c1 and issue #12",
       "/Users/bilalsengul/Developer/REPOS/tools/claude-session-monitor",
       "x".repeat(60),
-      "0123456789abcdef".repeat(2),
+      "0123456789abcdef".repeat(1) + "0123456789abcde",
+      "550e8400-e29b-41d4-a716-446655440000",
+      "Rotate passwords: staging first",
+      "the password reset flow",
+      "run pwd then ls; cwd=/Users/x/repo",
+      "Bearer token missing",
     ]) {
       expect(redactSecrets(ok)).toBe(ok);
     }
@@ -470,7 +587,9 @@ describe("buildSnapshot redaction", () => {
   it("redacts the title, the last text and the closing text before they are uploaded", () => {
     const b = buildSnapshot({
       host: "mac",
-      rows: [row({ title: `use ${fake.github} here`, notifMessage: `paste ${fake.anthropic}`, closing: { kind: "done", text: `done ${fake.aws}` } })],
+      rows: [
+        row({ title: `use ${fake.github} here`, aiTitle: true, notifMessage: `paste ${fake.anthropic}`, closing: { kind: "done", text: `done ${fake.aws}` } }),
+      ],
       accounts,
       machine,
       now: 1,

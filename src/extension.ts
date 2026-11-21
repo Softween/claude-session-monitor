@@ -22,7 +22,7 @@ import { gaugeColumn } from "./compact";
 import { calibrate } from "./burn";
 import { BURN_WINDOWS, DEFAULT_BURN_WINDOW_MS, buildBurnPayload, burnShares, gaugeSamplesFromHistory, resolveScale, type BurnPayload } from "./burnPayload";
 import { BurnTracker } from "./burnTracker";
-import { TYPED_REASON, deliverText, registerRemoteBridge, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt, type RemoteBridge } from "./remoteBridge";
+import { TYPED_REASON, deliverText, registerRemoteBridge, remoteCwdRoots, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt, type RemoteBridge } from "./remoteBridge";
 import { runTool } from "./remote";
 import { sanitizeRemoteLine } from "./remoteInput";
 import { backgroundByDue, fmtClock, timingNote } from "./closingBuckets";
@@ -4168,6 +4168,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       sessions: mergeSeen(ctx.globalState.get(SESSION_CWDS_KEY), [], now),
       now,
       exists: isRealDirectory,
+      cwdRoots: remoteCwdRoots(),
     });
     cwdsCache = { at: now, list };
     return list;

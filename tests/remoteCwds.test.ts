@@ -5,9 +5,11 @@ import {
   SEEN_TTL_MS,
   allowedCwds,
   checkNewSession,
+  cwdRoots,
   isInside,
   isUsablePath,
   mergeSeen,
+  withinRoots,
   withoutPaths,
 } from "../src/remoteCwds";
 
@@ -76,6 +78,7 @@ describe("withoutPaths", () => {
 
 describe("allowedCwds", () => {
   const trusted = { "/r/REPOS": NOW - 1000 };
+  const cwdRoots = ["/r"];
 
   it("lists trusted folders and the session cwds inside them, newest first, each once", () => {
     const sessions = {
@@ -85,25 +88,56 @@ describe("allowedCwds", () => {
       "/private/tmp/scratch": NOW,
       "/r/REPOS-copy": NOW,
     };
-    expect(allowedCwds({ trusted, sessions, now: NOW, exists: any })).toEqual(["/r/REPOS/personal/app", "/r/REPOS", "/r/REPOS/old"]);
+    expect(allowedCwds({ trusted, sessions, now: NOW, exists: any, cwdRoots })).toEqual(["/r/REPOS/personal/app", "/r/REPOS", "/r/REPOS/old"]);
   });
 
   it("leaves out every session cwd when no folder is trusted", () => {
-    expect(allowedCwds({ trusted: {}, sessions: { "/r/REPOS/app": NOW }, now: NOW, exists: any })).toEqual([]);
+    expect(allowedCwds({ trusted: {}, sessions: { "/r/REPOS/app": NOW }, now: NOW, exists: any, cwdRoots })).toEqual([]);
   });
 
   it("drops trusted folders and sessions older than 7 days", () => {
     const old = { "/r/REPOS": NOW - SEEN_TTL_MS - 1 };
-    expect(allowedCwds({ trusted: old, sessions: { "/r/REPOS/app": NOW }, now: NOW, exists: any })).toEqual([]);
-    expect(allowedCwds({ trusted, sessions: { "/r/REPOS/app": NOW - SEEN_TTL_MS - 1 }, now: NOW, exists: any })).toEqual(["/r/REPOS"]);
+    expect(allowedCwds({ trusted: old, sessions: { "/r/REPOS/app": NOW }, now: NOW, exists: any, cwdRoots })).toEqual([]);
+    expect(allowedCwds({ trusted, sessions: { "/r/REPOS/app": NOW - SEEN_TTL_MS - 1 }, now: NOW, exists: any, cwdRoots })).toEqual(["/r/REPOS"]);
   });
 
   it("keeps only folders `exists` accepts and stops at 30", () => {
     const sessions = Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`/r/REPOS/p${i}`, NOW - i]));
-    const list = allowedCwds({ trusted, sessions, now: NOW, exists: (p) => p !== "/r/REPOS/p0" });
+    const list = allowedCwds({ trusted, sessions, now: NOW, exists: (p) => p !== "/r/REPOS/p0", cwdRoots });
     expect(list).toHaveLength(ALLOWED_CWDS_MAX);
     expect(list[0]).toBe("/r/REPOS/p1");
     expect(list).not.toContain("/r/REPOS/p0");
+  });
+
+  it("offers only folders inside a remote.allowedCwds root, and none without a root", () => {
+    const wide = { "/r/REPOS": NOW - 1000, "/r/Downloads": NOW - 2000 };
+    const sessions = { "/r/REPOS/app": NOW - 10, "/r/Downloads/tool": NOW - 20 };
+    expect(allowedCwds({ trusted: wide, sessions, now: NOW, exists: any, cwdRoots: ["/r/REPOS"] })).toEqual(["/r/REPOS/app", "/r/REPOS"]);
+    expect(allowedCwds({ trusted: wide, sessions, now: NOW, exists: any, cwdRoots: [] })).toEqual([]);
+  });
+});
+
+describe("cwdRoots", () => {
+  it("keeps absolute and ~/ entries, normalized and each once, and ignores the rest", () => {
+    const raw = ["/r/REPOS/", "~/code", "/r/REPOS", "/r/a/../b", "relative/dir", "~", "~other/x", "", 3, null];
+    expect(cwdRoots(raw, "/home/u")).toEqual(["/r/REPOS", "/home/u/code", "/r/b"]);
+    expect(cwdRoots("/r/REPOS", "/home/u")).toEqual([]);
+    expect(cwdRoots(undefined, "/home/u")).toEqual([]);
+  });
+});
+
+describe("withinRoots", () => {
+  it("takes the root itself and anything below it, compared on normalized paths", () => {
+    const roots = ["/r/REPOS"];
+    expect(withinRoots("/r/REPOS", roots)).toBe(true);
+    expect(withinRoots("/r/REPOS/app/src", roots)).toBe(true);
+    expect(withinRoots("/r/REPOS/..app", roots)).toBe(true); // a folder named "..app" is inside
+    expect(withinRoots("/r/REPOS-x", roots)).toBe(false);
+    expect(withinRoots("/r/REPOS/../secret", roots)).toBe(false);
+    expect(withinRoots("/r", roots)).toBe(false);
+    expect(withinRoots("REPOS/app", roots)).toBe(false); // not absolute
+    expect(withinRoots("/r/REPOS/app", [])).toBe(false);
+    expect(withinRoots("/anything", ["/"])).toBe(true);
   });
 });
 

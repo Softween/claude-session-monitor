@@ -7,7 +7,8 @@
  * open as a workspace folder in the last 7 days. The list holds those folders
  * plus the cwds of sessions seen in the last 7 days that are such a folder or
  * lie inside one (VS Code trust covers subfolders), newest first, each once,
- * at most 30. Anything else stays out.
+ * at most 30, and only those inside a root of the `remote.allowedCwds` user
+ * setting (cwdRoots, withinRoots). Anything else stays out.
  */
 import * as path from "path";
 import { sanitizeRemoteLine } from "./remoteInput";
@@ -45,6 +46,37 @@ export function isInside(dir: string, root: string): boolean {
 }
 
 /**
+ * The `remote.allowedCwds` setting as roots: each absolute entry, or `~/...`
+ * under `home`, normalized (no trailing slash, no `.` / `..` segments), each
+ * once. Anything else (a relative path, a bare `~`, a non-string) is ignored.
+ */
+export function cwdRoots(raw: unknown, home: string): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string") continue;
+    const p = entry.startsWith("~/") ? path.join(home, entry.slice(2)) : entry;
+    if (!path.isAbsolute(p)) continue;
+    const root = path.resolve(p);
+    if (!out.includes(root)) out.push(root);
+  }
+  return out;
+}
+
+/**
+ * True when the absolute path `p` is one of `roots` or lies below one, compared
+ * on normalized paths: `/a/REPOS-x` is not inside `/a/REPOS`, and `..` segments
+ * cannot climb out of a root.
+ */
+export function withinRoots(p: string, roots: readonly string[]): boolean {
+  if (!path.isAbsolute(p)) return false;
+  return roots.some((root) => {
+    const rel = path.relative(root, p);
+    return rel === "" || (rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel));
+  });
+}
+
+/**
  * `prev` (any stored value) with `seen` merged in: the newest time per path;
  * unusable paths, entries older than 7 days or from the future dropped; the
  * newest `cap` kept.
@@ -71,13 +103,15 @@ export function withoutPaths(map: SeenFolders, paths: readonly string[]): SeenFo
 /**
  * The snapshot's allowedCwds: every trusted folder, plus each session cwd that
  * is a trusted folder or lies inside one, newest first, each path once, only
- * paths `exists` accepts (an existing directory), at most 30.
+ * paths inside one of `cwdRoots` (the remote.allowedCwds roots) that `exists`
+ * accepts (an existing directory), at most 30. No roots: none.
  */
 export function allowedCwds(o: {
   trusted: SeenFolders;
   sessions: SeenFolders;
   now: number;
   exists: (p: string) => boolean;
+  cwdRoots: readonly string[];
 }): string[] {
   const trusted = mergeSeen(o.trusted, [], o.now);
   const roots = Object.keys(trusted);
@@ -86,7 +120,7 @@ export function allowedCwds(o: {
   const out: string[] = [];
   for (const p of Object.keys(merged)) {
     if (out.length >= ALLOWED_CWDS_MAX) break;
-    if (o.exists(p)) out.push(p);
+    if (withinRoots(p, o.cwdRoots) && o.exists(p)) out.push(p);
   }
   return out;
 }

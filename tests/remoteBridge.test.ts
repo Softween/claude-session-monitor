@@ -394,3 +394,63 @@ describe("RemoteBridge command loop", () => {
     expect(execute).not.toHaveBeenCalled();
   });
 });
+
+// ------------------------------------------------------- remote.allowedCwds ---
+
+describe("remote.allowedCwds in the pushed snapshot", () => {
+  const capabilities = { focus: true, transcript: false, resume: true, kill: false, bulkInput: true };
+  const sessionRow = (sessionId: string, cwd: string): import("../src/providers/types").SessionView => ({
+    key: `claude:${sessionId}`,
+    provider: "claude",
+    sessionId,
+    title: "prompt text",
+    bucket: "working",
+    sub: "working",
+    detail: "",
+    tooltip: "",
+    capabilities,
+    cwd,
+    lastActivityMs: 0,
+    stale: false,
+    matchLabels: [],
+  });
+
+  type Pushed = { sessions: Array<{ cwd: string | null }>; allowedCwds?: string[]; accounts: Array<{ email: string }> };
+
+  async function pushOnce(): Promise<Pushed> {
+    settings.set("remote.url", "https://relay.test");
+    settings.set("remote.host", "mac");
+    const r = relay([]);
+    const ctx = {
+      extension: { packageJSON: { version: "0.0.0-test" } },
+      secrets: { get: async () => JSON.stringify({ origin: "https://relay.test", token: "test-token" }) },
+    };
+    const bridge = new RemoteBridge(ctx as never, {
+      log: () => undefined,
+      accounts: () => ({ accounts: [{ id: "a1", email: "alice@example.com", plan: null, active: true, gauges: [] }], bestId: null }),
+      execute: async () => ({ ok: true, message: "" }),
+      allowedCwds: () => ["/r/app", "/x/tool"],
+    });
+    await bridge.restart();
+    bridge.onRows([sessionRow("s1", "/r/app"), sessionRow("s2", "/x/secret")]);
+    const ingest = () => r.calls.find((c) => c.url.endsWith("/fleet/ingest"));
+    await vi.waitFor(() => expect(ingest()).toBeDefined(), { timeout: 5000 });
+    bridge.dispose();
+    return JSON.parse(ingest()!.init.body ?? "{}") as Pushed;
+  }
+
+  it("sends full paths only inside the user's roots and masks the account emails", async () => {
+    settings.set("remote.allowedCwds", ["/r"]);
+    const body = await pushOnce();
+    expect(body.sessions.map((s) => s.cwd)).toEqual(["/r/app", "secret"]);
+    expect(body.allowedCwds).toEqual(["/r/app"]);
+    expect(body.accounts.map((a) => a.email)).toEqual(["a***@example.com"]);
+  });
+
+  it("ignores a workspace value, so a repository cannot widen the roots", async () => {
+    workspaceSettings.set("remote.allowedCwds", ["/"]);
+    const body = await pushOnce();
+    expect(body.sessions.map((s) => s.cwd)).toEqual(["app", "secret"]);
+    expect(body.allowedCwds).toEqual([]);
+  });
+});

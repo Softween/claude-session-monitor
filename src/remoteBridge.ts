@@ -32,6 +32,7 @@ import {
   type FleetAutoResume,
   type SnapshotAccountInput,
 } from "./remote";
+import { cwdRoots } from "./remoteCwds";
 import { sanitizeRemoteLine } from "./remoteInput";
 
 export const REMOTE_TOKEN_KEY = "csm.remote.token";
@@ -234,6 +235,7 @@ export class RemoteBridge implements vscode.Disposable {
         bestAccountId: bestId,
         machine: await sampleMachine(this.pressure, rows.length),
         allowedCwds: this.deps.allowedCwds?.(),
+        cwdRoots: remoteCwdRoots(),
         now,
         git: (cwd) => this.gitInfo.get(cwd),
         autoResume: this.deps.autoResume,
@@ -437,6 +439,15 @@ export class RemoteBridge implements vscode.Disposable {
       outer?.removeEventListener("abort", onAbort);
     }
   }
+}
+
+/**
+ * `remote.allowedCwds` as normalized roots (remoteCwds.ts cwdRoots), user (global)
+ * value only like remote.url, so a workspace's .vscode/settings.json cannot widen it.
+ */
+export function remoteCwdRoots(): string[] {
+  const v = vscode.workspace.getConfiguration("claudeSessionMonitor").inspect<unknown>("remote.allowedCwds")?.globalValue;
+  return cwdRoots(v, os.homedir());
 }
 
 /**

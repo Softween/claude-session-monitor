@@ -41,6 +41,8 @@ export interface SessionView {
   provider: AgentProvider;
   sessionId: string;
   title: string;
+  /** The title is Claude's own session title (the transcript's ai-title record), not prompt text. */
+  aiTitle?: boolean;
   bucket: SessionBucket;
   sub: string;
   detail: string;

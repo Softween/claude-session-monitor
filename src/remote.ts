@@ -455,13 +455,20 @@ export function commandRefusal(
   return age <= COMMAND_MAX_AGE_MS ? null : "expired";
 }
 
-/** `p`, or `fallback` once `ms` pass without an answer. The work itself is not cancelled. */
-export function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+/**
+ * What `run` answers, or `fallback` once `ms` pass without an answer. Then the
+ * signal `run` got aborts, so the work it started stops instead of going on unseen.
+ */
+export function withTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number, fallback: T): Promise<T> {
+  const ac = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const late = new Promise<T>((resolve) => {
-    timer = setTimeout(() => resolve(fallback), ms);
+    timer = setTimeout(() => {
+      ac.abort(new Error("timed out"));
+      resolve(fallback);
+    }, ms);
   });
-  return Promise.race([p, late]).finally(() => clearTimeout(timer));
+  return Promise.race([run(ac.signal), late]).finally(() => clearTimeout(timer));
 }
 
 /** A relay response's body text, refused above `max` bytes by its content-length header or by its size. */

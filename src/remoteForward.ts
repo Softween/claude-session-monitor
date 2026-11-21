@@ -103,20 +103,18 @@ const sleep = (ms: number, signal: AbortSignal) =>
     }, { once: true });
   });
 
-/** A handed-over command file's content, or undefined for anything else; only the fields a tab-bound command reads are kept. */
+/**
+ * A handed-over command file's content, or undefined for anything else: a
+ * tab-bound command with an id, from a window key. The command comes back as the
+ * relay sent it, every field unchanged (the executor checks the ones it reads).
+ */
 export function parseRequest(text: string | undefined): ForwardedCommand | undefined {
   const raw = parseJson(text);
   if (!isRecord(raw) || raw.v !== 1 || typeof raw.from !== "string" || !WINDOW_KEY.test(raw.from)) return undefined;
   if (typeof raw.deadline !== "number" || !isRecord(raw.cmd)) return undefined;
-  const { id, type, sessionId, text: line, createdAt } = raw.cmd;
+  const { id, type } = raw.cmd;
   if (typeof id !== "string" || !id || typeof type !== "string" || !TAB_BOUND_TYPES.includes(type)) return undefined;
-  const cmd: FleetCommand = {
-    id,
-    type,
-    sessionId: typeof sessionId === "string" ? sessionId : null,
-    text: typeof line === "string" ? line : null,
-    ...(typeof createdAt === "number" ? { createdAt } : {}),
-  };
+  const cmd: FleetCommand = { ...(raw.cmd as Partial<FleetCommand>), id, type };
   return { from: raw.from, deadline: raw.deadline, cmd };
 }
 
@@ -198,9 +196,8 @@ export class RemoteForwarder {
     const name = fileKey(cmd.id);
     const request = path.join(deps.dir, holder.win, name + REQUEST);
     const reply = path.join(deps.dir, deps.win, name + RESULT);
-    const body = { v: 1, from: deps.win, deadline, cmd: { id: cmd.id, type: cmd.type, sessionId: cmd.sessionId, text: cmd.text, createdAt: cmd.createdAt } };
     try {
-      deps.fs.write(request, JSON.stringify(body));
+      deps.fs.write(request, JSON.stringify({ v: 1, from: deps.win, deadline, cmd }));
     } catch (e) {
       deps.log(`remote: ${cmd.type} ${short(cmd.id)} not handed to window ${holder.win} (${errText(e)}); it runs here`);
       return this.runHere(cmd, deadline);

@@ -129,16 +129,16 @@ export interface RemoteBridgeDeps {
   accounts: () => { accounts: SnapshotAccountInput[]; bestId: string | null };
   /** runs a command; `signal` aborts once the command's 60 s are up, and it then types and sends nothing more */
   execute: (cmd: FleetCommand, signal: AbortSignal) => Promise<CommandOutcome>;
+  /** hands a tab-bound command to the window holding its session (remoteForward.ts); without it every command runs here */
+  forward?: ForwardDeps;
+  /** the sessions this window holds changed (remoteForward.ts): its health file should list them now */
+  holdsChanged?: () => void;
   /** folders a remote newSession may use (remoteCwds.ts), sent with every snapshot */
   allowedCwds?: () => string[];
   /** a limited row's auto-resume state (autoResume.ts), sent on limited rows */
   autoResume?: (v: SessionView) => FleetAutoResume | null;
   /** which paired devices may run commands (remoteDevices.ts); registerRemoteBridge uses the file under ~/.claude/session-monitor unless given */
   devices?: DeviceCheck;
-  /** hands a tab-bound command to the window holding its session (remoteForward.ts); without it every command runs here */
-  forward?: ForwardDeps;
-  /** the sessions this window holds changed (remoteForward.ts): its health file should list them now */
-  holdsChanged?: () => void;
 }
 
 interface BridgeCfg { url: string; host: string; token: string }
@@ -224,8 +224,8 @@ export class RemoteBridge implements vscode.Disposable {
       return;
     }
     this.cfg = { url, host, token: stored.token };
-    this.stop = new AbortController();
     this.forwarder.start();
+    this.stop = new AbortController();
     this.deps.log(`remote: bridge on (${url}, host ${host})`);
     void this.deps.devices.migrate(this.pairedLookup(this.cfg, this.stop.signal));
     void this.pollLoop(this.cfg, this.stop.signal);

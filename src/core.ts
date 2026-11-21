@@ -1038,6 +1038,7 @@ function isMonitorInfrastructureFile(file: string): boolean {
     file === "statusline-last-raw.json" ||
     file === "token-offsets.json" ||
     file === "token-buckets.json" ||
+    file === "remote-devices.json" || // the paired devices confirmed on this Mac (remoteDevices.ts): it changes only on the owner's decision
     file.startsWith("official-usage")
   );
 }

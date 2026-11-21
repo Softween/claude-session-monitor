@@ -36,6 +36,7 @@ export const AHEAD = "signed more than 5 minutes ahead of this Mac's clock";
 export const NONCE_SEEN = "signed command already received";
 export const NO_KEY = "the relay lists no key for the device";
 export const KEY_NOT_READ = "the device's key could not be read from the relay; send the command again";
+export const KEY_NOT_PINNED = "the device's key is not pinned on this Mac";
 export const CONFIRM_KEY = "the device's key is not pinned on this Mac: confirm it on the Mac, then send the command again";
 
 const SPKI_ED25519 = Buffer.from("302a300506032b6570032100", "hex"); // the DER header of an Ed25519 public key (RFC 8410)
@@ -81,10 +82,12 @@ export function keyFingerprint(key: string): string {
 export function verifySigned(signed: string, sig: unknown, key: unknown): boolean {
   const raw = publicKeyBytes(key);
   const signature = base64Bytes(sig, 64);
-  if (!raw || !signature) return false;
+  const bytes = Buffer.from(signed, "utf8");
+  // A lone surrogate becomes the bytes of U+FFFD: only a text that its bytes spell out exactly is the text that was signed.
+  if (!raw || !signature || bytes.toString("utf8") !== signed) return false;
   try {
     const publicKey = createPublicKey({ key: Buffer.concat([SPKI_ED25519, raw]), format: "der", type: "spki" });
-    return verify(null, Buffer.from(signed, "utf8"), publicKey, signature);
+    return verify(null, bytes, publicKey, signature);
   } catch {
     return false;
   }
@@ -157,7 +160,8 @@ export async function checkSigned(cmd: FleetCommand, deps: SignedDeps): Promise<
 /**
  * An allowed device without a pinned key: its command must verify against the
  * key the relay lists for it and pass the checks up to its nonce; only then is
- * the owner asked to pin that key. The command itself is refused either way.
+ * the owner asked to pin that key, unless they were asked about the device in
+ * the last 10 minutes. The command itself is refused either way.
  */
 async function pinRequest(signed: string, sig: string, deviceId: string, deps: SignedDeps): Promise<SignedCheck> {
   let device: PairedDevice | undefined;
@@ -171,8 +175,7 @@ async function pinRequest(signed: string, sig: string, deviceId: string, deps: S
   const s = readSigned(signed, deviceId, deps);
   if (!s.ok) return s;
   if (!deps.nonces.claim(s.nonce)) return refuse(NONCE_SEEN);
-  deps.devices.askToPin(device);
-  return refuse(CONFIRM_KEY);
+  return refuse(deps.devices.askToPin(device) ? CONFIRM_KEY : KEY_NOT_PINNED);
 }
 
 /** The nonces of the signed commands in `dir`, shared by every window that uses it, kept 11 minutes. */

@@ -9,13 +9,16 @@
  * that got the command shows a notification naming it, one per device at a
  * time; only its Review… button opens the modal: Deny (the default button),
  * Allow, or closed (nothing decided). The command is answered at once; after
- * Allow the phone sends it again. Without the file (the first run, or after it
- * was removed) the devices the relay paired before DEVICE_MIGRATION_CUTOFF are
- * allowed, once. An entry also keeps the key the device signs its commands with
+ * Allow the phone sends it again. On the first run, without the file, the
+ * devices the relay paired before DEVICE_MIGRATION_CUTOFF are allowed, and
+ * remote/devices-first-run.json records that this happened: from then on a
+ * missing file refuses every command until it is back (removing both files
+ * starts over). An entry also keeps the key the device signs its commands with
  * (`publicKey`, remoteSigned.ts): Allow pins the key the relay lists for the
- * device, which the modal shows by its fingerprint, and an allowed device
- * without one is asked about it when its first signed command arrives. A pinned
- * key is never replaced.
+ * device, which the modal shows by its fingerprint first, and an allowed device
+ * without one is asked about it when its first signed command arrives: Pin Key,
+ * Deny Device, or Don't Pin, which pauses the question for 10 minutes in every
+ * window. A pinned key is never replaced.
  */
 import { randomBytes } from "crypto";
 import * as fs from "fs";
@@ -28,6 +31,7 @@ export const NOT_CONFIRMED = "device not confirmed on this Mac";
 export const DENIED = "device denied on this Mac";
 export const PENDING = "device check pending";
 export const UNREADABLE = "device list unreadable on this Mac";
+export const MISSING = "device list missing on this Mac";
 export const DEVICE_NAME_MAX = 60;
 /** The first run allows only devices the relay paired before this moment (its own createdAt); later ones are asked about. */
 export const DEVICE_MIGRATION_CUTOFF = Date.parse("2026-11-21T12:00:00Z");
@@ -36,10 +40,16 @@ const DEVICE_ID_MAX = 128;
 const REVIEW = "Review…";
 const PIN = "Pin Key";
 const DONT_PIN = "Don't Pin";
+const DENY_DEVICE = "Deny Device";
+const NAME_HIDDEN = "[name not shown]";
+/** How long the owner is not asked again to pin a device's key after Don't Pin or a dismissal. */
+export const PIN_QUIET_MS = 10 * 60_000;
 
 export type DeviceState = "allowed" | "denied";
 /** The owner's answer to the modal; undefined: closed without one. */
 export type DeviceDecision = "allow" | "deny" | undefined;
+/** The owner's answer to the prompt to pin a key; undefined: Don't Pin, or closed without one. */
+export type PinDecision = "pin" | "deny" | undefined;
 
 /** One device in the file, with its pinned key in `publicKey` once it has one; fields a later version adds are kept on every rewrite. */
 export interface DeviceEntry {
@@ -76,12 +86,13 @@ export interface DeviceFs {
 
 export interface DeviceGateDeps {
   file: string;
+  marker: string; // records that the first run happened: under remote/, which the monitor folder cleanups never look into
   fs: DeviceFs;
   now(): number; // epoch ms
   /** Asks the owner about the device; `sameName` holds the ids of the allowed devices that have its name. */
   prompt(device: PairedDevice, sameName: string[]): Promise<DeviceDecision>;
-  /** Asks the owner to pin the key the relay lists for an allowed device that has none pinned; true: pin it. */
-  askPin(device: PairedDevice & { publicKey: string }): Promise<boolean>;
+  /** Asks the owner to pin the key the relay lists for an allowed device that has none pinned, or to deny the device. */
+  askPin(device: PairedDevice & { publicKey: string }): Promise<PinDecision>;
   log(msg: string): void;
 }
 
@@ -96,11 +107,15 @@ export interface DeviceCheck {
   refusal(deviceId: unknown, lookup: PairedLookup, ask?: boolean): Promise<string | null>;
   /** The key pinned for the device, as the file holds it (base64 of the raw 32-byte key); undefined when none is. */
   pinnedKey(deviceId: string): unknown;
-  /** Asks the owner, in the background and one prompt per device at a time, to pin `device.publicKey` for the allowed device. */
-  askToPin(device: PairedDevice): void;
+  /**
+   * Asks the owner, in the background and one prompt per device at a time, to pin `device.publicKey` for the allowed
+   * device; true when a prompt about it shows, false when none does (no key, or the owner skipped it in the last 10 minutes).
+   */
+  askToPin(device: PairedDevice): boolean;
 }
 
-type Loaded = { kind: "missing" } | { kind: "unreadable"; why: string } | { kind: "ok"; store: DeviceStore };
+// lost: the file is missing although its first run is recorded
+type Loaded = { kind: "missing" } | { kind: "lost" } | { kind: "unreadable"; why: string } | { kind: "ok"; store: DeviceStore };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const validId = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= DEVICE_ID_MAX;
@@ -174,9 +189,15 @@ export class DeviceGate implements DeviceCheck {
     }
     if (loaded.kind === "unreadable") {
       this.deps.log(
-        `remote: ${this.deps.file} is unreadable (${loaded.why}); no remote command runs until it is fixed. Removing it is no reset: without the file every device the relay paired before ${CUTOFF_TEXT} is allowed again, denied ones included`,
+        `remote: ${this.deps.file} is unreadable (${loaded.why}); no remote command runs until it is fixed. Removing it does not start over: while ${this.deps.marker} exists every command is refused, and removing both allows every device the relay paired before ${CUTOFF_TEXT} again, denied ones included`,
       );
       return UNREADABLE;
+    }
+    if (loaded.kind === "lost") {
+      this.deps.log(
+        `remote: ${this.deps.file} is missing although its first run is recorded in ${this.deps.marker}; no remote command runs until the list is back. To start over on purpose, remove ${this.deps.marker} as well: the next start then allows every device the relay paired before ${CUTOFF_TEXT} again, denied ones included`,
+      );
+      return MISSING;
     }
     const state = entryOf(loaded.store, deviceId)?.state;
     if (state === "allowed") return null;
@@ -190,8 +211,13 @@ export class DeviceGate implements DeviceCheck {
     return loaded.kind === "ok" ? keyOf(entryOf(loaded.store, deviceId)) : undefined;
   }
 
-  askToPin(device: PairedDevice): void {
-    void this.pinPrompt(device);
+  askToPin(device: PairedDevice): boolean {
+    const key = device.publicKey;
+    if (!key) return false;
+    if (this.asking.has(device.id)) return true; // its prompt is open
+    if (!this.mayAskPin(device.id)) return false;
+    void this.pinPrompt({ ...device, publicKey: key });
+    return true;
   }
 
   /** The file: missing, unreadable (any other read error, or not a version 1 device list), or its store. */
@@ -202,13 +228,15 @@ export class DeviceGate implements DeviceCheck {
     } catch (e) {
       return { kind: "unreadable", why: errText(e) };
     }
-    if (text === undefined) return { kind: "missing" };
+    if (text === undefined) return this.firstRunDone() ? { kind: "lost" } : { kind: "missing" };
     const store = parseStore(text);
     return store ? { kind: "ok", store } : { kind: "unreadable", why: "not a version 1 device list" };
   }
 
   private async firstRun(lookup: PairedLookup): Promise<void> {
-    if (this.load().kind !== "missing") return;
+    const loaded = this.load();
+    if (loaded.kind === "ok") this.markFirstRun(); // a list an earlier version wrote counts as the first run
+    if (loaded.kind !== "missing") return;
     let paired: PairedDevice[];
     try {
       paired = pairedDevices(await lookup());
@@ -230,8 +258,27 @@ export class DeviceGate implements DeviceCheck {
           `remote: first run, ${early.length} device(s) paired before ${CUTOFF_TEXT} confirmed on this Mac${early.length ? ": " + early.map((d) => d.name).join(", ") : ""}${later ? `; ${later} other(s) are asked about at their first command` : ""}`,
         );
       }
+      this.markFirstRun(); // also when another window wrote its list first
     } catch (e) {
       this.deps.log(`remote: device list not written (${errText(e)})`);
+    }
+  }
+
+  /** Whether the first run is recorded; a marker that cannot be read counts as recorded, so nothing starts over by mistake. */
+  private firstRunDone(): boolean {
+    try {
+      return this.deps.fs.read(this.deps.marker) !== undefined;
+    } catch {
+      return true;
+    }
+  }
+
+  /** Records that the first run happened, once; when that fails it is logged and tried again at the next start. */
+  private markFirstRun(): void {
+    try {
+      if (!this.firstRunDone()) this.deps.fs.write(this.deps.marker, JSON.stringify({ v: 1, at: this.deps.now() }) + "\n", true);
+    } catch (e) {
+      this.deps.log(`remote: ${this.deps.marker} not written (${errText(e)})`);
     }
   }
 
@@ -276,8 +323,8 @@ export class DeviceGate implements DeviceCheck {
   private record(device: PairedDevice, state: DeviceState, askedAt: number): void {
     const label = `device "${device.name}" (${short(device.id)}) ${state}`;
     const loaded = this.load();
-    if (loaded.kind === "unreadable") {
-      this.deps.log(`remote: ${label}, but not saved: ${this.deps.file} is unreadable (${loaded.why})`);
+    if (loaded.kind === "unreadable" || loaded.kind === "lost") {
+      this.deps.log(`remote: ${label}, but not saved: ${this.deps.file} is ${loaded.kind === "lost" ? "missing" : `unreadable (${loaded.why})`}`);
       return;
     }
     const store: DeviceStore = loaded.kind === "ok" ? loaded.store : { version: 1, devices: {} };
@@ -304,16 +351,16 @@ export class DeviceGate implements DeviceCheck {
     }
   }
 
-  /** Asks once the device is still allowed and without a pinned key, then pins the key on Pin Key; never throws. */
-  private async pinPrompt(device: PairedDevice): Promise<void> {
-    const key = device.publicKey;
-    if (!key || this.asking.has(device.id)) return;
+  /** Shows the prompt, one per device at a time, and records the owner's answer; never throws. */
+  private async pinPrompt(device: PairedDevice & { publicKey: string }): Promise<void> {
     this.asking.add(device.id);
-    const label = `key ${keyFingerprint(key)} of device "${device.name}" (${short(device.id)})`;
+    const label = `key ${keyFingerprint(device.publicKey)} of device "${device.name}" (${short(device.id)})`;
+    const askedAt = this.deps.now();
     try {
-      if (!this.unpinned(device.id)) return;
-      if (await this.deps.askPin({ ...device, publicKey: key })) this.pin(device.id, key, label);
-      else this.deps.log(`remote: ${label} not pinned; its next signed command asks again`);
+      const decision = await this.deps.askPin(device);
+      if (decision === "pin") this.pin(device.id, device.publicKey, label);
+      else if (decision === "deny") this.record(device, "denied", askedAt);
+      else this.skipPin(device.id, label);
     } catch (e) {
       this.deps.log(`remote: ${label} not asked about: ${errText(e)}`);
     } finally {
@@ -321,18 +368,33 @@ export class DeviceGate implements DeviceCheck {
     }
   }
 
-  /** Read again right before asking: whether the readable file has the device allowed and without a pinned key. */
-  private unpinned(id: string): boolean {
+  /** Read again right before asking: the readable file has the device allowed, without a pinned key and not skipped in the last 10 minutes. */
+  private mayAskPin(id: string): boolean {
     const loaded = this.load();
     const entry = loaded.kind === "ok" ? entryOf(loaded.store, id) : undefined;
-    return isRecord(entry) && entry.state === "allowed" && keyOf(entry) === undefined;
+    if (!isRecord(entry) || entry.state !== "allowed" || keyOf(entry) !== undefined) return false;
+    const skipped = entry.pinSkippedAt;
+    return !(typeof skipped === "number" && this.deps.now() - skipped < PIN_QUIET_MS);
+  }
+
+  /** Don't Pin or a dismissal: every window leaves the device unasked for 10 minutes (pinSkippedAt in its entry). */
+  private skipPin(id: string, label: string): void {
+    const loaded = this.load();
+    const old = loaded.kind === "ok" ? entryOf(loaded.store, id) : undefined;
+    if (loaded.kind !== "ok" || !isRecord(old)) return;
+    try {
+      this.deps.fs.write(this.deps.file, serialize({ ...loaded.store, devices: { ...loaded.store.devices, [id]: { ...old, pinSkippedAt: this.deps.now() } } }), false);
+      this.deps.log(`remote: ${label} not pinned; not asked about again for 10 minutes`);
+    } catch (e) {
+      this.deps.log(`remote: ${label} not pinned: ${errText(e)}`);
+    }
   }
 
   /** Writes `key` into the file as it is now, only while the device is allowed and has no key pinned, so other windows' changes stay. */
   private pin(id: string, key: string, label: string): void {
     const loaded = this.load();
     if (loaded.kind !== "ok") {
-      this.deps.log(`remote: ${label} not pinned: ${this.deps.file} is ${loaded.kind === "missing" ? "missing" : `unreadable (${loaded.why})`}`);
+      this.deps.log(`remote: ${label} not pinned: ${this.deps.file} is ${loaded.kind === "unreadable" ? `unreadable (${loaded.why})` : "missing"}`);
       return;
     }
     const old = entryOf(loaded.store, id);
@@ -352,9 +414,16 @@ export class DeviceGate implements DeviceCheck {
 /** How the prompts name a device: its pairing time and the first 8 characters of its id, then the relay-sent name. */
 function aboutDevice(device: PairedDevice): string {
   const when = device.pairedAt === null ? "at an unknown time" : `on ${new Date(device.pairedAt).toLocaleString()}`;
-  // A notification turns "[text](target)" into a link; the space keeps the name plain text.
-  const name = device.name.replaceAll("](", "] (");
+  const name = shownName(device.name);
   return `the device paired with the relay ${when}, id ${short(device.id)}, named "${name}"`;
+}
+
+/**
+ * A relay name as the prompts show it: one that reads like a key fingerprint (a run of 4 hex digits or more, or
+ * the word itself) is not shown. A notification turns "[text](target)" into a link; the space keeps the name plain text.
+ */
+function shownName(name: string): string {
+  return /[0-9a-f]{4,}|fingerprint/i.test(name.normalize("NFKC")) ? NAME_HIDDEN : name.replaceAll("](", "] (");
 }
 
 /** The modal's sentence about allowed devices that already have the device's name; "" when none has. */
@@ -377,11 +446,15 @@ export async function askOnThisMac(device: PairedDevice, sameName: readonly stri
   if (review !== REVIEW) return undefined;
   const detail =
     "Commands from a newly paired device run on this Mac only after you allow it. Deny refuses its commands, Allow runs them from now on, and closing this dialog decides nothing. If you did not pair this device, choose Deny and revoke it on the relay.";
+  // The key's fingerprint comes first, on its own line, before anything the relay sent.
+  const message = device.publicKey
+    ? `Agent Sessions: key fingerprint ${keyFingerprint(device.publicKey)}\nRun remote commands from ${about}?`
+    : `Agent Sessions: run remote commands from ${about}?`;
   const key = device.publicKey
-    ? `Key fingerprint ${keyFingerprint(device.publicKey)}: allow only if the device shows the same fingerprint. Allow also pins this key, and only commands signed with it run.`
+    ? "Allow only if the device shows the same key fingerprint. Allow also pins this key, and only commands signed with it run."
     : "The device has sent no key yet: once it signs its commands, you are asked to pin its key.";
   const pick = await vscode.window.showWarningMessage(
-    `Agent Sessions: run remote commands from ${about}?`,
+    message,
     { modal: true, detail: [sameNameNote(sameName), key, detail].filter(Boolean).join(" ") },
     "Deny",
     "Allow",
@@ -391,27 +464,29 @@ export async function askOnThisMac(device: PairedDevice, sameName: readonly stri
 
 /**
  * Asks to pin the key the relay lists for an allowed device that signs its commands now: a notification naming
- * the device with Review… as its only button, then, only after Review…, the modal naming the key's fingerprint,
- * whose first button, the one Return presses, is Don't Pin. True only for Pin Key; anything else decides nothing.
+ * the device with Review… as its only button, then, only after Review…, the modal with the key's fingerprint on its
+ * first line, whose first button, the one Return presses, is Don't Pin. Pin Key pins the key, Deny Device denies the
+ * device; Don't Pin and closing decide neither.
  */
-export async function askPinOnThisMac(device: PairedDevice & { publicKey: string }): Promise<boolean> {
+export async function askPinOnThisMac(device: PairedDevice & { publicKey: string }): Promise<PinDecision> {
   const about = aboutDevice(device);
   const review = await vscode.window.showWarningMessage(
     `Agent Sessions: refused a remote command from ${about}. Its commands run only after you pin its key on this Mac.`,
     REVIEW,
   );
-  if (review !== REVIEW) return false;
+  if (review !== REVIEW) return undefined;
   const pick = await vscode.window.showWarningMessage(
-    `Agent Sessions: ${about} now signs its commands, key fingerprint ${keyFingerprint(device.publicKey)}: pin this key?`,
+    `Agent Sessions: key fingerprint ${keyFingerprint(device.publicKey)}\nPin this key for ${about}? The device now signs its commands with it.`,
     {
       modal: true,
       detail:
-        "Pin it only if the device shows the same fingerprint. Once its key is pinned, only commands signed with it run. Don't Pin and closing this dialog decide nothing: its next signed command asks again.",
+        "Pin it only if the device shows the same fingerprint: then only commands signed with this key run. Deny Device refuses its commands until it is paired again. Don't Pin and closing this dialog decide neither, and the device is not asked about again for 10 minutes.",
     },
     DONT_PIN,
     PIN,
+    DENY_DEVICE,
   );
-  return pick === PIN;
+  return pick === PIN ? "pin" : pick === DENY_DEVICE ? "deny" : undefined;
 }
 
 /** Node's file system: the folder made or set 0700, the text written 0600 under a unique temp name, then renamed (or linked when only new). */
@@ -452,6 +527,7 @@ export const nodeDeviceFs: DeviceFs = {
 export function createDeviceGate(log: (msg: string) => void): DeviceGate {
   return new DeviceGate({
     file: path.join(MONITOR_DIR, "remote-devices.json"),
+    marker: path.join(MONITOR_DIR, "remote", "devices-first-run.json"),
     fs: nodeDeviceFs,
     now: () => Date.now(),
     prompt: askOnThisMac,

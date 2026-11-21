@@ -484,17 +484,29 @@ describe("buildSnapshot redaction", () => {
 
 describe("commandRefusal", () => {
   const now = 1_800_000_000_000;
-  it("answers every command when commands are off, before the expiry check", () => {
-    expect(commandRefusal(now, now, false)).toBe("remote commands disabled on this Mac");
-    expect(commandRefusal(undefined, now, false)).toBe("remote commands disabled on this Mac");
+  const every = ["resume", "kill", "resumeAll", "switchAccount", "send", "newSession", "autoResume", "answer"];
+  it("answers every command when commands are off, before the type and expiry checks", () => {
+    expect(commandRefusal({ type: "kill", createdAt: now }, now, false, every)).toBe("remote commands disabled on this Mac");
+    expect(commandRefusal({ type: "send" }, now, false, [])).toBe("remote commands disabled on this Mac");
   });
-  it("lets a command younger than 2 minutes run and expires an older or undated one", () => {
+  it("refuses a type missing from the allowlist or one the bridge does not run, before the expiry check", () => {
+    expect(commandRefusal({ type: "send", createdAt: now }, now, true, ["resume", "kill"])).toBe("send is not allowed on this Mac");
+    expect(commandRefusal({ type: "send", createdAt: now - 121_000 }, now, true, ["kill"])).toBe("send is not allowed on this Mac");
+    expect(commandRefusal({ type: "kill", createdAt: now }, now, true, [])).toBe("kill is not allowed on this Mac");
+    expect(commandRefusal({ type: "reboot", createdAt: now }, now, true, [...every, "reboot"])).toBe("reboot is not allowed on this Mac");
+    for (const type of [undefined, "", 7]) {
+      expect(commandRefusal({ type, createdAt: now }, now, true, every)).toBe("a command without a type is not allowed on this Mac");
+    }
+    for (const type of every) expect(commandRefusal({ type, createdAt: now }, now, true, every)).toBeNull();
+  });
+  it("lets an allowed command younger than 2 minutes run and expires an older or undated one", () => {
     expect(COMMAND_MAX_AGE_MS).toBe(120_000);
-    expect(commandRefusal(now, now, true)).toBeNull();
-    expect(commandRefusal(now - 120_000, now, true)).toBeNull();
-    expect(commandRefusal(now - 120_001, now, true)).toBe("expired");
+    const refusal = (createdAt: unknown) => commandRefusal({ type: "kill", createdAt }, now, true, ["kill"]);
+    expect(refusal(now)).toBeNull();
+    expect(refusal(now - 120_000)).toBeNull();
+    expect(refusal(now - 120_001)).toBe("expired");
     for (const bad of [undefined, null, "1800000000000", Number.NaN, Number.NEGATIVE_INFINITY]) {
-      expect(commandRefusal(bad, now, true)).toBe("expired");
+      expect(refusal(bad)).toBe("expired");
     }
   });
 });

@@ -4288,9 +4288,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
         if (v.provider !== "claude") return { ok: false, message: "send is supported for Claude sessions only" };
         const text = cmd.text;
         return deliverText({
+          text,
           terminal: () => sendToSessionTerminal(v, text),
           typed: () => typeIntoSession(v, text),
-          uds: () => sendToSession({ pid: v.pid, sessionId: v.sessionId, text, timeoutMs: 5000, waitTranscriptMs: 15_000 }),
+          uds: (line) => sendToSession({ pid: v.pid, sessionId: v.sessionId, text: line, timeoutMs: 5000, waitTranscriptMs: 15_000 }),
         });
       }
       default:

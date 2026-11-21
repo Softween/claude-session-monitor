@@ -1,7 +1,7 @@
 /**
  * remoteInput.ts — the check a remote text passes before it is written into a
- * session's terminal or typed into its Claude tab. Pure (no vscode import), so
- * vitest can load it. The uds inbox path wraps the text itself and skips this.
+ * session's terminal, typed into its Claude tab or sent to its uds inbox. Pure
+ * (no vscode import), so vitest can load it.
  */
 
 export const REMOTE_LINE_MAX = 2000;

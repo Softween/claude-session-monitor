@@ -2,7 +2,7 @@
  * remoteDevices.ts - the paired devices whose remote commands run on this Mac.
  * The relay puts on each command the id of the device token that queued it
  * (`deviceId`); the bridge runs the command only when that device is `allowed`
- * in ~/.claude/session-monitor/remote-devices.json (0600 in a 0700 folder,
+ * in ~/.claude/session-monitor/remote/devices.json (0600 in a 0700 folder,
  * written through a temp file and a rename). Every window shares the file, so
  * each check reads it again. A device that is not in the file is looked up in
  * the relay's paired devices (GET /fleet/tokens) and, when listed, the window
@@ -480,7 +480,7 @@ export async function askPinOnThisMac(device: PairedDevice & { publicKey: string
     {
       modal: true,
       detail:
-        "Pin it only if the device shows the same fingerprint: then only commands signed with this key run. Deny Device refuses its commands until it is paired again. Don't Pin and closing this dialog decide neither, and the device is not asked about again for 10 minutes.",
+        "Pin only if the phone shows this same fingerprint (on the phone: Ayarlar > Eşleştirilmiş cihazlar > Anahtar parmak izi). If it differs, choose Don't Pin: the key did not come from the phone. Deny Device blocks this device until it is paired again. Once a key is pinned, only commands signed with it run; after Don't Pin or closing this dialog the device is not asked about again for 10 minutes.",
     },
     DONT_PIN,
     PIN,
@@ -523,11 +523,19 @@ export const nodeDeviceFs: DeviceFs = {
   },
 };
 
-/** The gate the bridge uses: the shared file under ~/.claude/session-monitor, the clock and the modal. */
+/**
+ * Where the device list and its first-run record live: in the monitor folder's remote/ subfolder, next to the
+ * seen command ids and the nonces, which the cleanups of the folder's top-level files never look into.
+ */
+export function devicePaths(monitorDir: string): { file: string; marker: string } {
+  const dir = path.join(monitorDir, "remote");
+  return { file: path.join(dir, "devices.json"), marker: path.join(dir, "devices-first-run.json") };
+}
+
+/** The gate the bridge uses: the shared list under ~/.claude/session-monitor/remote, the clock and the modal. */
 export function createDeviceGate(log: (msg: string) => void): DeviceGate {
   return new DeviceGate({
-    file: path.join(MONITOR_DIR, "remote-devices.json"),
-    marker: path.join(MONITOR_DIR, "remote", "devices-first-run.json"),
+    ...devicePaths(MONITOR_DIR),
     fs: nodeDeviceFs,
     now: () => Date.now(),
     prompt: askOnThisMac,

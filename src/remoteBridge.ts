@@ -148,7 +148,7 @@ export interface RemoteBridgeDeps {
   allowedCwds?: () => string[];
   /** a limited row's auto-resume state (autoResume.ts), sent on limited rows */
   autoResume?: (v: SessionView) => FleetAutoResume | null;
-  /** which paired devices may run commands (remoteDevices.ts); registerRemoteBridge uses the file under ~/.claude/session-monitor unless given */
+  /** which paired devices may run commands (remoteDevices.ts); registerRemoteBridge uses ~/.claude/session-monitor/remote/devices.json unless given */
   devices?: DeviceCheck;
   /** the nonces of the signed commands taken so far (remoteSigned.ts); registerRemoteBridge uses ~/.claude/session-monitor/remote/nonces unless given */
   nonces?: Pick<SeenIds, "claim">;

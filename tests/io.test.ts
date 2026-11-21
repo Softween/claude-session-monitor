@@ -83,6 +83,15 @@ describe("cleanupMonitorFiles", () => {
     expect(fs.existsSync(stale)).toBe(false);
     expect(fs.existsSync(path.join(tmp, "fresh.json"))).toBe(true);
   });
+
+  it("keeps the remote device list however old it is: it changes only when the owner decides", () => {
+    const devices = path.join(tmp, "remote-devices.json");
+    fs.writeFileSync(devices, JSON.stringify({ version: 1, devices: {} }));
+    backdate(devices, 13 * 3600);
+    expect(cleanupMonitorFiles(12 * 3600 * 1000, nowSec(), tmp)).toBe(0);
+    expect(cleanupEndedMonitorFiles(nowSec(), 12 * 3600 * 1000, tmp)).toBe(0);
+    expect(fs.existsSync(devices)).toBe(true);
+  });
 });
 
 describe("cleanupEndedMonitorFiles", () => {

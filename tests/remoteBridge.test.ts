@@ -315,7 +315,7 @@ function memoryNonces(): { claim(id: string): boolean } {
 }
 
 /** Every device confirmed, with the phone's key pinned: the tests that are not about the device check (remoteDevices.ts). */
-const everyDevice: DeviceCheck = { migrate: async () => undefined, refusal: async () => null, pinnedKey: () => KEY, askToPin: () => undefined };
+const everyDevice: DeviceCheck = { migrate: async () => undefined, refusal: async () => null, pinnedKey: () => KEY, askToPin: () => false };
 
 /** A bridge on the fake relay; `flags` are user settings (commands on unless a test passes its own). */
 function startBridge(
@@ -575,6 +575,7 @@ describe("RemoteBridge device check", () => {
   function devicesIn(file: string, prompts: string[], now = Date.now) {
     return new DeviceGate({
       file,
+      marker: path.join(path.dirname(file), "remote", "devices-first-run.json"),
       fs: nodeDeviceFs,
       now,
       prompt: async (d) => {
@@ -733,12 +734,13 @@ describe("RemoteBridge signed commands", () => {
     const pinAsks: string[] = [];
     const gate = new DeviceGate({
       file,
+      marker: path.join(base, "remote", "devices-first-run.json"),
       fs: nodeDeviceFs,
       now: Date.now,
       prompt: async () => undefined,
       askPin: async (d) => {
         pinAsks.push(`${d.id} ${d.publicKey}`);
-        return true;
+        return "pin";
       },
       log: () => undefined,
     });

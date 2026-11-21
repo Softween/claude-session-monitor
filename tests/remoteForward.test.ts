@@ -109,7 +109,7 @@ function signedByPhone(cmd: FleetCommand): FleetCommand {
 }
 
 /** Every paired device confirmed on this Mac with the phone's key pinned (remoteDevices.ts): the tests that are not about the device check. */
-const everyDevice: DeviceCheck = { migrate: async () => undefined, refusal: async () => null, pinnedKey: () => KEY, askToPin: () => undefined };
+const everyDevice: DeviceCheck = { migrate: async () => undefined, refusal: async () => null, pinnedKey: () => KEY, askToPin: () => false };
 
 /** A window's bridge on the machine; its executor answers "ran in <win>" unless the test passes one. */
 function windowOn(m: Machine, win: string, exec?: Exec, over: Partial<ForwardDeps> = {}, devices: DeviceCheck = everyDevice): Win {
@@ -621,7 +621,7 @@ describe("the window that holds the session checks a handed-over command again",
         return deviceId === "phone-1" ? null : NOT_CONFIRMED;
       },
       pinnedKey: () => KEY,
-      askToPin: () => undefined,
+      askToPin: () => false,
     };
     const b = windowOn(m, WIN_B, undefined, {}, devices);
     record(m, "c1");

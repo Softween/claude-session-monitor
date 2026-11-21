@@ -9,6 +9,7 @@ import type { PairedDevice } from "../src/remoteDevices";
 import {
   AHEAD,
   CONFIRM_KEY,
+  KEY_NOT_PINNED,
   KEY_NOT_READ,
   NONCE_RETAIN_MS,
   NONCE_SEEN,
@@ -62,7 +63,9 @@ const relayCmd = (signed: string, over: Record<string, unknown> = {}): FleetComm
 const refused = (refusal: string) => ({ ok: false, refusal });
 
 /** The check's dependencies: this Mac's clock at `now`, its host, a pinned key for every device unless `pinned` says otherwise. */
-function deps(o: { now?: number; host?: string; allowed?: readonly string[]; pinned?: unknown; listed?: () => Promise<PairedDevice | undefined> } = {}) {
+function deps(
+  o: { now?: number; host?: string; allowed?: readonly string[]; pinned?: unknown; listed?: () => Promise<PairedDevice | undefined>; asks?: boolean } = {},
+) {
   const taken = new Set<string>();
   const pinAsks: PairedDevice[] = [];
   const lookups: string[] = [];
@@ -73,7 +76,10 @@ function deps(o: { now?: number; host?: string; allowed?: readonly string[]; pin
     nonces: { claim: (id) => !taken.has(id) && !!taken.add(id) },
     devices: {
       pinnedKey: () => ("pinned" in o ? o.pinned : KEY),
-      askToPin: (device) => void pinAsks.push(device),
+      askToPin: (device) => {
+        pinAsks.push(device);
+        return o.asks ?? true; // whether a prompt shows now
+      },
     },
     listed: async (id) => {
       lookups.push(id);
@@ -114,6 +120,18 @@ describe("the protocol's test vector", () => {
     const near = Buffer.from(KEY, "base64");
     near[31] ^= 1;
     expect(verifySigned(SIGNED, SIG, near.toString("base64"))).toBe(false);
+  });
+
+  it("does not verify a text whose UTF-8 bytes stand for another text: a lone surrogate where the signed text has U+FFFD", async () => {
+    const text = envelope({ type: "send", nonce: "n-fffd", args: { sessionId: SESSION, text: "a\uFFFDb" } });
+    const sig = signText(text);
+    expect(verifySigned(text, sig, KEY)).toBe(true);
+    const swapped = text.replace("\uFFFD", "\uD800");
+    expect(swapped).not.toBe(text);
+    expect(Buffer.from(swapped, "utf8").equals(Buffer.from(text, "utf8"))).toBe(true); // the same bytes
+    expect(verifySigned(swapped, sig, KEY)).toBe(false);
+    expect(await checkSigned({ ...relayCmd(text), signed: swapped, sig }, deps({ allowed: ["send"] }).d)).toEqual(refused(NOT_VERIFIED));
+    expect(verifySigned("\uD800", sign(null, Buffer.from("\uFFFD", "utf8"), phoneKey).toString("base64"), KEY)).toBe(false);
   });
 
   it("takes a key only as canonical base64 of 32 bytes and a signature only as canonical base64 of 64", () => {
@@ -272,6 +290,13 @@ describe("checkSigned: an allowed device without a pinned key", () => {
     expect(taken.has(NONCE)).toBe(true);
     expect(await checkSigned(relayCmd(SIGNED, { id: "hub-2" }), d)).toEqual(refused(NONCE_SEEN));
     expect(pinAsks).toHaveLength(1);
+  });
+
+  it("says the key is not pinned, without asking to confirm it, while the owner is not asked about the device again yet", async () => {
+    const { d, taken, pinAsks } = deps({ pinned: undefined, listed: listedWith(KEY), asks: false });
+    expect(await checkSigned(relayCmd(SIGNED), d)).toEqual(refused(KEY_NOT_PINNED));
+    expect(pinAsks).toHaveLength(1);
+    expect(taken.has(NONCE)).toBe(true);
   });
 
   it("asks nothing when the relay lists no key or another one, or cannot be read", async () => {

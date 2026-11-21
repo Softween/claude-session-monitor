@@ -634,18 +634,35 @@ describe("withTimeout", () => {
   afterEach(() => {
     vi.useRealTimers();
   });
-  it("passes a prompt answer through", async () => {
-    expect(await withTimeout(Promise.resolve("done"), 50, "late")).toBe("done");
+  it("passes a prompt answer through and leaves the work's signal alone", async () => {
+    let signal: AbortSignal | undefined;
+    const run = async (s: AbortSignal): Promise<string> => {
+      signal = s;
+      return "done";
+    };
+    expect(await withTimeout(run, 50, "late")).toBe("done");
+    expect(signal?.aborted).toBe(false);
   });
-  it("answers the fallback once the time is up", async () => {
+  it("answers the fallback once the time is up and aborts the work's signal then, not before", async () => {
     vi.useFakeTimers();
     expect(COMMAND_TIMEOUT_MS).toBe(60_000);
-    const p = withTimeout(new Promise<string>(() => undefined), COMMAND_TIMEOUT_MS, "timed out");
-    await vi.advanceTimersByTimeAsync(COMMAND_TIMEOUT_MS);
+    let signal: AbortSignal | undefined;
+    const p = withTimeout(
+      (s) => {
+        signal = s;
+        return new Promise<string>(() => undefined);
+      },
+      COMMAND_TIMEOUT_MS,
+      "timed out",
+    );
+    await vi.advanceTimersByTimeAsync(COMMAND_TIMEOUT_MS - 1);
+    expect(signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
     expect(await p).toBe("timed out");
+    expect(signal?.aborted).toBe(true);
   });
   it("passes a rejection through", async () => {
-    await expect(withTimeout(Promise.reject(new Error("boom")), 50, "late")).rejects.toThrow("boom");
+    await expect(withTimeout(() => Promise.reject(new Error("boom")), 50, "late")).rejects.toThrow("boom");
   });
 });
 

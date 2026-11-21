@@ -133,6 +133,30 @@ describe("deliverText: one delivery path per command", () => {
     expect(before.calls).toEqual(["terminal", "typed", "uds"]);
   });
 
+  it("runs no further path once the command's time is up", async () => {
+    for (const abortIn of ["terminal", "typed"]) {
+      const ac = new AbortController();
+      const calls: string[] = [];
+      const step = (via: string) => async (): Promise<PathAttempt> => {
+        calls.push(via);
+        if (via === abortIn) ac.abort();
+        return skip(`no ${via}`);
+      };
+      const out = await deliverText({
+        text: "run the tests",
+        terminal: step("terminal"),
+        typed: step("typed"),
+        uds: async () => {
+          calls.push("uds");
+          return inboxOk;
+        },
+        signal: ac.signal,
+      });
+      expect(out).toEqual({ ok: false, message: "timed out" });
+      expect(calls).toEqual(abortIn === "terminal" ? ["terminal"] : ["terminal", "typed"]);
+    }
+  });
+
   it("names every skipped path when the inbox fails too", async () => {
     const refused = paths({ uds: { ok: false, code: "target", error: "no session record" } });
     expect(await refused.run()).toEqual({
@@ -247,7 +271,7 @@ const everyDevice: DeviceCheck = { migrate: async () => undefined, refusal: asyn
 
 /** A bridge on the fake relay; `flags` are user settings (commands on unless a test passes its own). */
 function startBridge(
-  execute: (cmd: FleetCommand) => Promise<CommandOutcome>,
+  execute: (cmd: FleetCommand, signal: AbortSignal) => Promise<CommandOutcome>,
   flags: Record<string, unknown> = { "remote.acceptCommands": true },
   devices: DeviceCheck = everyDevice,
 ): RemoteBridge {
@@ -360,6 +384,34 @@ describe("RemoteBridge command loop", () => {
     expect(r.results).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(1_000);
     await vi.waitFor(() => expect(r.results).toEqual([{ id: "slow", body: { ok: false, message: "timed out" } }]));
+    bridge.dispose();
+  });
+
+  it("cancels a command that runs past 60 s: its signal aborts and it types nothing more", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const r = relay([{ id: "slow", type: "send", sessionId: "s1", text: "a long text", createdAt: Date.now() }]);
+    let keystrokes = 0;
+    let signal: AbortSignal | undefined;
+    const bridge = startBridge(
+      async (_cmd, s) => {
+        signal = s;
+        while (!s.aborted) {
+          keystrokes++;
+          await new Promise((resolve) => setTimeout(resolve, 1_000));
+        }
+        return { ok: false, message: "typing stopped" };
+      },
+      { "remote.acceptCommands": true, "remote.allowedCommands": ["send"] },
+    );
+    await bridge.restart();
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(r.results).toEqual([{ id: "slow", body: { ok: false, message: "timed out" } }]));
+    expect(signal?.aborted).toBe(true);
+    const typed = keystrokes;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(keystrokes).toBe(typed);
     bridge.dispose();
   });
 

@@ -2157,7 +2157,7 @@ describe("resume terminals: reuse, and remote resume / send / kill without a hoo
     };
     lastCtx = mkCtx();
     ext.activate(lastCtx);
-    return rec.bridgeDeps.execute;
+    return (cmd) => rec.bridgeDeps.execute(cmd, new AbortController().signal);
   }
   const refresh = () => rec.commands.get("claudeSessionMonitor.refresh")!();
 

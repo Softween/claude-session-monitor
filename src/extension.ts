@@ -25,6 +25,7 @@ import { BurnTracker } from "./burnTracker";
 import { TYPED_REASON, deliverText, registerRemoteBridge, remoteCwdRoots, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt, type RemoteBridge } from "./remoteBridge";
 import { runTool } from "./remote";
 import { sanitizeRemoteLine } from "./remoteInput";
+import { TIMED_OUT, nodeForwardDeps } from "./remoteForward";
 import { backgroundByDue, fmtClock, timingNote } from "./closingBuckets";
 import { resolveClaudeBinary } from "./claudeBinary";
 import { stageGuard } from "./safeStage";
@@ -3475,7 +3476,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
    * typing osascript checks the frontmost app itself. Never prompts. `skip` = nothing
    * was typed; only a failed keystroke is final.
    */
-  async function typeIntoSession(v: SessionView, text: string): Promise<PathAttempt> {
+  async function typeIntoSession(v: SessionView, text: string, stop?: AbortSignal): Promise<PathAttempt> {
     const skip = (reason: string, detail?: string): PathAttempt => ({ ok: false, skip: true, reason, detail });
     if (!remoteFlag("remote.typeFallback")) return skip("typing disabled (remote.typeFallback is off)");
     const held = automationGate.blocker("remoteTyping");
@@ -3489,9 +3490,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (!windowFocused()) return skip(TYPED_REASON["not-frontmost"], "this VS Code window is not focused");
     const s = sanitizeRemoteLine(text);
     if (!s.ok) return { ok: false, skip: false, reason: s.reason };
+    if (stop?.aborted) return { ok: false, skip: false, reason: TIMED_OUT };
     const signal = automationGate.signal("remoteTyping");
     await focusTab(tab.gi, tab.ti); // also when active: showing it moves the keyboard focus into the tab
-    const r = await typeIntoFocusedSession(s.line, undefined, () => !disposed && !resumeActive && !signal.aborted, {
+    const r = await typeIntoFocusedSession(s.line, undefined, () => !disposed && !resumeActive && !signal.aborted && !stop?.aborted, {
       activate: false,
       tabActive: () => findSessionTab(v, rivals)?.active === true,
       label: `remote ${v.key}`,
@@ -3511,6 +3513,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
     return views.filter((v) => findSessionTab(v, rivalLabels(v)) !== null);
   }
 
+  /** This window holds the session for a tab-bound remote command (remoteForward.ts): a live terminal it started or registered, or its one matching tab. */
+  function holdsSession(v: SessionView): boolean {
+    if (resumeTerminals.liveTerminalFor(v.sessionId)) return true;
+    return v.provider === "claude" && groupOf(v) !== "ended" && findSessionTab(v, rivalLabels(v)) !== null;
+  }
+
   /**
    * Remote path (a): write `text` + Return straight into the VS Code terminal
    * that hosts the session (process-tree match first, else the one terminal
@@ -3519,7 +3527,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
    * user keeps working where they are. `skip` when no terminal here is the
    * session's; the text must pass sanitizeRemoteLine before it is written.
    */
-  async function sendToSessionTerminal(v: SessionView, text: string): Promise<PathAttempt> {
+  async function sendToSessionTerminal(v: SessionView, text: string, stop?: AbortSignal): Promise<PathAttempt> {
     if (v.provider !== "claude" || !v.capabilities.bulkInput) {
       return { ok: false, skip: true, reason: "this session has no typable Claude input" };
     }
@@ -3532,6 +3540,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (!term) return { ok: false, skip: true, reason: "no terminal for this session in this window" };
     const s = sanitizeRemoteLine(text);
     if (!s.ok) return { ok: false, skip: false, reason: s.reason };
+    if (stop?.aborted) return { ok: false, skip: false, reason: TIMED_OUT };
     try {
       term.sendText(s.line + "\r", false);
       return { ok: true };
@@ -4190,7 +4199,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     });
   }
 
-  async function executeRemote(cmd: FleetCommand): Promise<CommandOutcome> {
+  /** Runs a remote command; once `signal` aborts (its 60 s are up) nothing more is written, typed, opened or killed. */
+  async function executeRemote(cmd: FleetCommand, signal: AbortSignal): Promise<CommandOutcome> {
     const find = () => (cmd.sessionId ? lastAllViews.find((v) => v.sessionId === cmd.sessionId) : undefined);
     switch (cmd.type) {
       case "resume": {
@@ -4201,14 +4211,14 @@ export function activate(ctx: vscode.ExtensionContext): void {
         // (no tab switch, no focus change), the live terminal this window resumed
         // it in included. Only a session with no terminal is reopened, in the
         // background, so the user keeps working where they are.
-        const written = await sendToSessionTerminal(v, "resume");
+        const written = await sendToSessionTerminal(v, "resume", signal);
         if (written.ok) return { ok: true, message: `"resume" written into the open session "${truncate(v.title, 40)}"` };
         if (!written.skip) return { ok: false, message: `"resume" could not be written into the session's terminal: ${written.reason}` };
         if (v.pid && pidAlive(v.pid)) {
           // The session is running somewhere without a terminal we can address
           // (the Claude Code extension's own tab): a second `claude --resume`
           // would duplicate it, so type into the tab, only under the keystroke rules.
-          const typed = await typeIntoSession(v, "resume");
+          const typed = await typeIntoSession(v, "resume", signal);
           if (typed.ok) return { ok: true, message: `"resume" typed into the running session "${truncate(v.title, 40)}"` };
           if (typed.reason === NO_TAB_MESSAGE) return { ok: false, message: NO_TAB_MESSAGE };
           return {
@@ -4220,6 +4230,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         if (v.provider === "claude" && !(await claudeBinary)) {
           return { ok: false, message: "claude executable not found on this Mac; remote resume refused" };
         }
+        if (signal.aborted) return { ok: false, message: TIMED_OUT };
         resumeInTerminal(v, { show: false });
         return { ok: true, message: `resume terminal opened in the background for "${truncate(v.title, 40)}"` };
       }
@@ -4234,6 +4245,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
             : undefined;
         if (!v || !pid) return { ok: false, message: "no process id known for this session" };
         if (!(await verifyKillTarget(v, pid))) return { ok: false, message: "the recorded process has exited or no longer matches" };
+        if (signal.aborted) return { ok: false, message: TIMED_OUT };
         try {
           process.kill(pid, "SIGTERM");
         } catch (e) {
@@ -4290,9 +4302,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
         const text = cmd.text;
         return deliverText({
           text,
-          terminal: () => sendToSessionTerminal(v, text),
-          typed: () => typeIntoSession(v, text),
+          terminal: () => sendToSessionTerminal(v, text, signal),
+          typed: () => typeIntoSession(v, text, signal),
           uds: (line) => sendToSession({ pid: v.pid, sessionId: v.sessionId, text: line, timeoutMs: 5000, waitTranscriptMs: 15_000 }),
+          signal,
         });
       }
       default:
@@ -4318,12 +4331,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   // Each feature start below fails alone: the others and the first refresh still run.
   // Observer mode (observerMode.ts) skips the bridge and the restart guard and keeps wakes and continuity disabled.
+  let healthNow: (() => void) | undefined; // writes this window's health file now; set below, once its deps exist
   remoteBridge = allowed("remoteBridge") ? stages.safe("remote bridge start", () => registerRemoteBridge(ctx, {
     log,
     accounts: remoteAccounts,
     execute: executeRemote,
     allowedCwds: () => remoteCwds(),
     autoResume: (v) => rowAutoResume(v, autoResumeOverrides(), autoResumeAll(), autoResumeAt),
+    // A tab-bound command goes to the window holding its session; the health file lists the sessions this one holds.
+    forward: nodeForwardDeps({ win, monitorDir: MONITOR_DIR, healthDir: HEALTH_DIR, shared: () => allowed("sharedFiles"), holds: holdsSession, log }),
+    holdsChanged: () => healthNow?.(),
   })) : undefined;
 
   // After a restart, show each limit-stopped Claude Code tab once so its process runs
@@ -4465,10 +4482,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
     failures: () => stages.lastFailures(),
     refresh: refreshMs,
     guardArmed: () => restartGuard?.armed() === true,
+    holds: () => remoteBridge?.held(),
     shared: () => allowed("sharedFiles"),
     write: writePrivateTextAtomic,
     remove: (file) => fs.rmSync(file, { force: true }),
   };
+  healthNow = () => stages.safe("health", () => writeHealth(health));
   const overseer = new OverseerBeat(nodeBeatDeps(HEALTH_DIR, overseerBin(), () => allowed("sharedFiles"), log));
   const observe = (): void => {
     stages.safe("error registry", saveStageErrors);

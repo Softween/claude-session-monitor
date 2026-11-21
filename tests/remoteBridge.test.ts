@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -21,6 +22,7 @@ import { nothingTyped } from "../src/keystrokeTyping";
 import type { PeerSendResult } from "../src/peerSend";
 import { DEFAULT_ALLOWED_COMMANDS, REMOTE_COMMAND_TYPES } from "../src/remote";
 import { RemoteBridge, TYPED_REASON, deliverText, remoteAllowedCommands, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt } from "../src/remoteBridge";
+import { DeviceGate, nodeDeviceFs, type DeviceCheck } from "../src/remoteDevices";
 
 afterEach(() => {
   settings.clear();
@@ -220,14 +222,15 @@ function response(body: unknown, contentLength?: string) {
   };
 }
 
-/** A fake relay: the first poll hands out `commands`, later polls hang until the bridge stops. */
-function relay(commands: unknown[], contentLength?: string) {
+/** A fake relay: the first poll hands out `commands`, later polls hang until the bridge stops; GET /fleet/tokens lists `tokens`. */
+function relay(commands: unknown[], contentLength?: string, tokens: unknown[] = []) {
   const calls: FetchCall[] = [];
   const results: Array<{ id: string; body: CommandOutcome }> = [];
   let polls = 0;
   const fetchMock = vi.fn(async (url: string, init: FetchCall["init"]) => {
     calls.push({ url, init });
     if (init.method === "GET") {
+      if (url.endsWith("/fleet/tokens")) return response({ success: true, data: { tokens } });
       if (++polls === 1) return response({ success: true, data: { commands } }, contentLength);
       return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(new Error("aborted"))));
     }
@@ -239,10 +242,14 @@ function relay(commands: unknown[], contentLength?: string) {
   return { calls, results };
 }
 
+/** Every device confirmed: the tests that are not about the device check (remoteDevices.ts). */
+const everyDevice: DeviceCheck = { migrate: async () => undefined, refusal: async () => null };
+
 /** A bridge on the fake relay; `flags` are user settings (commands on unless a test passes its own). */
 function startBridge(
   execute: (cmd: FleetCommand) => Promise<CommandOutcome>,
   flags: Record<string, unknown> = { "remote.acceptCommands": true },
+  devices: DeviceCheck = everyDevice,
 ): RemoteBridge {
   settings.set("remote.url", "https://relay.test");
   settings.set("remote.host", "mac");
@@ -251,7 +258,7 @@ function startBridge(
     extension: { packageJSON: { version: "0.0.0-test" } },
     secrets: { get: async () => JSON.stringify({ origin: "https://relay.test", token: "test-token" }) },
   };
-  return new RemoteBridge(ctx as never, { log: () => undefined, accounts: () => ({ accounts: [], bestId: null }), execute });
+  return new RemoteBridge(ctx as never, { log: () => undefined, accounts: () => ({ accounts: [], bestId: null }), execute, devices });
 }
 
 describe("RemoteBridge command loop", () => {
@@ -430,6 +437,7 @@ describe("remote.allowedCwds in the pushed snapshot", () => {
       accounts: () => ({ accounts: [{ id: "a1", email: "alice@example.com", plan: null, active: true, gauges: [] }], bestId: null }),
       execute: async () => ({ ok: true, message: "" }),
       allowedCwds: () => ["/r/app", "/x/tool"],
+      devices: everyDevice,
     });
     await bridge.restart();
     bridge.onRows([sessionRow("s1", "/r/app"), sessionRow("s2", "/x/secret")]);
@@ -452,5 +460,74 @@ describe("remote.allowedCwds in the pushed snapshot", () => {
     const body = await pushOnce();
     expect(body.sessions.map((s) => s.cwd)).toEqual(["app", "secret"]);
     expect(body.allowedCwds).toEqual([]);
+  });
+});
+
+describe("RemoteBridge device check", () => {
+  let base = "";
+  afterEach(() => {
+    if (base) fs.rmSync(base, { recursive: true, force: true });
+    base = "";
+  });
+
+  /** A real gate over a temp file; the modal is recorded and closed without an answer. */
+  function devicesIn(file: string, prompts: string[], now = Date.now) {
+    return new DeviceGate({
+      file,
+      fs: nodeDeviceFs,
+      now,
+      prompt: async (d) => {
+        prompts.push(`${d.id} ${d.name}`);
+        return undefined;
+      },
+      log: () => undefined,
+    });
+  }
+
+  it("runs a command only from a device confirmed on this Mac and posts every refusal to the relay", async () => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "csm-bridge-devices-"));
+    const file = path.join(base, "remote-devices.json");
+    const entry = (state: string, name: string) => ({ state, name, pairedAt: 1, decidedAt: 2 });
+    fs.writeFileSync(file, JSON.stringify({ version: 1, devices: { phone: entry("allowed", "iPhone"), tablet: entry("denied", "iPad") } }));
+    const prompts: string[] = [];
+    const now = Date.now();
+    const kill = (id: string, deviceId?: string | null) => ({ id, type: "kill", sessionId: "s1", createdAt: now, ...(deviceId === undefined ? {} : { deviceId }) });
+    const r = relay([kill("a", "phone"), kill("b", "tablet"), kill("c", "stranger"), kill("d"), kill("e", null)], undefined, [
+      { id: "stranger", name: "Unknown phone", createdAt: now - 1000, lastUsedAt: null, current: false },
+    ]);
+    const execute = vi.fn(async (cmd: FleetCommand) => ({ ok: true, message: `ran ${cmd.id}` }));
+    const bridge = startBridge(execute, undefined, devicesIn(file, prompts));
+    await bridge.restart();
+    await vi.waitFor(() => expect(r.results).toHaveLength(5));
+    await vi.waitFor(() => expect(prompts).toEqual(["stranger Unknown phone"]));
+    bridge.dispose();
+
+    expect(execute.mock.calls.map(([cmd]) => cmd.id)).toEqual(["a"]);
+    expect(r.results).toEqual([
+      { id: "a", body: { ok: true, message: "ran a" } },
+      { id: "b", body: { ok: false, message: "device denied on this Mac" } },
+      { id: "c", body: { ok: false, message: "device not confirmed on this Mac" } },
+      { id: "d", body: { ok: false, message: "device not confirmed on this Mac" } },
+      { id: "e", body: { ok: false, message: "device not confirmed on this Mac" } },
+    ]);
+  });
+
+  it("on its first start confirms the devices the relay lists, with the bridge token, once", async () => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "csm-bridge-devices-"));
+    const file = path.join(base, "session-monitor", "remote-devices.json");
+    const r = relay([], undefined, [{ id: "phone", name: "iPhone", createdAt: 1, lastUsedAt: null, current: false }]);
+    const bridge = startBridge(vi.fn(async () => ({ ok: true, message: "ran" })), undefined, devicesIn(file, [], () => 5));
+    await bridge.restart();
+    await vi.waitFor(() => expect(fs.existsSync(file)).toBe(true));
+    await bridge.restart();
+    bridge.dispose();
+
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({
+      version: 1,
+      devices: { phone: { state: "allowed", name: "iPhone", pairedAt: 1, decidedAt: 5 } },
+    });
+    const lookups = r.calls.filter((c) => c.url === "https://relay.test/fleet/tokens");
+    expect(lookups).toHaveLength(1);
+    expect((lookups[0].init as unknown as { headers: Record<string, string> }).headers.Authorization).toBe("Bearer test-token");
   });
 });

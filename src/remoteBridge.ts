@@ -33,6 +33,7 @@ import {
   type SnapshotAccountInput,
 } from "./remote";
 import { cwdRoots } from "./remoteCwds";
+import { createDeviceGate, type DeviceCheck, type PairedLookup } from "./remoteDevices";
 import { sanitizeRemoteLine } from "./remoteInput";
 
 export const REMOTE_TOKEN_KEY = "csm.remote.token";
@@ -54,6 +55,8 @@ export interface FleetCommand {
   toolUseId?: string | null;
   answers?: unknown;
   createdAt?: number;
+  /** the paired device that queued it (the relay's device token id); null or missing for none */
+  deviceId?: string | null;
 }
 
 export interface CommandOutcome { ok: boolean; message: string }
@@ -126,6 +129,8 @@ export interface RemoteBridgeDeps {
   allowedCwds?: () => string[];
   /** a limited row's auto-resume state (autoResume.ts), sent on limited rows */
   autoResume?: (v: SessionView) => FleetAutoResume | null;
+  /** which paired devices may run commands (remoteDevices.ts); registerRemoteBridge uses the file under ~/.claude/session-monitor unless given */
+  devices?: DeviceCheck;
 }
 
 interface BridgeCfg { url: string; host: string; token: string }
@@ -167,7 +172,7 @@ export class RemoteBridge implements vscode.Disposable {
 
   private readonly userAgent: string;
 
-  constructor(private readonly ctx: vscode.ExtensionContext, private readonly deps: RemoteBridgeDeps) {
+  constructor(private readonly ctx: vscode.ExtensionContext, private readonly deps: RemoteBridgeDeps & { devices: DeviceCheck }) {
     // Cloudflare answers 403 (error 1010) to generic fetch user agents.
     const version = (ctx.extension?.packageJSON as { version?: string } | undefined)?.version ?? "0.0.0";
     this.userAgent = `claude-session-monitor/${version}`;
@@ -206,6 +211,7 @@ export class RemoteBridge implements vscode.Disposable {
     this.cfg = { url, host, token: stored.token };
     this.stop = new AbortController();
     this.deps.log(`remote: bridge on (${url}, host ${host})`);
+    void this.deps.devices.migrate(this.pairedLookup(this.cfg, this.stop.signal));
     void this.pollLoop(this.cfg, this.stop.signal);
   }
 
@@ -351,7 +357,9 @@ export class RemoteBridge implements vscode.Disposable {
     if (!cmd || typeof cmd.id !== "string" || !cmd.id) return;
     // The kill switch, the allowlist and the 2 min expiry answer before any action runs;
     // a command that runs gets 60 s, then its result says "timed out" and the loop moves on.
-    const refusal = commandRefusal(cmd, Date.now(), remoteFlag("remote.acceptCommands"), remoteAllowedCommands());
+    const refusal =
+      commandRefusal(cmd, Date.now(), remoteFlag("remote.acceptCommands"), remoteAllowedCommands()) ??
+      (await this.deps.devices.refusal(cmd.deviceId, this.pairedLookup(cfg, signal))); // then only a device confirmed on this Mac
     let out: CommandOutcome;
     if (refusal) {
       out = { ok: false, message: refusal };
@@ -388,6 +396,11 @@ export class RemoteBridge implements vscode.Disposable {
     const after = Date.now();
     this.forceAfter = after;
     while (!signal.aborted && this.lastPushBuiltAt < after && Date.now() - after < FLUSH_WAIT_MS) await sleep(250, signal);
+  }
+
+  /** The relay's paired devices (GET /fleet/tokens) for the device check. */
+  private pairedLookup(cfg: BridgeCfg, signal: AbortSignal): PairedLookup {
+    return () => this.request(cfg, "GET", "/fleet/tokens", undefined, REQUEST_TIMEOUT_MS, signal);
   }
 
   /**
@@ -472,7 +485,7 @@ export function remoteAllowedCommands(): readonly string[] {
 
 /** Register the bridge, its two commands and its lifecycle hooks; returns the bridge for the poll cycle. */
 export function registerRemoteBridge(ctx: vscode.ExtensionContext, deps: RemoteBridgeDeps): RemoteBridge {
-  const bridge = new RemoteBridge(ctx, deps);
+  const bridge = new RemoteBridge(ctx, { ...deps, devices: deps.devices ?? createDeviceGate(deps.log) });
   ctx.subscriptions.push(
     bridge,
     vscode.commands.registerCommand("claudeSessionMonitor.setRemoteToken", async () => {

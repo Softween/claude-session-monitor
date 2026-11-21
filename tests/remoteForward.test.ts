@@ -117,7 +117,8 @@ function windowOn(m: Machine, win: string, exec?: Exec, over: Partial<ForwardDep
     },
     forward,
     holdsChanged: () => void w.changed++,
-  });
+    devices: { migrate: async () => undefined, refusal: async () => null }, // every paired device confirmed
+  } as ConstructorParameters<typeof RemoteBridge>[1]);
   bridges.push(w.bridge);
   return w;
 }
@@ -188,7 +189,7 @@ describe("a tab-bound remote command runs in the window that holds the session",
   it("is handed to the live window holding the session, which runs it; the window that got it reports that result", async () => {
     commandsOn();
     const m = machine();
-    const r = relay([[command("c1", "send", { text: "run the tests" })]]);
+    const r = relay([[command("c1", "send", { text: "run the tests", deviceId: "phone-1" } as Partial<FleetCommand>)]]);
     const a = windowOn(m, WIN_A);
     const b = windowOn(m, WIN_B, async () => ({ ok: true, message: "delivered via typed" }));
     b.held.add(SID);
@@ -200,7 +201,7 @@ describe("a tab-bound remote command runs in the window that holds the session",
 
     expect(r.results[0]).toEqual({ id: "c1", body: { ok: true, message: "delivered via typed" } });
     expect(a.ran).toEqual([]);
-    expect(b.ran).toEqual([{ id: "c1", type: "send", sessionId: SID, text: "run the tests", createdAt: expect.any(Number) }]);
+    expect(b.ran).toEqual([{ id: "c1", type: "send", sessionId: SID, text: "run the tests", createdAt: expect.any(Number), deviceId: "phone-1" }]); // unchanged
     expect(a.logs.join("\n")).toContain(`send c1 handed to window ${WIN_B}, which holds the session`);
     expect(b.logs.join("\n")).toContain(`send c1 from window ${WIN_A} -> ok: delivered via typed`);
     expect(inboxFiles(m)).toEqual([]); // the command and its result were removed once read
@@ -398,9 +399,9 @@ describe("a tab-bound remote command runs in the window that holds the session",
 });
 
 describe("parseRequest", () => {
-  it("keeps the fields a tab-bound command reads and refuses anything else", () => {
-    const ok = { v: 1, from: WIN_A, deadline: 5, cmd: { id: "c1", type: "send", sessionId: SID, text: "hi", createdAt: 3, account: "x@y" } };
-    expect(parseRequest(JSON.stringify(ok))).toEqual({ from: WIN_A, deadline: 5, cmd: { id: "c1", type: "send", sessionId: SID, text: "hi", createdAt: 3 } });
+  it("gives the command back unchanged, its device id included, and refuses anything but a tab-bound command from a window", () => {
+    const ok = { v: 1, from: WIN_A, deadline: 5, cmd: { id: "c1", type: "send", sessionId: SID, text: "hi", createdAt: 3, deviceId: "phone-1" } };
+    expect(parseRequest(JSON.stringify(ok))).toEqual({ from: WIN_A, deadline: 5, cmd: ok.cmd });
     expect(TAB_BOUND_TYPES).toEqual(["send", "resume", "kill"]);
     for (const bad of [
       { ...ok, v: 2 },

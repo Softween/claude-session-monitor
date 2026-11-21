@@ -189,7 +189,12 @@ export class RemoteBridge implements vscode.Disposable {
     // Cloudflare answers 403 (error 1010) to generic fetch user agents.
     const version = (ctx.extension?.packageJSON as { version?: string } | undefined)?.version ?? "0.0.0";
     this.userAgent = `claude-session-monitor/${version}`;
-    this.forwarder = new RemoteForwarder(deps.execute, (cmd) => this.refusal(cmd), deps.forward);
+    // A command another window hands over passes the same refusal step here, without asking about its device.
+    this.forwarder = new RemoteForwarder(
+      deps.execute,
+      (cmd) => (this.cfg && this.stop ? this.refusal(cmd, this.cfg, this.stop.signal, false) : Promise.resolve("the bridge stopped")),
+      deps.forward,
+    );
   }
 
   get running(): boolean {
@@ -380,11 +385,9 @@ export class RemoteBridge implements vscode.Disposable {
 
   private async runCommand(cfg: BridgeCfg, cmd: FleetCommand, signal: AbortSignal): Promise<void> {
     if (!cmd || typeof cmd.id !== "string" || !cmd.id) return;
-    // The kill switch, the allowlist and the 2 min expiry answer before any action runs;
+    // The kill switch, the allowlist, the 2 min expiry and the device check answer before any action runs;
     // a command that runs gets 60 s, then its result says "timed out" and the loop moves on.
-    const refusal =
-      commandRefusal(cmd, Date.now(), remoteFlag("remote.acceptCommands"), remoteAllowedCommands()) ??
-      (await this.deps.devices.refusal(cmd.deviceId, this.pairedLookup(cfg, signal))); // then only a device confirmed on this Mac
+    const refusal = await this.refusal(cmd, cfg, signal, true);
     let out: CommandOutcome;
     if (refusal) {
       out = { ok: false, message: refusal };
@@ -415,11 +418,17 @@ export class RemoteBridge implements vscode.Disposable {
   /**
    * Why `cmd` must not run in this window, or null to run it: commands are off,
    * its type is not allowed or it is older than 2 min (remote.ts commandRefusal),
-   * by this window's settings. Asked before any action runs, for a relay command
-   * and for a command another window handed to this one (remoteForward.ts).
+   * by this window's settings, then its device is not confirmed on this Mac
+   * (remoteDevices.ts). Asked before any action runs, for a relay command and for
+   * a command another window handed to this one (remoteForward.ts). Only with
+   * `ask` does an unknown device raise the question here: the window that got a
+   * command from the relay asks, the window it hands the command to never does.
    */
-  private async refusal(cmd: FleetCommand): Promise<string | null> {
-    return commandRefusal(cmd, Date.now(), remoteFlag("remote.acceptCommands"), remoteAllowedCommands());
+  private async refusal(cmd: FleetCommand, cfg: BridgeCfg, signal: AbortSignal, ask: boolean): Promise<string | null> {
+    return (
+      commandRefusal(cmd, Date.now(), remoteFlag("remote.acceptCommands"), remoteAllowedCommands()) ??
+      (await this.deps.devices.refusal(cmd.deviceId, this.pairedLookup(cfg, signal), ask)) // then only a device confirmed on this Mac
+    );
   }
 
   /**

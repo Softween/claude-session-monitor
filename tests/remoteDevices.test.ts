@@ -116,6 +116,21 @@ describe("DeviceGate: which devices run commands", () => {
     expect(prompts).toHaveLength(1);
   });
 
+  it("with asking off (a command another window handed over) refuses an unknown device without a lookup or a notification", async () => {
+    writeStore({ [IPHONE]: allowed("iPhone"), [IPAD]: denied("iPad") });
+    const relay = async () => tokens({ id: NEW, name: "Ali's iPhone", createdAt: T0 - 60_000 });
+    const { g, lookup, prompts, lookups } = gate({ relay });
+    expect(await g.refusal(NEW, lookup, false)).toBe(NOT_CONFIRMED);
+    expect(await g.refusal(IPHONE, lookup, false)).toBeNull();
+    expect(await g.refusal(IPAD, lookup, false)).toBe(DENIED);
+    await flush();
+    expect(lookups()).toBe(0);
+    expect(prompts).toEqual([]);
+
+    expect(await g.refusal(NEW, lookup)).toBe(NOT_CONFIRMED); // a command from the relay still asks
+    await vi.waitFor(() => expect(prompts).toEqual([{ id: NEW, name: "Ali's iPhone", pairedAt: T0 - 60_000 }]));
+  });
+
   it("Deny keeps refusing without asking again; a closed modal decides nothing and the next command asks again", async () => {
     writeStore({});
     const relay = async () => tokens({ id: NEW, name: "iPad", createdAt: T0 });

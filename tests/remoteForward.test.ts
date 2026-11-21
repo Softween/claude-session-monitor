@@ -26,6 +26,7 @@ import { LIVE_MS } from "../src/overseerBeat";
 import { defaultCapabilities, type SessionView } from "../src/providers/types";
 import { COMMAND_MAX_AGE_MS, COMMAND_TIMEOUT_MS, REMOTE_COMMAND_TYPES } from "../src/remote";
 import { RemoteBridge, type CommandOutcome, type FleetCommand } from "../src/remoteBridge";
+import { NOT_CONFIRMED, type DeviceCheck } from "../src/remoteDevices";
 import { ALREADY_RUN, TAB_BOUND_TYPES, TIMED_OUT, nodeForwardFs, parseRequest, type ForwardDeps } from "../src/remoteForward";
 import { SeenIds, nodeSeenFs } from "../src/seenIds";
 
@@ -88,8 +89,11 @@ interface Win {
 
 type Exec = (cmd: FleetCommand, signal: AbortSignal) => Promise<CommandOutcome>;
 
+/** Every paired device confirmed on this Mac (remoteDevices.ts): the tests that are not about the device check. */
+const everyDevice: DeviceCheck = { migrate: async () => undefined, refusal: async () => null };
+
 /** A window's bridge on the machine; its executor answers "ran in <win>" unless the test passes one. */
-function windowOn(m: Machine, win: string, exec?: Exec, over: Partial<ForwardDeps> = {}): Win {
+function windowOn(m: Machine, win: string, exec?: Exec, over: Partial<ForwardDeps> = {}, devices: DeviceCheck = everyDevice): Win {
   const w = { ran: [], logs: [], held: new Set(), changed: 0 } as unknown as Win;
   const forward: ForwardDeps = {
     win,
@@ -118,8 +122,8 @@ function windowOn(m: Machine, win: string, exec?: Exec, over: Partial<ForwardDep
     },
     forward,
     holdsChanged: () => void w.changed++,
-    devices: { migrate: async () => undefined, refusal: async () => null }, // every paired device confirmed
-  } as ConstructorParameters<typeof RemoteBridge>[1]);
+    devices,
+  });
   bridges.push(w.bridge);
   return w;
 }
@@ -577,6 +581,31 @@ describe("the window that holds the session checks a handed-over command again",
     handIn(m, WIN_B, command("c2", "send", { text: "hi" }));
     await vi.waitFor(() => expect(resultFor(m, WIN_A, "c2")).toEqual({ v: 1, id: "c2", ok: false, message: "send is not allowed on this Mac" }), WAIT);
     expect(b.ran).toEqual([]);
+  });
+
+  it("runs the device check too, never asking about a device itself: one not confirmed on this Mac is refused", async () => {
+    commandsOn();
+    const m = machine();
+    relay([]);
+    const checked: Array<[unknown, boolean | undefined]> = []; // device id, whether the check may ask about it
+    const devices: DeviceCheck = {
+      migrate: async () => undefined,
+      refusal: async (deviceId, _lookup, ask) => {
+        checked.push([deviceId, ask]);
+        return deviceId === "phone-1" ? null : NOT_CONFIRMED;
+      },
+    };
+    const b = windowOn(m, WIN_B, undefined, {}, devices);
+    record(m, "c1");
+    handIn(m, WIN_B, command("c1", "kill", { deviceId: "phone-2" }));
+    await b.bridge.restart();
+    await vi.waitFor(() => expect(resultFor(m, WIN_A, "c1")).toEqual({ v: 1, id: "c1", ok: false, message: NOT_CONFIRMED }), WAIT);
+
+    record(m, "c2");
+    handIn(m, WIN_B, command("c2", "kill", { deviceId: "phone-1" }));
+    await vi.waitFor(() => expect(resultFor(m, WIN_A, "c2")).toEqual({ v: 1, id: "c2", ok: true, message: `ran in ${WIN_B}` }), WAIT);
+    expect(b.ran.map((c) => c.id)).toEqual(["c2"]);
+    expect(checked).toEqual([["phone-2", false], ["phone-1", false]]);
   });
 
   it("runs nothing whose id the seen-id store does not hold, and answers nothing", async () => {

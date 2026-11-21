@@ -79,8 +79,11 @@ export interface DeviceGateDeps {
 export interface DeviceCheck {
   /** The first run: allows the devices the relay paired before DEVICE_MIGRATION_CUTOFF while the file does not exist yet. */
   migrate(lookup: PairedLookup): Promise<void>;
-  /** null when the device may run commands, else the answer the relay gets. */
-  refusal(deviceId: unknown, lookup: PairedLookup): Promise<string | null>;
+  /**
+   * null when the device may run commands, else the answer the relay gets. With `ask` false (a command
+   * another window handed over) a device that is not in the file is refused without asking about it.
+   */
+  refusal(deviceId: unknown, lookup: PairedLookup, ask?: boolean): Promise<string | null>;
 }
 
 type Loaded = { kind: "missing" } | { kind: "unreadable"; why: string } | { kind: "ok"; store: DeviceStore };
@@ -143,7 +146,7 @@ export class DeviceGate implements DeviceCheck {
     return this.migrating;
   }
 
-  async refusal(deviceId: unknown, lookup: PairedLookup): Promise<string | null> {
+  async refusal(deviceId: unknown, lookup: PairedLookup, ask = true): Promise<string | null> {
     if (!validId(deviceId)) return NOT_CONFIRMED;
     const loaded = this.load();
     if (loaded.kind === "missing") {
@@ -159,7 +162,7 @@ export class DeviceGate implements DeviceCheck {
     const state = entryOf(loaded.store, deviceId)?.state;
     if (state === "allowed") return null;
     if (state === "denied") return DENIED;
-    void this.ask(deviceId, lookup);
+    if (ask) void this.ask(deviceId, lookup);
     return NOT_CONFIRMED;
   }
 

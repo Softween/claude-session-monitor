@@ -154,4 +154,16 @@ describe("the health file", () => {
     expect(parseHealth(JSON.stringify({ ...JSON.parse(text), v: 2 }))).toBeUndefined();
     expect(parseHealth(JSON.stringify({ ...JSON.parse(text), features: { wake: "broken" } }))).toBeUndefined();
   });
+
+  it("lists the sessions the window holds while its remote bridge runs, and parseHealth checks that list", () => {
+    expect("holds" in buildHealth(deps())).toBe(false);
+    expect("holds" in buildHealth(deps({ holds: () => undefined }))).toBe(false); // the bridge is off
+    const d = deps({ holds: () => ["s1", "s2"] });
+    writeHealth(d);
+    const text = [...d.files.values()][0];
+    expect(parseHealth(text)?.holds).toEqual(["s1", "s2"]);
+    expect(parseHealth(JSON.stringify({ ...JSON.parse(text), holds: [] }))?.holds).toEqual([]);
+    expect(parseHealth(JSON.stringify({ ...JSON.parse(text), holds: "s1" }))).toBeUndefined();
+    expect(parseHealth(JSON.stringify({ ...JSON.parse(text), holds: ["s1", 2] }))).toBeUndefined();
+  });
 });

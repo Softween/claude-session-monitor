@@ -1,10 +1,11 @@
 /**
  * health.ts - this window's health file, ~/.claude/session-monitor/health/<win>.json,
  * rewritten atomically every 30 s: the extension version, each feature's status
- * (ok, error or disabled), the 95th percentile of the recent refresh durations and
- * whether the restart guard is armed. <win> is the window key of the debug log and
- * the continuity heartbeat (continuity.ts windowKey). overseerBeat.ts reads the
- * files of all live windows. No vscode import.
+ * (ok, error or disabled), the 95th percentile of the recent refresh durations,
+ * whether the restart guard is armed and, while the remote bridge runs, the
+ * sessions whose tab or terminal the window holds. <win> is the window key of the
+ * debug log and the continuity heartbeat (continuity.ts windowKey). overseerBeat.ts
+ * and remoteForward.ts read the files of all live windows. No vscode import.
  */
 import * as path from "path";
 import { performance } from "perf_hooks";
@@ -26,6 +27,7 @@ export interface WindowHealth {
   refreshP95Ms: number | null; // null before the first refresh
   refreshSamples: number;
   guardArmed: boolean;
+  holds?: string[]; // while the remote bridge runs: the sessions whose tab or terminal this window holds (remoteForward.ts)
 }
 
 /** A feature's stages in the stage guard: `start` runs once at activation; a refresh stage also matches "<stage> <detail>". */
@@ -104,6 +106,7 @@ export interface HealthDeps {
   failures(): ReadonlyMap<string, number>; // stage -> when it last failed (safeStage.ts lastFailures)
   refresh: DurationRing;
   guardArmed(): boolean;
+  holds?(): string[] | undefined; // the sessions this window holds while the remote bridge runs, else undefined
   shared(): boolean; // false in observer mode (observerMode.ts sharedFiles): the file is neither written nor removed
   write(file: string, text: string): void; // atomic
   remove(file: string): void;
@@ -116,6 +119,7 @@ export function healthFile(dir: string, win: string): string {
 export function buildHealth(deps: HealthDeps): WindowHealth {
   const now = deps.nowMs();
   const p95 = deps.refresh.p95();
+  const holds = deps.holds?.();
   return {
     v: HEALTH_VERSION,
     win: deps.win,
@@ -126,6 +130,7 @@ export function buildHealth(deps: HealthDeps): WindowHealth {
     refreshP95Ms: p95 === null ? null : Math.round(p95 * 10) / 10,
     refreshSamples: deps.refresh.count,
     guardArmed: deps.guardArmed(),
+    ...(holds ? { holds } : {}),
   };
 }
 
@@ -163,6 +168,7 @@ export function parseHealth(text: string | undefined): WindowHealth | undefined 
     featuresOk &&
     (h.refreshP95Ms === null || typeof h.refreshP95Ms === "number") &&
     typeof h.refreshSamples === "number" &&
-    typeof h.guardArmed === "boolean";
+    typeof h.guardArmed === "boolean" &&
+    (h.holds === undefined || (Array.isArray(h.holds) && h.holds.every((id) => typeof id === "string")));
   return ok ? (h as WindowHealth) : undefined;
 }

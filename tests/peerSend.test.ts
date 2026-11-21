@@ -136,6 +136,19 @@ describe("sendToSession over a real Unix socket", () => {
     expect(r).toMatchObject({ ok: false, code: "auth" });
   });
 
+  it("writes nothing once its signal aborts before the frames go out", async () => {
+    const connections: net.Socket[] = [];
+    await listen((s) => {
+      connections.push(s);
+      s.end();
+    });
+    const ac = new AbortController();
+    const sending = sendToSession({ pid: process.pid, text: "ping", sessionsDir, timeoutMs: 600, authGraceMs: 50, signal: ac.signal });
+    ac.abort(); // while it looks up the inbox's key
+    expect(await sending).toMatchObject({ ok: false, code: "aborted" });
+    expect(connections).toEqual([]);
+  });
+
   it("rejects empty text and a missing socket", async () => {
     expect(await sendToSession({ pid: process.pid, text: "", sessionsDir })).toMatchObject({ ok: false, code: "usage" });
     expect(await sendToSession({ pid: process.pid, text: "x", sessionsDir })).toMatchObject({ ok: false, code: "target" });

@@ -14,7 +14,6 @@ import { GitInfo } from "./gitInfo";
 import type { PeerSendResult } from "./peerSend";
 import type { SessionView } from "./providers/types";
 import {
-  COMMAND_TIMEOUT_MS,
   MAX_COMMANDS_PER_POLL,
   allowedCommandTypes,
   buildSnapshot,
@@ -28,12 +27,12 @@ import {
   sampleMachine,
   shouldPush,
   snapshotHash,
-  withTimeout,
   type FleetAutoResume,
   type SnapshotAccountInput,
 } from "./remote";
 import { cwdRoots } from "./remoteCwds";
 import { createDeviceGate, type DeviceCheck, type PairedLookup } from "./remoteDevices";
+import { RemoteForwarder, TIMED_OUT, canStart, type ForwardDeps } from "./remoteForward";
 import { sanitizeRemoteLine } from "./remoteInput";
 
 export const REMOTE_TOKEN_KEY = "csm.remote.token";
@@ -94,9 +93,13 @@ export async function deliverText(o: {
   terminal: () => Promise<PathAttempt>;
   typed: () => Promise<PathAttempt>;
   uds: (line: string) => Promise<PeerSendResult>;
+  signal?: AbortSignal; // aborted once the command's time is up: no further path runs
+  deadline?: number; // epoch ms, when that is: the inbox send does not start with less than 10 s left
 }): Promise<CommandOutcome> {
   const skipped: string[] = [];
+  const stopped: CommandOutcome = { ok: false, message: TIMED_OUT };
   for (const [via, run] of [["terminal", o.terminal], ["typed", o.typed]] as const) {
+    if (o.signal?.aborted) return stopped;
     let r: PathAttempt;
     try {
       r = await run();
@@ -110,6 +113,7 @@ export async function deliverText(o: {
   }
   const checked = sanitizeRemoteLine(o.text);
   if (!checked.ok) return { ok: false, message: `not delivered via inbox: ${checked.reason}` };
+  if (o.signal?.aborted || !canStart(o.deadline)) return stopped;
   let r: PeerSendResult;
   try {
     r = await o.uds(checked.line);
@@ -124,7 +128,15 @@ export async function deliverText(o: {
 export interface RemoteBridgeDeps {
   log: (msg: string) => void;
   accounts: () => { accounts: SnapshotAccountInput[]; bestId: string | null };
-  execute: (cmd: FleetCommand) => Promise<CommandOutcome>;
+  /**
+   * runs a command; `signal` aborts once the command's 60 s are up, at `deadline` (epoch ms), and it then
+   * types and sends nothing more; keystroke typing and a socket send do not start with less than 10 s left
+   */
+  execute: (cmd: FleetCommand, signal: AbortSignal, deadline: number) => Promise<CommandOutcome>;
+  /** hands a tab-bound command to the window holding its session (remoteForward.ts); without it every command runs here */
+  forward?: ForwardDeps;
+  /** the sessions this window holds changed (remoteForward.ts): its health file should list them now */
+  holdsChanged?: () => void;
   /** folders a remote newSession may use (remoteCwds.ts), sent with every snapshot */
   allowedCwds?: () => string[];
   /** a limited row's auto-resume state (autoResume.ts), sent on limited rows */
@@ -169,6 +181,7 @@ export class RemoteBridge implements vscode.Disposable {
   private restartSeq = 0;
   private warnedOrigin = ""; // url whose origin mismatch was already shown once
   private readonly gitInfo = new GitInfo(); // per-cwd branch / changes / PR, only asked while the bridge runs
+  private readonly forwarder: RemoteForwarder; // runs the commands, here or in the window holding the session
 
   private readonly userAgent: string;
 
@@ -176,10 +189,21 @@ export class RemoteBridge implements vscode.Disposable {
     // Cloudflare answers 403 (error 1010) to generic fetch user agents.
     const version = (ctx.extension?.packageJSON as { version?: string } | undefined)?.version ?? "0.0.0";
     this.userAgent = `claude-session-monitor/${version}`;
+    // A command another window hands over passes the same refusal step here, without asking about its device.
+    this.forwarder = new RemoteForwarder(
+      deps.execute,
+      (cmd) => (this.cfg && this.stop ? this.refusal(cmd, this.cfg, this.stop.signal, false) : Promise.resolve("the bridge stopped")),
+      deps.forward,
+    );
   }
 
   get running(): boolean {
     return !!this.cfg;
+  }
+
+  /** While the bridge runs: the sessions whose tab or terminal this window holds (remoteForward.ts), for its health file. */
+  held(): string[] | undefined {
+    return this.cfg ? this.forwarder.holdings() : undefined;
   }
 
   /** (Re)read url + host + token; start when url and token are present, otherwise stay off. */
@@ -209,6 +233,7 @@ export class RemoteBridge implements vscode.Disposable {
       return;
     }
     this.cfg = { url, host, token: stored.token };
+    this.forwarder.start();
     this.stop = new AbortController();
     this.deps.log(`remote: bridge on (${url}, host ${host})`);
     void this.deps.devices.migrate(this.pairedLookup(this.cfg, this.stop.signal));
@@ -218,7 +243,9 @@ export class RemoteBridge implements vscode.Disposable {
   /** Called from the extension's poll cycle once the rows are resolved. */
   onRows(rows: SessionView[]): void {
     const cfg = this.cfg;
-    if (!cfg || this.pushInflight) return;
+    if (!cfg) return;
+    if (this.forwarder.observe(rows)) this.deps.holdsChanged?.();
+    if (this.pushInflight) return;
     const now = Date.now();
     if (now < this.pushRetryAt) return;
     // One snapshot at a time: the machine sample is async, then the push.
@@ -296,14 +323,17 @@ export class RemoteBridge implements vscode.Disposable {
   }
 
   private halt(): void {
+    const running = !!this.cfg;
     this.stop?.abort();
     this.stop = undefined;
+    this.forwarder.stop();
     this.cfg = undefined;
     this.lastHash = "";
     this.lastPushTs = 0;
     this.pushRetryAt = 0;
     this.pushBackoff = 0;
     this.forceAfter = 0;
+    if (running) this.deps.holdsChanged?.(); // the health file lists no held session now: no window hands this one a command
   }
 
   private fail(msg: string): void {
@@ -355,17 +385,15 @@ export class RemoteBridge implements vscode.Disposable {
 
   private async runCommand(cfg: BridgeCfg, cmd: FleetCommand, signal: AbortSignal): Promise<void> {
     if (!cmd || typeof cmd.id !== "string" || !cmd.id) return;
-    // The kill switch, the allowlist and the 2 min expiry answer before any action runs;
+    // The kill switch, the allowlist, the 2 min expiry and the device check answer before any action runs;
     // a command that runs gets 60 s, then its result says "timed out" and the loop moves on.
-    const refusal =
-      commandRefusal(cmd, Date.now(), remoteFlag("remote.acceptCommands"), remoteAllowedCommands()) ??
-      (await this.deps.devices.refusal(cmd.deviceId, this.pairedLookup(cfg, signal))); // then only a device confirmed on this Mac
+    const refusal = await this.refusal(cmd, cfg, signal, true);
     let out: CommandOutcome;
     if (refusal) {
       out = { ok: false, message: refusal };
     } else {
       try {
-        out = await withTimeout(this.deps.execute(cmd), COMMAND_TIMEOUT_MS, { ok: false, message: "timed out" });
+        out = await this.forwarder.run(cmd, signal);
       } catch (e) {
         out = { ok: false, message: String(e) };
       }
@@ -385,6 +413,22 @@ export class RemoteBridge implements vscode.Disposable {
     } catch (e) {
       if (!signal.aborted) this.fail(`result post for ${cmd.id} failed: ${String(e)}`);
     }
+  }
+
+  /**
+   * Why `cmd` must not run in this window, or null to run it: commands are off,
+   * its type is not allowed or it is older than 2 min (remote.ts commandRefusal),
+   * by this window's settings, then its device is not confirmed on this Mac
+   * (remoteDevices.ts). Asked before any action runs, for a relay command and for
+   * a command another window handed to this one (remoteForward.ts). Only with
+   * `ask` does an unknown device raise the question here: the window that got a
+   * command from the relay asks, the window it hands the command to never does.
+   */
+  private async refusal(cmd: FleetCommand, cfg: BridgeCfg, signal: AbortSignal, ask: boolean): Promise<string | null> {
+    return (
+      commandRefusal(cmd, Date.now(), remoteFlag("remote.acceptCommands"), remoteAllowedCommands()) ??
+      (await this.deps.devices.refusal(cmd.deviceId, this.pairedLookup(cfg, signal), ask)) // then only a device confirmed on this Mac
+    );
   }
 
   /**

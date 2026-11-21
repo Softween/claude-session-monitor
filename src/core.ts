@@ -610,8 +610,9 @@ function resolve(
   const stamped = Math.max(hookTs, convTs, tx?.activityTs ?? 0);
   const lastActivity = stamped > 0 ? stamped : tx ? tx.mtimeMs / 1000 : 0;
 
+  const aiTitle = cleanTitle(tx?.title);
   const title =
-    cleanTitle(tx?.title) ||
+    aiTitle ||
     cleanTitle(hook?.prompt) ||
     cleanTitle(tx?.lastPrompt) ||
     `session ${sessionId.slice(0, 8)}`;
@@ -755,6 +756,7 @@ function resolve(
     model,
     effort,
     matchLabels,
+    ...(aiTitle ? { aiTitle: true } : {}),
     ...(tx?.askPending ? { askPending: true } : {}),
     ...(hook?.event === "Notification" && hookTs >= convTs && hook.notif_type ? { notifType: hook.notif_type } : {}),
   };

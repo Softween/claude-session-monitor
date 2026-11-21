@@ -9,7 +9,7 @@ import * as os from "os";
 import { parseResetToEpoch } from "./core";
 import type { FleetGit } from "./gitInfo";
 import type { SessionView } from "./providers/types";
-import { ALLOWED_CWDS_MAX } from "./remoteCwds";
+import { ALLOWED_CWDS_MAX, withinRoots } from "./remoteCwds";
 import { groupOf, type GroupKey } from "./view";
 
 export type FleetBucket = "waiting" | "yourTurn" | "working" | "idle" | "limited" | "ended";
@@ -60,10 +60,12 @@ export interface FleetGauge { key: string; label: string; pct: number; resetMs: 
 export interface FleetSession {
   id: string;
   provider: "claude" | "codex";
+  /** Claude's own session title, redacted; any other title goes out as "Session in <folder>" (sessionTitle). */
   title: string;
   bucket: FleetBucket;
   model: string | null;
   effort: string | null;
+  /** The full path only inside a remote.allowedCwds root, else the folder name. */
   cwd: string | null;
   project: string | null;
   pid: number | null;
@@ -73,6 +75,7 @@ export interface FleetSession {
   limit: { resetText: string | null; resetTs: number | null } | null;
   canResume: boolean;
   tokens: { ctxPct: number | null; total: number | null } | null;
+  /** The active account's email, masked (maskEmail). */
   account: string | null;
   /** Only on an "In background" row: its ⏳ finish time (epoch seconds, null when the line names none). */
   background?: { dueTs: number | null };
@@ -88,6 +91,7 @@ export interface FleetSession {
 
 export interface FleetAccount {
   id: string;
+  /** masked (maskEmail) */
   email: string;
   tier: string | null;
   active: boolean;
@@ -131,6 +135,8 @@ export interface SnapshotInput {
   bestAccountId?: string | null;
   machine: FleetMachine;
   allowedCwds?: string[];
+  /** remote.allowedCwds roots (remoteCwds.ts cwdRoots): paths inside one go out in full; none: folder names only. */
+  cwdRoots?: string[];
   now?: number; // epoch ms
   /** git info for a session cwd (gitInfo.ts GitInfo.get); rows carry git: null without it. */
   git?: (cwd: string | null) => FleetGit | null;
@@ -157,24 +163,56 @@ export function clipBytes(s: string, maxBytes: number): string {
 // Secret-looking substrings never leave the machine in uploaded text.
 const SECRET_PATTERNS: RegExp[] = [
   /sk-ant-[A-Za-z0-9_-]{8,}/g,
-  /ghp_[A-Za-z0-9]{20,}/g,
-  /xox[bpa]-[A-Za-z0-9-]{10,}/g,
+  /(?<![A-Za-z0-9])sk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}/g,
+  /gh[pousr]_[A-Za-z0-9]{20,}/g,
+  /github_pat_[A-Za-z0-9_]{20,}/g,
+  /xox[abeprs]-[A-Za-z0-9-]{10,}/g,
   /AKIA[A-Z0-9]{12,}/g,
+  /AIza[A-Za-z0-9_-]{30,}/g,
+  /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?/g,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/g,
-  /\b[A-Fa-f0-9]{40,}\b/g,
+  // A UUID's dashes keep its hex groups short, so session ids stay readable.
+  /(?<![A-Za-z0-9])(?:0x)?[A-Fa-f0-9]{32,}(?![A-Za-z0-9])/g,
 ];
+const BEARER = /\b(Bearer)[ \t]+(?=[A-Za-z0-9._~+\/-]*\d)[A-Za-z0-9._~+\/-]{16,}=*/gi;
+// password=..., "password": "...", password: "...", pwd=...: the key stays, the value goes.
+const PASSWORD_ASSIGNMENT =
+  /((?:passw(?:or)?d|(?<![A-Za-z])pwd)[A-Za-z0-9_-]*(?:["']?[ \t]*=|["'][ \t]*:|[ \t]*:(?=[ \t]*["']))[ \t]*)("[^"]*"|'[^']*'|[^\s"'`]+)/gi;
 const BASE64_RUN = /[A-Za-z0-9+\/_-]{40,}={0,2}/g;
 
 /**
- * Replace API keys, tokens, private-key headers, 40+ character hex runs and
- * 40+ character base64 runs with `[redacted]`. A base64 run counts only when it
- * mixes digits with lower- and upper-case letters, so long plain words and
- * paths without digits stay readable.
+ * Replace API keys and tokens (`sk-`, GitHub, Slack, AWS, Google, JWT, `Bearer`
+ * credentials), private-key headers, password assignment values, 32+ character
+ * hex runs and 40+ character base64 runs with `[redacted]`. A base64 run counts
+ * only when it mixes digits with lower- and upper-case letters, so long plain
+ * words and paths without digits stay readable.
  */
 export function redactSecrets(s: string): string {
   let out = s;
   for (const re of SECRET_PATTERNS) out = out.replace(re, "[redacted]");
+  out = out
+    .replace(BEARER, "$1 [redacted]")
+    .replace(PASSWORD_ASSIGNMENT, (_m, key: string, value: string) =>
+      key + (value[0] === '"' || value[0] === "'" ? `${value[0]}[redacted]${value[0]}` : "[redacted]"),
+    );
   return out.replace(BASE64_RUN, (m) => (/\d/.test(m) && /[a-z]/.test(m) && /[A-Z]/.test(m) ? "[redacted]" : m));
+}
+
+/** `alice@example.com` -> `a***@example.com`: the first character and the domain stay; a value without `@` becomes `***`. */
+export function maskEmail(email: string): string {
+  const at = email.lastIndexOf("@");
+  if (at < 0) return "***";
+  return (Array.from(email.slice(0, at))[0] ?? "") + "***" + email.slice(at);
+}
+
+/**
+ * The uploaded title: Claude's own session title (redacted, at most 512 bytes).
+ * Any other title (prompt text, a Codex thread name or preview) stays on this
+ * machine: the row reads "Session in <folder>", or "Session <id prefix>" without a folder.
+ */
+function sessionTitle(v: SessionView, folder: string | null): string {
+  if (v.aiTitle) return clipBytes(redactSecrets(v.title), 512);
+  return folder ? `Session in ${folder}` : `Session ${v.sessionId.slice(0, 8)}`;
 }
 
 /**
@@ -188,22 +226,24 @@ export function waitReasonOf(v: SessionView, bucket: FleetBucket): WaitReason | 
   return v.notifType === "permission_prompt" ? "permission" : "idle";
 }
 
-function sessionOf(v: SessionView, nowSec: number, activeEmail: string | null, input: SnapshotInput): FleetSession {
+function sessionOf(v: SessionView, nowSec: number, account: string | null, input: SnapshotInput): FleetSession {
   const group = groupOf(v);
   const bucket = BUCKET_MAP[group];
   // The row keeps no assistant reply text; the most recent human-readable line it has
   // is the hook notification, then the closing status line, then the status detail.
   const text = v.notifMessage || v.closing?.text || v.detail || "";
   const resetTs = v.resetText ? parseResetToEpoch(v.resetText, nowSec) ?? null : null;
+  const folder = v.cwd ? v.cwd.split(/[\\/]/).filter(Boolean).pop() ?? null : null;
   return {
     id: v.sessionId,
     provider: v.provider,
-    title: clipBytes(redactSecrets(v.title), 512),
+    title: sessionTitle(v, folder),
     bucket,
     model: v.model ?? null,
     effort: v.effort ?? null,
-    cwd: v.cwd ?? null,
-    project: v.cwdLabel ?? (v.cwd ? v.cwd.split(/[\\/]/).filter(Boolean).pop() ?? null : null),
+    // The full path only inside a remote.allowedCwds root (a remote newSession needs it there).
+    cwd: v.cwd && withinRoots(v.cwd, input.cwdRoots ?? []) ? v.cwd : folder,
+    project: v.cwdLabel ?? folder,
     pid: typeof v.pid === "number" ? v.pid : null,
     lastActivityTs: v.lastActivityMs ? Math.floor(v.lastActivityMs / 1000) : null,
     lastText: text ? clipBytes(redactSecrets(text), LAST_TEXT_MAX_BYTES) : null,
@@ -212,7 +252,7 @@ function sessionOf(v: SessionView, nowSec: number, activeEmail: string | null, i
     canResume: !!v.capabilities?.resume,
     tokens: typeof v.tokens === "number" ? { ctxPct: null, total: v.tokens } : null,
     // Running Claude sessions follow the machine's active login at their next token refresh.
-    account: v.provider === "claude" ? activeEmail : null,
+    account: v.provider === "claude" ? account : null,
     ...(group === "background"
       ? { background: { dueTs: v.closingTiming?.dueMs != null ? Math.floor(v.closingTiming.dueMs / 1000) : null } }
       : {}),
@@ -229,7 +269,7 @@ function accountOf(a: SnapshotAccountInput, bestId: string | null): FleetAccount
     .map((g) => ({ key: g.key, label: g.label, pct: Math.round(g.pct), resetMs: g.resetMs ?? null }));
   return {
     id: a.id,
-    email: a.email,
+    email: maskEmail(a.email),
     tier: a.plan,
     active: a.active,
     best: !!bestId && a.id === bestId,
@@ -254,15 +294,19 @@ function coarseMachine(m: FleetMachine): FleetMachine {
 
 export function buildSnapshot(input: SnapshotInput): IngestBody {
   const now = input.now ?? Date.now();
-  const activeEmail = input.accounts.find((a) => a.active)?.email ?? null;
+  const activeEmail = input.accounts.find((a) => a.active)?.email;
+  const account = activeEmail === undefined ? null : maskEmail(activeEmail);
+  const roots = input.cwdRoots ?? [];
   return {
     v: 1,
     host: input.host.slice(0, 64),
     sentAt: now,
-    sessions: input.rows.slice(0, MAX_SESSIONS).map((v) => sessionOf(v, now / 1000, activeEmail, input)),
+    sessions: input.rows.slice(0, MAX_SESSIONS).map((v) => sessionOf(v, now / 1000, account, input)),
     accounts: input.accounts.map((a) => accountOf(a, input.bestAccountId ?? null)),
     machine: coarseMachine({ ...input.machine, sessions: input.rows.length }),
-    ...(input.allowedCwds ? { allowedCwds: input.allowedCwds.slice(0, ALLOWED_CWDS_MAX) } : {}),
+    ...(input.allowedCwds
+      ? { allowedCwds: input.allowedCwds.filter((p) => withinRoots(p, roots)).slice(0, ALLOWED_CWDS_MAX) }
+      : {}),
   };
 }
 

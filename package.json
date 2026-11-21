@@ -498,6 +498,15 @@
           "default": "",
           "markdownDescription": "Name this machine reports to the remote bridge. Empty uses the OS host name."
         },
+        "claudeSessionMonitor.remote.allowedCwds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "scope": "application",
+          "default": [],
+          "markdownDescription": "Folders (absolute paths, or starting with `~/`) whose sessions the remote bridge may report with their full path. A session in one of these folders or below it is sent with its full working directory, and only folders inside them are offered for a remote `newSession`; any other session is sent with its folder name only. Read from user settings only. Empty sends folder names only and offers no folder for `newSession`."
+        },
         "claudeSessionMonitor.remote.acceptCommands": {
           "type": "boolean",
           "scope": "application",

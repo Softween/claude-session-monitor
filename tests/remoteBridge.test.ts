@@ -157,6 +157,25 @@ describe("deliverText: one delivery path per command", () => {
     }
   });
 
+  it("starts no inbox send with less than 10 s of the command's time left", async () => {
+    for (const [left, sent] of [[9_000, false], [11_000, true]] as const) {
+      const calls: string[] = [];
+      const out = await deliverText({
+        text: "run the tests",
+        terminal: async () => skip("no terminal"),
+        typed: async () => skip("no tab"),
+        uds: async () => {
+          calls.push("uds");
+          return inboxOk;
+        },
+        signal: new AbortController().signal,
+        deadline: Date.now() + left,
+      });
+      expect(out).toEqual(sent ? { ok: true, message: "delivered via inbox (in-transcript, msg_id m1)" } : { ok: false, message: "timed out" });
+      expect(calls).toEqual(sent ? ["uds"] : []);
+    }
+  });
+
   it("names every skipped path when the inbox fails too", async () => {
     const refused = paths({ uds: { ok: false, code: "target", error: "no session record" } });
     expect(await refused.run()).toEqual({

@@ -8,6 +8,7 @@ const HOME = "/tmp/csm-ext-test";
 const rec = vi.hoisted(() => ({
   commands: new Map<string, (...a: any[]) => any>(),
   config: new Map<string, unknown>(),
+  globals: new Map<string, unknown>(), // user (global) setting values, as inspect() reports them (the remote.* settings)
   configListeners: [] as Array<(event: any) => void>,
   executeCalls: [] as Array<{ id: string; args: any[] }>,
   warningMessages: [] as any[][],
@@ -228,7 +229,7 @@ vi.mock("vscode", () => {
     workspace: {
       getConfiguration: () => ({
         get: (key: string, def: any) => (rec.config.has(key) ? rec.config.get(key) : def),
-        inspect: () => undefined,
+        inspect: (key: string) => (rec.globals.has(key) ? { globalValue: rec.globals.get(key) } : undefined),
       }),
       workspaceFolders: undefined,
       openTextDocument: () => Promise.resolve({}),
@@ -352,6 +353,7 @@ afterEach(() => {
   disposeCtx(lastCtx);
   rec.commands.clear();
   rec.config.clear();
+  rec.globals.clear();
   rec.configListeners.length = 0;
   rec.executeCalls.length = 0;
   rec.warningMessages.length = 0;
@@ -2005,6 +2007,29 @@ describe("a session's tab: shown by its index, typed into only when it is the on
     await vi.advanceTimersByTimeAsync(2_000);
     expect(claude(posted[posted.length - 1])).toEqual([expect.objectContaining({ state: "ready" })]);
   });
+
+  it("a remote send types into the session's tab only with at least 10 s of the command's time left", async () => {
+    vi.useFakeTimers();
+    seedSession("notes", NOTES);
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    await vi.advanceTimersByTimeAsync(2_000);
+    const e = fakeEditor([{ viewColumn: 1, labels: [NOTES_TAB, "notes.md"] }], [NOTES_TAB]);
+    const typedInto = recordTyping(e);
+    rec.globals.set("remote.typeFallback", true);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "darwin" }); // keystrokes need macOS
+    restorers.push(() => Object.defineProperty(process, "platform", platform));
+    const send = async (id: string, left: number) => {
+      const out = rec.bridgeDeps.execute({ id, type: "send", sessionId: "notes", text: "run the tests" }, new AbortController().signal, Date.now() + left);
+      await vi.advanceTimersByTimeAsync(5_000);
+      return out;
+    };
+    expect(await send("s1", 9_000)).toEqual({ ok: false, message: "not delivered via typed: timed out" });
+    expect(typedInto).toEqual([]);
+    expect(await send("s2", 60_000)).toEqual({ ok: true, message: "delivered via typed" });
+    expect(typedInto).toEqual([NOTES_TAB]);
+  });
 });
 
 describe("closingStatusMarkers setting", () => {
@@ -2157,7 +2182,7 @@ describe("resume terminals: reuse, and remote resume / send / kill without a hoo
     };
     lastCtx = mkCtx();
     ext.activate(lastCtx);
-    return (cmd) => rec.bridgeDeps.execute(cmd, new AbortController().signal);
+    return (cmd) => rec.bridgeDeps.execute(cmd, new AbortController().signal, Date.now() + 60_000);
   }
   const refresh = () => rec.commands.get("claudeSessionMonitor.refresh")!();
 

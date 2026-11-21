@@ -11,13 +11,18 @@
  * Allow, or closed (nothing decided). The command is answered at once; after
  * Allow the phone sends it again. Without the file (the first run, or after it
  * was removed) the devices the relay paired before DEVICE_MIGRATION_CUTOFF are
- * allowed, once.
+ * allowed, once. An entry also keeps the key the device signs its commands with
+ * (`publicKey`, remoteSigned.ts): Allow pins the key the relay lists for the
+ * device, which the modal shows by its fingerprint, and an allowed device
+ * without one is asked about it when its first signed command arrives. A pinned
+ * key is never replaced.
  */
 import { randomBytes } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { MONITOR_DIR } from "./core";
+import { keyFingerprint, publicKeyBytes } from "./remoteSigned";
 
 export const NOT_CONFIRMED = "device not confirmed on this Mac";
 export const DENIED = "device denied on this Mac";
@@ -29,12 +34,14 @@ export const DEVICE_MIGRATION_CUTOFF = Date.parse("2026-11-21T12:00:00Z");
 const CUTOFF_TEXT = new Date(DEVICE_MIGRATION_CUTOFF).toISOString();
 const DEVICE_ID_MAX = 128;
 const REVIEW = "Review…";
+const PIN = "Pin Key";
+const DONT_PIN = "Don't Pin";
 
 export type DeviceState = "allowed" | "denied";
 /** The owner's answer to the modal; undefined: closed without one. */
 export type DeviceDecision = "allow" | "deny" | undefined;
 
-/** One device in the file; fields a later version adds are kept on every rewrite. */
+/** One device in the file, with its pinned key in `publicKey` once it has one; fields a later version adds are kept on every rewrite. */
 export interface DeviceEntry {
   state: DeviceState;
   name: string;
@@ -54,6 +61,7 @@ export interface PairedDevice {
   id: string;
   name: string;
   pairedAt: number | null;
+  publicKey?: string; // the key it signs its commands with (base64 of the raw 32 bytes), when the relay lists a valid one
 }
 
 /** The relay's GET /fleet/tokens, resolved to the envelope's data. */
@@ -72,6 +80,8 @@ export interface DeviceGateDeps {
   now(): number; // epoch ms
   /** Asks the owner about the device; `sameName` holds the ids of the allowed devices that have its name. */
   prompt(device: PairedDevice, sameName: string[]): Promise<DeviceDecision>;
+  /** Asks the owner to pin the key the relay lists for an allowed device that has none pinned; true: pin it. */
+  askPin(device: PairedDevice & { publicKey: string }): Promise<boolean>;
   log(msg: string): void;
 }
 
@@ -84,6 +94,10 @@ export interface DeviceCheck {
    * another window handed over) a device that is not in the file is refused without asking about it.
    */
   refusal(deviceId: unknown, lookup: PairedLookup, ask?: boolean): Promise<string | null>;
+  /** The key pinned for the device, as the file holds it (base64 of the raw 32-byte key); undefined when none is. */
+  pinnedKey(deviceId: string): unknown;
+  /** Asks the owner, in the background and one prompt per device at a time, to pin `device.publicKey` for the allowed device. */
+  askToPin(device: PairedDevice): void;
 }
 
 type Loaded = { kind: "missing" } | { kind: "unreadable"; why: string } | { kind: "ok"; store: DeviceStore };
@@ -94,6 +108,10 @@ const errText = (e: unknown): string => (e instanceof Error ? e.message : String
 const short = (id: string): string => id.slice(0, 8);
 const entryOf = (store: DeviceStore, id: string): DeviceEntry | undefined => (Object.hasOwn(store.devices, id) ? store.devices[id] : undefined);
 const serialize = (store: DeviceStore): string => JSON.stringify(store, null, 2) + "\n";
+/** `{ publicKey }` when `v` is a key the relay may send (canonical base64 of 32 bytes), else nothing. */
+const keyField = (v: unknown): { publicKey?: string } => (typeof v === "string" && publicKeyBytes(v) ? { publicKey: v } : {});
+/** An entry's pinned key as stored, undefined when it has none. */
+const keyOf = (entry: unknown): unknown => (isRecord(entry) && entry.publicKey !== null ? entry.publicKey : undefined);
 
 // Control, format (zero-width, bidirectional), private-use, unassigned and lone surrogate code points, and the line and paragraph separators.
 const HIDDEN_RE = /[\p{C}\p{Zl}\p{Zp}]/gu;
@@ -115,6 +133,7 @@ export function pairedDevices(data: unknown): PairedDevice[] {
       id: t.id,
       name: deviceName(t.name),
       pairedAt: typeof t.createdAt === "number" && Number.isFinite(t.createdAt) ? t.createdAt : null,
+      ...keyField(t.publicKey),
     }));
 }
 
@@ -164,6 +183,15 @@ export class DeviceGate implements DeviceCheck {
     if (state === "denied") return DENIED;
     if (ask) void this.ask(deviceId, lookup);
     return NOT_CONFIRMED;
+  }
+
+  pinnedKey(deviceId: string): unknown {
+    const loaded = this.load();
+    return loaded.kind === "ok" ? keyOf(entryOf(loaded.store, deviceId)) : undefined;
+  }
+
+  askToPin(device: PairedDevice): void {
+    void this.pinPrompt(device);
   }
 
   /** The file: missing, unreadable (any other read error, or not a version 1 device list), or its store. */
@@ -258,12 +286,65 @@ export class DeviceGate implements DeviceCheck {
       this.deps.log(`remote: device "${device.name}" (${short(device.id)}) stays denied: it was denied on this Mac after this window asked`);
       return;
     }
-    const entry: DeviceEntry = { ...(isRecord(old) ? old : {}), state, name: device.name, pairedAt: device.pairedAt, decidedAt: this.deps.now() };
+    // Allow pins the key the modal showed, unless the device has one pinned already: a pinned key is never replaced.
+    const key = state === "allowed" && keyOf(old) === undefined ? device.publicKey : undefined;
+    const entry: DeviceEntry = {
+      ...(isRecord(old) ? old : {}),
+      state,
+      name: device.name,
+      pairedAt: device.pairedAt,
+      decidedAt: this.deps.now(),
+      ...(key ? { publicKey: key } : {}),
+    };
     try {
       this.deps.fs.write(this.deps.file, serialize({ ...store, version: 1, devices: { ...store.devices, [device.id]: entry } }), false);
-      this.deps.log(`remote: ${label} on this Mac`);
+      this.deps.log(`remote: ${label} on this Mac${key ? `, key ${keyFingerprint(key)} pinned` : ""}`);
     } catch (e) {
       this.deps.log(`remote: ${label}, but not saved: ${errText(e)}`);
+    }
+  }
+
+  /** Asks once the device is still allowed and without a pinned key, then pins the key on Pin Key; never throws. */
+  private async pinPrompt(device: PairedDevice): Promise<void> {
+    const key = device.publicKey;
+    if (!key || this.asking.has(device.id)) return;
+    this.asking.add(device.id);
+    const label = `key ${keyFingerprint(key)} of device "${device.name}" (${short(device.id)})`;
+    try {
+      if (!this.unpinned(device.id)) return;
+      if (await this.deps.askPin({ ...device, publicKey: key })) this.pin(device.id, key, label);
+      else this.deps.log(`remote: ${label} not pinned; its next signed command asks again`);
+    } catch (e) {
+      this.deps.log(`remote: ${label} not asked about: ${errText(e)}`);
+    } finally {
+      this.asking.delete(device.id);
+    }
+  }
+
+  /** Read again right before asking: whether the readable file has the device allowed and without a pinned key. */
+  private unpinned(id: string): boolean {
+    const loaded = this.load();
+    const entry = loaded.kind === "ok" ? entryOf(loaded.store, id) : undefined;
+    return isRecord(entry) && entry.state === "allowed" && keyOf(entry) === undefined;
+  }
+
+  /** Writes `key` into the file as it is now, only while the device is allowed and has no key pinned, so other windows' changes stay. */
+  private pin(id: string, key: string, label: string): void {
+    const loaded = this.load();
+    if (loaded.kind !== "ok") {
+      this.deps.log(`remote: ${label} not pinned: ${this.deps.file} is ${loaded.kind === "missing" ? "missing" : `unreadable (${loaded.why})`}`);
+      return;
+    }
+    const old = entryOf(loaded.store, id);
+    if (!isRecord(old) || old.state !== "allowed" || keyOf(old) !== undefined) {
+      this.deps.log(`remote: ${label} not pinned: the device is no longer allowed on this Mac or has a key pinned already`);
+      return;
+    }
+    try {
+      this.deps.fs.write(this.deps.file, serialize({ ...loaded.store, devices: { ...loaded.store.devices, [id]: { ...old, publicKey: key } } }), false);
+      this.deps.log(`remote: ${label} pinned on this Mac`);
+    } catch (e) {
+      this.deps.log(`remote: ${label} not pinned: ${errText(e)}`);
     }
   }
 }
@@ -296,13 +377,41 @@ export async function askOnThisMac(device: PairedDevice, sameName: readonly stri
   if (review !== REVIEW) return undefined;
   const detail =
     "Commands from a newly paired device run on this Mac only after you allow it. Deny refuses its commands, Allow runs them from now on, and closing this dialog decides nothing. If you did not pair this device, choose Deny and revoke it on the relay.";
+  const key = device.publicKey
+    ? `Key fingerprint ${keyFingerprint(device.publicKey)}: allow only if the device shows the same fingerprint. Allow also pins this key, and only commands signed with it run.`
+    : "The device has sent no key yet: once it signs its commands, you are asked to pin its key.";
   const pick = await vscode.window.showWarningMessage(
     `Agent Sessions: run remote commands from ${about}?`,
-    { modal: true, detail: [sameNameNote(sameName), detail].filter(Boolean).join(" ") },
+    { modal: true, detail: [sameNameNote(sameName), key, detail].filter(Boolean).join(" ") },
     "Deny",
     "Allow",
   );
   return pick === "Allow" ? "allow" : pick === "Deny" ? "deny" : undefined;
+}
+
+/**
+ * Asks to pin the key the relay lists for an allowed device that signs its commands now: a notification naming
+ * the device with Review… as its only button, then, only after Review…, the modal naming the key's fingerprint,
+ * whose first button, the one Return presses, is Don't Pin. True only for Pin Key; anything else decides nothing.
+ */
+export async function askPinOnThisMac(device: PairedDevice & { publicKey: string }): Promise<boolean> {
+  const about = aboutDevice(device);
+  const review = await vscode.window.showWarningMessage(
+    `Agent Sessions: refused a remote command from ${about}. Its commands run only after you pin its key on this Mac.`,
+    REVIEW,
+  );
+  if (review !== REVIEW) return false;
+  const pick = await vscode.window.showWarningMessage(
+    `Agent Sessions: ${about} now signs its commands, key fingerprint ${keyFingerprint(device.publicKey)}: pin this key?`,
+    {
+      modal: true,
+      detail:
+        "Pin it only if the device shows the same fingerprint. Once its key is pinned, only commands signed with it run. Don't Pin and closing this dialog decide nothing: its next signed command asks again.",
+    },
+    DONT_PIN,
+    PIN,
+  );
+  return pick === PIN;
 }
 
 /** Node's file system: the folder made or set 0700, the text written 0600 under a unique temp name, then renamed (or linked when only new). */
@@ -341,5 +450,12 @@ export const nodeDeviceFs: DeviceFs = {
 
 /** The gate the bridge uses: the shared file under ~/.claude/session-monitor, the clock and the modal. */
 export function createDeviceGate(log: (msg: string) => void): DeviceGate {
-  return new DeviceGate({ file: path.join(MONITOR_DIR, "remote-devices.json"), fs: nodeDeviceFs, now: () => Date.now(), prompt: askOnThisMac, log });
+  return new DeviceGate({
+    file: path.join(MONITOR_DIR, "remote-devices.json"),
+    fs: nodeDeviceFs,
+    now: () => Date.now(),
+    prompt: askOnThisMac,
+    askPin: askPinOnThisMac,
+    log,
+  });
 }

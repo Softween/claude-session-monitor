@@ -4,7 +4,9 @@
  * key `csm.remote.token`). When on it pushes the panel's snapshot to
  * `<url>/fleet/ingest` (on change, >= 10 s apart, 2 min heartbeat) and long-polls
  * `<url>/fleet/commands` (one request ~every 25 s), running each command through
- * the extension's existing actions and posting its result.
+ * the extension's existing actions and posting its result. A command runs only
+ * when the paired device's signature on it checks out (remoteSigned.ts), and
+ * then as built from its signed type and arguments.
  */
 import { execFile } from "child_process";
 import * as os from "os";
@@ -31,9 +33,11 @@ import {
   type SnapshotAccountInput,
 } from "./remote";
 import { cwdRoots } from "./remoteCwds";
-import { createDeviceGate, type DeviceCheck, type PairedLookup } from "./remoteDevices";
+import { createDeviceGate, pairedDevices, type DeviceCheck, type PairedLookup } from "./remoteDevices";
 import { RemoteForwarder, TIMED_OUT, canStart, type ForwardDeps } from "./remoteForward";
 import { sanitizeRemoteLine } from "./remoteInput";
+import { checkSigned, nodeNonces } from "./remoteSigned";
+import type { SeenIds } from "./seenIds";
 
 export const REMOTE_TOKEN_KEY = "csm.remote.token";
 const POLL_WAIT_SEC = 25;
@@ -56,6 +60,9 @@ export interface FleetCommand {
   createdAt?: number;
   /** the paired device that queued it (the relay's device token id); null or missing for none */
   deviceId?: string | null;
+  /** the device's signature (remoteSigned.ts): the signed text and its base64 Ed25519 signature, carried unchanged by the relay */
+  signed?: string | null;
+  sig?: string | null;
 }
 
 export interface CommandOutcome { ok: boolean; message: string }
@@ -143,6 +150,8 @@ export interface RemoteBridgeDeps {
   autoResume?: (v: SessionView) => FleetAutoResume | null;
   /** which paired devices may run commands (remoteDevices.ts); registerRemoteBridge uses the file under ~/.claude/session-monitor unless given */
   devices?: DeviceCheck;
+  /** the nonces of the signed commands taken so far (remoteSigned.ts); registerRemoteBridge uses ~/.claude/session-monitor/remote/nonces unless given */
+  nonces?: Pick<SeenIds, "claim">;
 }
 
 interface BridgeCfg { url: string; host: string; token: string }
@@ -185,7 +194,10 @@ export class RemoteBridge implements vscode.Disposable {
 
   private readonly userAgent: string;
 
-  constructor(private readonly ctx: vscode.ExtensionContext, private readonly deps: RemoteBridgeDeps & { devices: DeviceCheck }) {
+  constructor(
+    private readonly ctx: vscode.ExtensionContext,
+    private readonly deps: RemoteBridgeDeps & { devices: DeviceCheck; nonces: Pick<SeenIds, "claim"> },
+  ) {
     // Cloudflare answers 403 (error 1010) to generic fetch user agents.
     const version = (ctx.extension?.packageJSON as { version?: string } | undefined)?.version ?? "0.0.0";
     this.userAgent = `claude-session-monitor/${version}`;
@@ -385,22 +397,23 @@ export class RemoteBridge implements vscode.Disposable {
 
   private async runCommand(cfg: BridgeCfg, cmd: FleetCommand, signal: AbortSignal): Promise<void> {
     if (!cmd || typeof cmd.id !== "string" || !cmd.id) return;
-    // The kill switch, the allowlist, the 2 min expiry and the device check answer before any action runs;
+    // The kill switch, the allowlist, the 2 min expiry, the device check and the signature answer before any action runs;
     // a command that runs gets 60 s, then its result says "timed out" and the loop moves on.
-    const refusal = await this.refusal(cmd, cfg, signal, true);
+    const checked = await this.checked(cmd, cfg, signal);
     let out: CommandOutcome;
-    if (refusal) {
-      out = { ok: false, message: refusal };
+    if (typeof checked === "string") {
+      out = { ok: false, message: checked };
     } else {
       try {
-        out = await this.forwarder.run(cmd, signal);
+        out = await this.forwarder.run(checked, signal);
       } catch (e) {
         out = { ok: false, message: String(e) };
       }
     }
-    this.deps.log(`remote: command ${cmd.type} ${cmd.id.slice(0, 8)} -> ${out.ok ? "ok" : "failed"}: ${out.message}`);
+    const type = typeof checked === "string" ? cmd.type : checked.type;
+    this.deps.log(`remote: command ${type} ${cmd.id.slice(0, 8)} -> ${out.ok ? "ok" : "failed"}: ${out.message}`);
     // The phone reads the state after the result: let it list the new session or the new auto-resume state.
-    if ((cmd.type === "newSession" || cmd.type === "autoResume") && out.ok) await this.flushSnapshot(signal);
+    if ((type === "newSession" || type === "autoResume") && out.ok) await this.flushSnapshot(signal);
     try {
       await this.request(
         cfg,
@@ -413,6 +426,27 @@ export class RemoteBridge implements vscode.Disposable {
     } catch (e) {
       if (!signal.aborted) this.fail(`result post for ${cmd.id} failed: ${String(e)}`);
     }
+  }
+
+  /**
+   * The command to run, or why it must not: the refusal step below, then the
+   * device's signature (remoteSigned.ts), once, in the window that polled the
+   * command and before it is claimed or handed over. What runs is built from the
+   * signed type and arguments; a window it is handed to does not check it again.
+   */
+  private async checked(cmd: FleetCommand, cfg: BridgeCfg, signal: AbortSignal): Promise<FleetCommand | string> {
+    const refusal = await this.refusal(cmd, cfg, signal, true);
+    if (refusal) return refusal;
+    const lookup = this.pairedLookup(cfg, signal);
+    const signed = await checkSigned(cmd, {
+      host: cfg.host,
+      allowed: remoteAllowedCommands(),
+      now: () => Date.now(),
+      nonces: this.deps.nonces,
+      devices: this.deps.devices,
+      listed: async (id) => pairedDevices(await lookup()).find((d) => d.id === id),
+    });
+    return signed.ok ? signed.cmd : signed.refusal;
   }
 
   /**
@@ -529,7 +563,7 @@ export function remoteAllowedCommands(): readonly string[] {
 
 /** Register the bridge, its two commands and its lifecycle hooks; returns the bridge for the poll cycle. */
 export function registerRemoteBridge(ctx: vscode.ExtensionContext, deps: RemoteBridgeDeps): RemoteBridge {
-  const bridge = new RemoteBridge(ctx, { ...deps, devices: deps.devices ?? createDeviceGate(deps.log) });
+  const bridge = new RemoteBridge(ctx, { ...deps, devices: deps.devices ?? createDeviceGate(deps.log), nonces: deps.nonces ?? nodeNonces() });
   ctx.subscriptions.push(
     bridge,
     vscode.commands.registerCommand("claudeSessionMonitor.setRemoteToken", async () => {

@@ -25,7 +25,7 @@ import * as path from "path";
 export const TAG = "cross-session-message";
 export const MAX_LINE = 1048576; // uJe @160972491
 
-export type PeerSendCode = "usage" | "target" | "auth" | "endpoint" | "transport" | "unconfirmed";
+export type PeerSendCode = "usage" | "target" | "auth" | "endpoint" | "transport" | "unconfirmed" | "aborted";
 
 export interface PeerSendOk {
   ok: true;
@@ -60,6 +60,7 @@ export interface SendOptions {
   sessionsDir?: string;
   projectsDir?: string;
   authGraceMs?: number; // wait for an early close after the auth line (300 ms)
+  signal?: AbortSignal; // once aborted, nothing is written: checked right before the frames go out
 }
 
 const DEFAULT_SESSIONS_DIR = path.join(os.homedir(), ".claude", "sessions");
@@ -380,6 +381,7 @@ export async function sendToSession(o: SendOptions): Promise<PeerSendResult> {
   if (Buffer.byteLength(frames.msgLine) > MAX_LINE) {
     return fail("usage", `message line is ${Buffer.byteLength(frames.msgLine)} bytes, over the receiver's ${MAX_LINE} byte limit`);
   }
+  if (o.signal?.aborted) return fail("aborted", "cancelled before the frame was written");
   const w = await writeFrames(sock, frames, timeoutMs, o.authGraceMs);
   if (!w.ok) return { ...w, msgId: frames.msgId };
   const res: PeerSendOk = {

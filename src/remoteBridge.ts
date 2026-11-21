@@ -32,7 +32,7 @@ import {
 } from "./remote";
 import { cwdRoots } from "./remoteCwds";
 import { createDeviceGate, type DeviceCheck, type PairedLookup } from "./remoteDevices";
-import { RemoteForwarder, TIMED_OUT, type ForwardDeps } from "./remoteForward";
+import { RemoteForwarder, TIMED_OUT, canStart, type ForwardDeps } from "./remoteForward";
 import { sanitizeRemoteLine } from "./remoteInput";
 
 export const REMOTE_TOKEN_KEY = "csm.remote.token";
@@ -94,6 +94,7 @@ export async function deliverText(o: {
   typed: () => Promise<PathAttempt>;
   uds: (line: string) => Promise<PeerSendResult>;
   signal?: AbortSignal; // aborted once the command's time is up: no further path runs
+  deadline?: number; // epoch ms, when that is: the inbox send does not start with less than 10 s left
 }): Promise<CommandOutcome> {
   const skipped: string[] = [];
   const stopped: CommandOutcome = { ok: false, message: TIMED_OUT };
@@ -112,7 +113,7 @@ export async function deliverText(o: {
   }
   const checked = sanitizeRemoteLine(o.text);
   if (!checked.ok) return { ok: false, message: `not delivered via inbox: ${checked.reason}` };
-  if (o.signal?.aborted) return stopped;
+  if (o.signal?.aborted || !canStart(o.deadline)) return stopped;
   let r: PeerSendResult;
   try {
     r = await o.uds(checked.line);
@@ -127,8 +128,11 @@ export async function deliverText(o: {
 export interface RemoteBridgeDeps {
   log: (msg: string) => void;
   accounts: () => { accounts: SnapshotAccountInput[]; bestId: string | null };
-  /** runs a command; `signal` aborts once the command's 60 s are up, and it then types and sends nothing more */
-  execute: (cmd: FleetCommand, signal: AbortSignal) => Promise<CommandOutcome>;
+  /**
+   * runs a command; `signal` aborts once the command's 60 s are up, at `deadline` (epoch ms), and it then
+   * types and sends nothing more; keystroke typing and a socket send do not start with less than 10 s left
+   */
+  execute: (cmd: FleetCommand, signal: AbortSignal, deadline: number) => Promise<CommandOutcome>;
   /** hands a tab-bound command to the window holding its session (remoteForward.ts); without it every command runs here */
   forward?: ForwardDeps;
   /** the sessions this window holds changed (remoteForward.ts): its health file should list them now */
@@ -185,7 +189,7 @@ export class RemoteBridge implements vscode.Disposable {
     // Cloudflare answers 403 (error 1010) to generic fetch user agents.
     const version = (ctx.extension?.packageJSON as { version?: string } | undefined)?.version ?? "0.0.0";
     this.userAgent = `claude-session-monitor/${version}`;
-    this.forwarder = new RemoteForwarder(deps.execute, deps.forward);
+    this.forwarder = new RemoteForwarder(deps.execute, (cmd) => this.refusal(cmd), deps.forward);
   }
 
   get running(): boolean {
@@ -314,6 +318,7 @@ export class RemoteBridge implements vscode.Disposable {
   }
 
   private halt(): void {
+    const running = !!this.cfg;
     this.stop?.abort();
     this.stop = undefined;
     this.forwarder.stop();
@@ -323,6 +328,7 @@ export class RemoteBridge implements vscode.Disposable {
     this.pushRetryAt = 0;
     this.pushBackoff = 0;
     this.forceAfter = 0;
+    if (running) this.deps.holdsChanged?.(); // the health file lists no held session now: no window hands this one a command
   }
 
   private fail(msg: string): void {
@@ -404,6 +410,16 @@ export class RemoteBridge implements vscode.Disposable {
     } catch (e) {
       if (!signal.aborted) this.fail(`result post for ${cmd.id} failed: ${String(e)}`);
     }
+  }
+
+  /**
+   * Why `cmd` must not run in this window, or null to run it: commands are off,
+   * its type is not allowed or it is older than 2 min (remote.ts commandRefusal),
+   * by this window's settings. Asked before any action runs, for a relay command
+   * and for a command another window handed to this one (remoteForward.ts).
+   */
+  private async refusal(cmd: FleetCommand): Promise<string | null> {
+    return commandRefusal(cmd, Date.now(), remoteFlag("remote.acceptCommands"), remoteAllowedCommands());
   }
 
   /**

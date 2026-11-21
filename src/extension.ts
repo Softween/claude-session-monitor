@@ -25,7 +25,7 @@ import { BurnTracker } from "./burnTracker";
 import { TYPED_REASON, deliverText, registerRemoteBridge, remoteCwdRoots, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt, type RemoteBridge } from "./remoteBridge";
 import { runTool } from "./remote";
 import { sanitizeRemoteLine } from "./remoteInput";
-import { TIMED_OUT, nodeForwardDeps } from "./remoteForward";
+import { TIMED_OUT, canStart, nodeForwardDeps } from "./remoteForward";
 import { backgroundByDue, fmtClock, timingNote } from "./closingBuckets";
 import { resolveClaudeBinary } from "./claudeBinary";
 import { stageGuard } from "./safeStage";
@@ -3474,9 +3474,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
    * i.e. VS Code is already frontmost (it is never activated), and the automation gate lets
    * remote typing through. The tab is then shown by its index and re-verified, and the
    * typing osascript checks the frontmost app itself. Never prompts. `skip` = nothing
-   * was typed; only a failed keystroke is final.
+   * was typed; only a failed keystroke is final. Nothing starts once `stop` aborted
+   * or with less than 10 s left before the command's `deadline`.
    */
-  async function typeIntoSession(v: SessionView, text: string, stop?: AbortSignal): Promise<PathAttempt> {
+  async function typeIntoSession(v: SessionView, text: string, stop?: AbortSignal, deadline?: number): Promise<PathAttempt> {
     const skip = (reason: string, detail?: string): PathAttempt => ({ ok: false, skip: true, reason, detail });
     if (!remoteFlag("remote.typeFallback")) return skip("typing disabled (remote.typeFallback is off)");
     const held = automationGate.blocker("remoteTyping");
@@ -3490,7 +3491,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (!windowFocused()) return skip(TYPED_REASON["not-frontmost"], "this VS Code window is not focused");
     const s = sanitizeRemoteLine(text);
     if (!s.ok) return { ok: false, skip: false, reason: s.reason };
-    if (stop?.aborted) return { ok: false, skip: false, reason: TIMED_OUT };
+    if (stop?.aborted || !canStart(deadline)) return { ok: false, skip: false, reason: TIMED_OUT };
     const signal = automationGate.signal("remoteTyping");
     await focusTab(tab.gi, tab.ti); // also when active: showing it moves the keyboard focus into the tab
     const r = await typeIntoFocusedSession(s.line, undefined, () => !disposed && !resumeActive && !signal.aborted && !stop?.aborted, {
@@ -4199,8 +4200,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     });
   }
 
-  /** Runs a remote command; once `signal` aborts (its 60 s are up) nothing more is written, typed, opened or killed. */
-  async function executeRemote(cmd: FleetCommand, signal: AbortSignal): Promise<CommandOutcome> {
+  /**
+   * Runs a remote command; once `signal` aborts (its 60 s are up, at `deadline`) nothing more is written,
+   * typed, opened or killed, and typing or an inbox send does not start with less than 10 s left.
+   */
+  async function executeRemote(cmd: FleetCommand, signal: AbortSignal, deadline: number): Promise<CommandOutcome> {
     const find = () => (cmd.sessionId ? lastAllViews.find((v) => v.sessionId === cmd.sessionId) : undefined);
     switch (cmd.type) {
       case "resume": {
@@ -4218,7 +4222,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           // The session is running somewhere without a terminal we can address
           // (the Claude Code extension's own tab): a second `claude --resume`
           // would duplicate it, so type into the tab, only under the keystroke rules.
-          const typed = await typeIntoSession(v, "resume", signal);
+          const typed = await typeIntoSession(v, "resume", signal, deadline);
           if (typed.ok) return { ok: true, message: `"resume" typed into the running session "${truncate(v.title, 40)}"` };
           if (typed.reason === NO_TAB_MESSAGE) return { ok: false, message: NO_TAB_MESSAGE };
           return {
@@ -4303,9 +4307,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
         return deliverText({
           text,
           terminal: () => sendToSessionTerminal(v, text, signal),
-          typed: () => typeIntoSession(v, text, signal),
-          uds: (line) => sendToSession({ pid: v.pid, sessionId: v.sessionId, text: line, timeoutMs: 5000, waitTranscriptMs: 15_000 }),
+          typed: () => typeIntoSession(v, text, signal, deadline),
+          uds: (line) => sendToSession({ pid: v.pid, sessionId: v.sessionId, text: line, timeoutMs: 5000, waitTranscriptMs: 15_000, signal }),
           signal,
+          deadline,
         });
       }
       default:

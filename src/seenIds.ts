@@ -4,9 +4,10 @@
  * 0700, files 0600), holding when it was recorded. Recording an id creates its
  * file atomically and fails while the file exists, so of two windows that get
  * the same id at the same time only one goes on. Records are kept for 10
- * minutes (a remote command stays valid for 2), then removed. The remote bridge
- * records each command id before it runs (remoteForward.ts). No vscode import:
- * the clock and the file system come in through SeenDeps.
+ * minutes (a remote command stays valid for 2), then removed, and so is a temp
+ * file a crash left once it is 2 minutes old. The remote bridge records each
+ * command id before it runs (remoteForward.ts). No vscode import: the clock and
+ * the file system come in through SeenDeps.
  */
 import { createHash } from "crypto";
 import * as fs from "fs";
@@ -14,6 +15,7 @@ import * as path from "path";
 import { readText } from "./continuity";
 
 export const SEEN_RETAIN_MS = 10 * 60_000;
+const TEMP_MAX_AGE_MS = 2 * 60_000; // a create takes milliseconds: a temp file this old was left by a crash
 const RECORD = /^[0-9a-f]{32}\.json$/;
 
 /** The file operations of the store; nodeSeenFs is the real one. */
@@ -23,6 +25,7 @@ export interface SeenFs {
   read(file: string): string | undefined; // undefined when missing or unreadable
   list(dir: string): string[]; // [] when the folder is missing
   remove(file: string): void;
+  mtimeMs(file: string): number | undefined; // undefined when missing
 }
 
 export interface SeenDeps {
@@ -52,12 +55,17 @@ export class SeenIds {
     return ts !== undefined && this.deps.now() - ts < this.retainMs;
   }
 
-  /** Removes the records older than the retention and the unreadable ones. */
+  /** Removes the records older than the retention, the unreadable ones and the temp files a crash left. */
   prune(): void {
     const now = this.deps.now();
     for (const name of this.deps.fs.list(this.deps.dir)) {
-      if (!RECORD.test(name)) continue; // a temp file of a create in progress
       const file = path.join(this.deps.dir, name);
+      if (!RECORD.test(name)) {
+        // A temp file belongs to a create in progress unless it is 2 minutes old.
+        const mtime = name.endsWith(".tmp") ? this.deps.fs.mtimeMs(file) : undefined;
+        if (mtime !== undefined && now - mtime > TEMP_MAX_AGE_MS) this.deps.fs.remove(file);
+        continue;
+      }
       const ts = this.recordedAt(file);
       if (ts === undefined || now - ts >= this.retainMs) this.deps.fs.remove(file);
     }
@@ -87,8 +95,8 @@ export const nodeSeenFs: SeenFs = {
     const dir = path.dirname(file);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`);
-    fs.writeFileSync(tmp, text, { mode: 0o600, flag: "wx" });
     try {
+      fs.writeFileSync(tmp, text, { mode: 0o600, flag: "wx" });
       fs.linkSync(tmp, file);
       return true;
     } catch (e) {
@@ -108,5 +116,12 @@ export const nodeSeenFs: SeenFs = {
   },
   remove(file) {
     fs.rmSync(file, { force: true });
+  },
+  mtimeMs(file) {
+    try {
+      return fs.statSync(file).mtimeMs;
+    } catch {
+      return undefined;
+    }
   },
 };

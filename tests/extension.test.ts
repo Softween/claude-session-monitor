@@ -581,6 +581,49 @@ describe("extension activate()", () => {
     expect(record.terminalLookup.via).toBeNull();
   });
 
+  it("openSession has Claude Code show a session this window's Claude Code runs, whatever its tab label", async () => {
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    // A session without an ai-title keeps its first prompt as tab label ("devam")
+    // while its row shows the newest prompt ("evet"), and several tabs can share
+    // that label: only Claude Code knows which tab hosts the session.
+    const pid = process.ppid; // a live process, recorded as this window's tab process
+    fs.mkdirSync(`${HOME}/.claude/sessions`, { recursive: true });
+    fs.writeFileSync(
+      `${HOME}/.claude/sessions/${pid}.json`,
+      JSON.stringify({ pid, sessionId: "hosted-session", entrypoint: "claude-vscode" }),
+    );
+    rec.execFileImpl = (args) => {
+      if (args[0] !== "ps" || !String(args[1]).includes("ppid=,pcpu=")) return false;
+      args[args.length - 1](null, `${pid} ${process.pid} 0.0 1024\n`, "");
+      return true;
+    };
+    await rec.commands.get("claudeSessionMonitor.openSession")!({
+      key: "claude:hosted-session",
+      provider: "claude",
+      title: "evet",
+      sessionId: "hosted-session",
+      bucket: "attention",
+      sub: "your turn",
+      capabilities: { focus: true, transcript: true, resume: true, kill: true, bulkInput: true },
+      transcriptPath: `${HOME}/hosted-session.jsonl`,
+      tooltip: "",
+      detail: "",
+      lastActivityMs: Date.now(),
+      stale: false,
+      matchLabels: ["evet"],
+    });
+    await vi.waitFor(() =>
+      expect(rec.executeCalls).toContainEqual({
+        id: "claude-vscode.editor.open",
+        args: ["hosted-session", undefined, undefined, undefined, undefined, { programmatic: true }],
+      }),
+    );
+    expect(rec.infoMessages.filter((m) => m.includes("has no open tab"))).toEqual([]);
+    const record = JSON.parse(fs.readFileSync(`${HOME}/.claude/session-monitor/tabs-debug.json`, "utf8"));
+    expect(record.action).toBe("claude-vscode.editor.open (session runs in this window)");
+  });
+
   it("persists a hidden ended Codex dismissal across activation reloads", async () => {
     const sessionId = "ended-codex-hidden";
     const codexDir = `${HOME}/.codex/session-monitor`;

@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.40.1
+- **A click reaches the session's tab, whatever the tab is called.** A session that never gets an AI title (common when its first prompt is a single word) keeps that first prompt as its Claude Code tab label while its row shows the newest prompt, so a click could end in "has no open tab or terminal in this window" although the tab was open, and several such tabs can share one label. When this window's Claude Code runs the session, the click now asks Claude Code to show it by its id, which finds the right tab. Sessions that run elsewhere keep the lookup by tab label and terminal.
+
 ## 2.40.0
 - **One switch for every tab automation.** The new setting `claudeSessionMonitor.tabAutomation` (on by default) is checked right before every tab the monitor shows, moves or types into: limit-stopped tab wakes, continuity requests, the resume and command sweeps, auto-resume after a limit reset and remote typing. Each of them still needs its own setting as well. Turning the switch or a feature's own setting off cancels the work in progress, such as a wake, a tab restore or a sweep, and turning tab waking back on starts it without a restart.
 - **Tab wakes go easy on memory.** A woken tab starts its `claude` process, so wakes (continuity requests included) wait while macOS reports memory pressure and are limited to 3 per 5 minutes per window. After a refused wake the next try waits 30 s, doubling up to 10 minutes.

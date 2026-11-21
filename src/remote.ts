@@ -422,13 +422,35 @@ export async function sampleMachine(
   return { ...c.value, pressure, sessions };
 }
 
+/** Every command type the bridge runs (the remote command dispatcher in extension.ts). */
+export const REMOTE_COMMAND_TYPES = ["resume", "kill", "resumeAll", "switchAccount", "send", "newSession", "autoResume", "answer"] as const;
+
+/** `remote.allowedCommands` while the user has not set it: every type but send, newSession and switchAccount. */
+export const DEFAULT_ALLOWED_COMMANDS: readonly string[] = ["resume", "kill", "resumeAll", "autoResume", "answer"];
+
+/** The types a user's `remote.allowedCommands` value allows: the default list when it is unset or not an array of strings. */
+export function allowedCommandTypes(value: unknown): readonly string[] {
+  return Array.isArray(value) && value.every((t) => typeof t === "string") ? value : DEFAULT_ALLOWED_COMMANDS;
+}
+
 /**
- * Why a relay command must not run, or null to run it: commands are switched off
- * on this Mac (`remote.acceptCommands`), or the command is older than 2 min. A
- * command without a numeric `createdAt` counts as expired.
+ * Why a relay command must not run, or null to run it, checked in this order:
+ * commands are switched off on this Mac (`remote.acceptCommands`), its type is
+ * not one the bridge runs or not in `allowed` (`remote.allowedCommands`), or it
+ * is older than 2 min. A command without a numeric `createdAt` counts as expired.
  */
-export function commandRefusal(createdAt: unknown, now: number, acceptCommands: boolean): string | null {
+export function commandRefusal(
+  cmd: { type?: unknown; createdAt?: unknown },
+  now: number,
+  acceptCommands: boolean,
+  allowed: readonly string[],
+): string | null {
   if (!acceptCommands) return "remote commands disabled on this Mac";
+  const type = typeof cmd.type === "string" ? cmd.type : "";
+  if (!(REMOTE_COMMAND_TYPES as readonly string[]).includes(type) || !allowed.includes(type)) {
+    return `${type || "a command without a type"} is not allowed on this Mac`;
+  }
+  const { createdAt } = cmd;
   const age = typeof createdAt === "number" && Number.isFinite(createdAt) ? now - createdAt : NaN;
   return age <= COMMAND_MAX_AGE_MS ? null : "expired";
 }

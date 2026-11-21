@@ -501,14 +501,40 @@
         "claudeSessionMonitor.remote.acceptCommands": {
           "type": "boolean",
           "scope": "application",
-          "default": true,
-          "markdownDescription": "Run the commands the remote bridge receives (`resume`, `send`, `kill`, `resumeAll`, `switchAccount`, `autoResume`, `answer`). Off is a kill switch: the session snapshot is still uploaded, but every command is answered with `remote commands disabled on this Mac` and nothing runs."
+          "default": false,
+          "markdownDescription": "Run the commands the remote bridge receives whose type is listed in `#claudeSessionMonitor.remote.allowedCommands#`. Off by default: the session snapshot is still uploaded, but every command is answered with `remote commands disabled on this Mac` and nothing runs."
+        },
+        "claudeSessionMonitor.remote.allowedCommands": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "resume",
+              "kill",
+              "resumeAll",
+              "switchAccount",
+              "send",
+              "newSession",
+              "autoResume",
+              "answer"
+            ]
+          },
+          "uniqueItems": true,
+          "scope": "application",
+          "default": [
+            "resume",
+            "kill",
+            "resumeAll",
+            "autoResume",
+            "answer"
+          ],
+          "markdownDescription": "The remote command types this Mac runs while `#claudeSessionMonitor.remote.acceptCommands#` is on: `resume`, `kill`, `resumeAll`, `switchAccount`, `send` (a message into a running Claude session), `newSession` (a new Claude session in one of the snapshot's `allowedCwds`), `autoResume` and `answer` (an answer to a waiting AskUserQuestion). A command of any other type is answered with `<type> is not allowed on this Mac` and nothing runs. The default leaves out `send`, `newSession` and `switchAccount`; add them here to allow them."
         },
         "claudeSessionMonitor.remote.typeFallback": {
           "type": "boolean",
           "scope": "application",
-          "default": true,
-          "markdownDescription": "Let a remote `send` or `resume` switch to a session's Claude Code tab and type into it (macOS keystrokes) when the session has no VS Code terminal here. Only when this VS Code window is focused (VS Code is never brought to the front), the tab is the window's one tab matching the session title (Claude Code's truncated labels included, never one another session's title matches too) and VS Code is still the frontmost app at the keystroke; otherwise `send` goes to the session's inbox. Off never types. It types in chunks of at most 200 characters and stops, without pressing Return, as soon as the Claude Code prompt input loses the focus."
+          "default": false,
+          "markdownDescription": "Let a remote `send` or `resume` switch to a session's Claude Code tab and type into it (macOS keystrokes) when the session has no VS Code terminal here. Only when this VS Code window is focused (VS Code is never brought to the front), the tab is the window's one tab matching the session title (Claude Code's truncated labels included, never one another session's title matches too) and VS Code is still the frontmost app at the keystroke; otherwise `send` goes to the session's inbox. Off (the default) never types. It types in chunks of at most 200 characters and stops, without pressing Return, as soon as the Claude Code prompt input loses the focus."
         },
         "claudeSessionMonitor.dev.enableFeatures": {
           "type": "array",

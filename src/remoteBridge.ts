@@ -16,6 +16,7 @@ import type { SessionView } from "./providers/types";
 import {
   COMMAND_TIMEOUT_MS,
   MAX_COMMANDS_PER_POLL,
+  allowedCommandTypes,
   buildSnapshot,
   checkRemoteUrl,
   commandRefusal,
@@ -31,6 +32,7 @@ import {
   type FleetAutoResume,
   type SnapshotAccountInput,
 } from "./remote";
+import { sanitizeRemoteLine } from "./remoteInput";
 
 export const REMOTE_TOKEN_KEY = "csm.remote.token";
 const POLL_WAIT_SEC = 25;
@@ -77,14 +79,17 @@ export const TYPED_REASON: Record<string, string> = {
  * terminal that hosts the session, (b) keystrokes into the session's Claude tab
  * (only when VS Code is frontmost and that tab is active), (c) the session's
  * uds-messaging inbox. The first path that applies ends the command, whatever
- * its result (a rejected input included). The inbox is last, so nothing is ever
- * typed after it accepted a frame; `unconfirmed` is an accepted frame that the
- * session has not shown yet, reported as pending.
+ * its result (a rejected input included). Every path checks `text` with
+ * sanitizeRemoteLine: (a) and (b) themselves, (c) here, and the inbox gets the
+ * checked line. The inbox is last, so nothing is ever typed after it accepted a
+ * frame; `unconfirmed` is an accepted frame that the session has not shown yet,
+ * reported as pending.
  */
 export async function deliverText(o: {
+  text: string;
   terminal: () => Promise<PathAttempt>;
   typed: () => Promise<PathAttempt>;
-  uds: () => Promise<PeerSendResult>;
+  uds: (line: string) => Promise<PeerSendResult>;
 }): Promise<CommandOutcome> {
   const skipped: string[] = [];
   for (const [via, run] of [["terminal", o.terminal], ["typed", o.typed]] as const) {
@@ -99,9 +104,11 @@ export async function deliverText(o: {
     if (!r.skip) return { ok: false, message: `not delivered via ${via}: ${why}` };
     skipped.push(`${via}: ${why}`);
   }
+  const checked = sanitizeRemoteLine(o.text);
+  if (!checked.ok) return { ok: false, message: `not delivered via inbox: ${checked.reason}` };
   let r: PeerSendResult;
   try {
-    r = await o.uds();
+    r = await o.uds(checked.line);
   } catch (e) {
     return { ok: false, message: `not delivered: ${skipped.join("; ")}; inbox error: ${String(e)}` };
   }
@@ -340,9 +347,9 @@ export class RemoteBridge implements vscode.Disposable {
 
   private async runCommand(cfg: BridgeCfg, cmd: FleetCommand, signal: AbortSignal): Promise<void> {
     if (!cmd || typeof cmd.id !== "string" || !cmd.id) return;
-    // The kill switch and the 2 min expiry answer before any action runs; a command
-    // that runs gets 60 s, then its result says "timed out" and the loop moves on.
-    const refusal = commandRefusal(cmd.createdAt, Date.now(), remoteFlag("remote.acceptCommands"));
+    // The kill switch, the allowlist and the 2 min expiry answer before any action runs;
+    // a command that runs gets 60 s, then its result says "timed out" and the loop moves on.
+    const refusal = commandRefusal(cmd, Date.now(), remoteFlag("remote.acceptCommands"), remoteAllowedCommands());
     let out: CommandOutcome;
     if (refusal) {
       out = { ok: false, message: refusal };
@@ -441,10 +448,15 @@ export function remoteSetting(key: "remote.url" | "remote.host"): string {
   return typeof v === "string" ? v.trim() : "";
 }
 
-/** A boolean remote setting, user (global) value only like remote.url; unset means on. */
+/** A boolean remote setting, user (global) value only like remote.url; unset means off. */
 export function remoteFlag(key: "remote.acceptCommands" | "remote.typeFallback"): boolean {
   const v = vscode.workspace.getConfiguration("claudeSessionMonitor").inspect<boolean>(key)?.globalValue;
-  return typeof v === "boolean" ? v : true;
+  return typeof v === "boolean" ? v : false;
+}
+
+/** The command types a remote command may have (`remote.allowedCommands`), user (global) value only like remote.url. */
+export function remoteAllowedCommands(): readonly string[] {
+  return allowedCommandTypes(vscode.workspace.getConfiguration("claudeSessionMonitor").inspect<unknown>("remote.allowedCommands")?.globalValue);
 }
 
 /** Register the bridge, its two commands and its lifecycle hooks; returns the bridge for the poll cycle. */
@@ -484,7 +496,7 @@ export function registerRemoteBridge(ctx: vscode.ExtensionContext, deps: RemoteB
       if (e.key === REMOTE_TOKEN_KEY) void bridge.restart();
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      // acceptCommands / typeFallback are read per command and need no restart.
+      // acceptCommands / allowedCommands / typeFallback are read per command and need no restart.
       if (e.affectsConfiguration("claudeSessionMonitor.remote.url") || e.affectsConfiguration("claudeSessionMonitor.remote.host")) {
         void bridge.restart();
       }

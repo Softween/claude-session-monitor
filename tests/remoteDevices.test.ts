@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanupEndedMonitorFiles, cleanupMonitorFiles } from "../src/core";
 
 const warn = vi.hoisted(() => vi.fn<(...args: unknown[]) => Promise<string | undefined>>(async () => undefined));
 vi.mock("vscode", () => ({ window: { showWarningMessage: warn } }));
@@ -17,6 +18,7 @@ import {
   askOnThisMac,
   askPinOnThisMac,
   deviceName,
+  devicePaths,
   nodeDeviceFs,
   pairedDevices,
   type DeviceDecision,
@@ -42,7 +44,7 @@ let marker: string; // records that the first run happened
 
 beforeEach(() => {
   base = fs.mkdtempSync(path.join(os.tmpdir(), "csm-devices-"));
-  file = path.join(base, "session-monitor", "remote-devices.json");
+  file = path.join(base, "session-monitor", "remote", "devices.json");
   marker = path.join(base, "session-monitor", "remote", "devices-first-run.json");
   warn.mockReset();
 });
@@ -627,6 +629,9 @@ describe("the notification and the modal", () => {
     expect(second).toContain("now signs its commands");
     expect(second.indexOf(NEW.slice(0, 8))).toBeLessThan(second.indexOf(device.name));
     expect(options.detail).toMatch(/Deny Device/);
+    // A fingerprint the phone does not show did not come from the phone: the text steers that to Don't Pin.
+    expect(options.detail).toContain("Pin only if the phone shows this same fingerprint (on the phone: Ayarlar > Eşleştirilmiş cihazlar > Anahtar parmak izi).");
+    expect(options.detail).toContain("If it differs, choose Don't Pin: the key did not come from the phone.");
     expect(buttons).toEqual(["Don't Pin", "Pin Key", "Deny Device"]);
   });
 
@@ -712,6 +717,25 @@ describe("device names and the relay's list", () => {
   });
 });
 
+describe("where the device list lives", () => {
+  it("keeps the list and its first-run record in remote/, which no monitor folder cleanup looks into, however old they are", () => {
+    const monitor = path.join(base, "session-monitor");
+    const paths = devicePaths(monitor);
+    expect(path.relative(monitor, paths.file)).toBe(path.join("remote", "devices.json"));
+    expect(path.relative(monitor, paths.marker)).toBe(path.join("remote", "devices-first-run.json"));
+    // An older window's cleanup removes every top-level .json file older than 12 h.
+    const old = new Date(Date.now() - 13 * 3600_000);
+    for (const f of [paths.file, paths.marker]) {
+      nodeDeviceFs.write(f, JSON.stringify({ version: 1, devices: {} }), false);
+      fs.utimesSync(f, old, old);
+    }
+    const nowSec = Date.now() / 1000;
+    cleanupMonitorFiles(12 * 3600_000, nowSec, monitor);
+    cleanupEndedMonitorFiles(nowSec, 12 * 3600_000, monitor);
+    expect([fs.existsSync(paths.file), fs.existsSync(paths.marker)]).toEqual([true, true]);
+  });
+});
+
 describe("nodeDeviceFs", () => {
   it("writes the file 0600 in a 0700 folder through a temp file and leaves none behind", () => {
     const dir = path.dirname(file);
@@ -727,10 +751,10 @@ describe("nodeDeviceFs", () => {
     // Only when new: the file exists, so nothing changes.
     expect(nodeDeviceFs.write(file, "three", true)).toBe(false);
     expect(nodeDeviceFs.read(file)).toBe("two");
-    expect(fs.readdirSync(dir)).toEqual(["remote-devices.json"]);
-    const other = path.join(base, "fresh", "remote-devices.json");
+    expect(fs.readdirSync(dir)).toEqual(["devices.json"]);
+    const other = path.join(base, "fresh", "devices.json");
     expect(nodeDeviceFs.write(other, "new", true)).toBe(true);
     expect(nodeDeviceFs.read(other)).toBe("new");
-    expect(fs.readdirSync(path.dirname(other))).toEqual(["remote-devices.json"]);
+    expect(fs.readdirSync(path.dirname(other))).toEqual(["devices.json"]);
   });
 });

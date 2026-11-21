@@ -575,7 +575,7 @@ describe("RemoteBridge device check", () => {
   function devicesIn(file: string, prompts: string[], now = Date.now) {
     return new DeviceGate({
       file,
-      marker: path.join(path.dirname(file), "remote", "devices-first-run.json"),
+      marker: path.join(path.dirname(file), "devices-first-run.json"),
       fs: nodeDeviceFs,
       now,
       prompt: async (d) => {
@@ -589,8 +589,9 @@ describe("RemoteBridge device check", () => {
 
   it("runs a command only from a device confirmed on this Mac and posts every refusal to the relay", async () => {
     base = fs.mkdtempSync(path.join(os.tmpdir(), "csm-bridge-devices-"));
-    const file = path.join(base, "remote-devices.json");
+    const file = path.join(base, "remote", "devices.json");
     const entry = (state: string, name: string) => ({ state, name, pairedAt: 1, decidedAt: 2 });
+    fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify({ version: 1, devices: { phone: { ...entry("allowed", "iPhone"), publicKey: KEY }, tablet: entry("denied", "iPad") } }));
     const prompts: string[] = [];
     const now = Date.now();
@@ -617,7 +618,7 @@ describe("RemoteBridge device check", () => {
 
   it("on its first start confirms the devices the relay lists, with the bridge token, once", async () => {
     base = fs.mkdtempSync(path.join(os.tmpdir(), "csm-bridge-devices-"));
-    const file = path.join(base, "session-monitor", "remote-devices.json");
+    const file = path.join(base, "session-monitor", "remote", "devices.json");
     const r = relay([], undefined, [{ id: "phone", name: "iPhone", createdAt: 1, lastUsedAt: null, current: false }]);
     const bridge = startBridge(vi.fn(async () => ({ ok: true, message: "ran" })), undefined, devicesIn(file, [], () => 5));
     await bridge.restart();
@@ -728,8 +729,9 @@ describe("RemoteBridge signed commands", () => {
 
   it("an allowed device without a pinned key: its first signed command is refused and asks to pin the relay's key; once pinned, its commands run", async () => {
     base = fs.mkdtempSync(path.join(os.tmpdir(), "csm-bridge-keys-"));
-    const file = path.join(base, "remote-devices.json");
+    const file = path.join(base, "remote", "devices.json");
     const migrated = { state: "allowed", name: "iPhone", pairedAt: 1, decidedAt: 2 };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify({ version: 1, devices: { phone: migrated } }));
     const pinAsks: string[] = [];
     const gate = new DeviceGate({

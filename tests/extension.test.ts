@@ -505,7 +505,7 @@ describe("extension activate()", () => {
   it("refresh and openSession run without throwing on an empty home", async () => {
     lastCtx = mkCtx();
     ext.activate(lastCtx);
-    expect(() => rec.commands.get("claudeSessionMonitor.refresh")!()).not.toThrow();
+    await expect(rec.commands.get("claudeSessionMonitor.refresh")!()).resolves.toBeUndefined();
     await rec.commands.get("claudeSessionMonitor.openSession")!({
       key: "claude:s",
       provider: "claude",
@@ -690,7 +690,7 @@ describe("extension activate()", () => {
     expect(sharedState.get("dismissedSessionsV2")).toEqual(persisted);
   });
 
-  it("removes a persisted tombstone after newer live activity", () => {
+  it("removes a persisted tombstone after newer live activity", async () => {
     const sessionId = "active-after-dismissal";
     const now = Date.now();
     const sharedState = new Map<string, unknown>([
@@ -714,6 +714,7 @@ describe("extension activate()", () => {
 
     lastCtx = mkCtx(sharedState);
     ext.activate(lastCtx);
+    await rec.commands.get("claudeSessionMonitor.refresh")!(); // the first refresh, started by activate()
 
     expect(sharedState.get("dismissedSessionsV2")).toEqual([]);
   });
@@ -1571,11 +1572,11 @@ describe("active login and Use this account", () => {
     expect(debugLog()).toContain("active: b@x.com (acct bbbbbbbb, from claude.json)");
   });
 
-  it("auto-resume follows the active login's own 5h gauge, not the previous login's live poll", () => {
+  it("auto-resume follows the active login's own 5h gauge, not the previous login's live poll", async () => {
     vi.useFakeTimers();
     const reset = Date.now() + 600_000;
     const s5 = (pct: number) => [{ key: "session", label: "Session (5h)", pct, resetMs: reset }];
-    const start = (activePct: number, livePct: number): string => {
+    const start = async (activePct: number, livePct: number): Promise<string> => {
       disposeCtx(lastCtx);
       fs.rmSync(MON, { recursive: true, force: true });
       fs.mkdirSync(MON, { recursive: true });
@@ -1585,12 +1586,13 @@ describe("active login and Use this account", () => {
       fs.writeFileSync(snapFile(UB), JSON.stringify({ gauges: s5(activePct), ts: Date.now() / 1000 - 60 }));
       lastCtx = mkCtx();
       ext.activate(lastCtx);
+      await rec.commands.get("claudeSessionMonitor.refresh")!(); // the first refresh, started by activate()
       return debugLog();
     };
     rec.config.set("enableClaude", true);
     rec.config.set("autoResumeAfterReset", true);
-    expect(start(12, 99)).not.toContain("auto-resume scheduled");
-    expect(start(99, 10)).toContain("auto-resume scheduled");
+    expect(await start(12, 99)).not.toContain("auto-resume scheduled");
+    expect(await start(99, 10)).toContain("auto-resume scheduled");
   });
 
   it("without the claude-switch CLI a leftover panel.json is ignored: no block, badges, merged accounts or simplified cards, and nothing runs claude-switch", async () => {
@@ -2124,30 +2126,31 @@ describe("closingStatusMarkers setting", () => {
     fs.writeFileSync(tx, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
     fs.writeFileSync(`${mon}/s-closing.json`, JSON.stringify({ session_id: "s-closing", provider: "claude", state: "idle", ts: now - 35, cwd: "/repo", transcript_path: tx }));
   }
-  function yourTurnRow(): any {
+  async function yourTurnRow(): Promise<any> {
     lastCtx = mkCtx();
     ext.activate(lastCtx);
     const posted: any[] = [];
     rec.webviews.find((w) => w.id === "claudeSessionMonitor.view")!.p.resolveWebviewView(
       webviewView({ options: {}, html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: (m: any) => { posted.push(m); } }),
     );
+    await rec.commands.get("claudeSessionMonitor.refresh")!(); // the first refresh, started by activate(), posts the rows
     const done = posted[posted.length - 1].groups.find((g: { key: string }) => g.key === "done");
     return done?.rows.find((r: { id: string }) => r.id === "claude:s-closing");
   }
 
-  it("off by default: the your-turn row keeps the plain dot, with no closing text in the row or its tooltip", () => {
+  it("off by default: the your-turn row keeps the plain dot, with no closing text in the row or its tooltip", async () => {
     seedYourTurn();
-    const row = yourTurnRow();
+    const row = await yourTurnRow();
     expect(row).toBeDefined();
     expect(row.closing).toBe("");
     expect(row.closingText).toBe("");
     expect(row.tip).not.toContain("closing:");
   });
 
-  it("on: the your-turn row carries the closing marker and its text, and the tooltip a closing line", () => {
+  it("on: the your-turn row carries the closing marker and its text, and the tooltip a closing line", async () => {
     rec.config.set("closingStatusMarkers", true);
     seedYourTurn();
-    const row = yourTurnRow();
+    const row = await yourTurnRow();
     expect(row.closing).toBe("done");
     expect(row.closingText).toBe("All tests pass");
     expect(row.tip).toContain("closing: ✅ All tests pass");
@@ -2172,23 +2175,24 @@ describe("closingStatusMarkers setting", () => {
     fs.writeFileSync(`${mon}/${id}.json`, JSON.stringify({ session_id: id, provider: "claude", state: "idle", ts: now - agoSec + 1, cwd: "/repo", transcript_path: tx }));
     return hhmm;
   }
-  function sessionsPayload(): any {
+  async function sessionsPayload(): Promise<any> {
     lastCtx = mkCtx();
     ext.activate(lastCtx);
     const posted: any[] = [];
     rec.webviews.find((w) => w.id === "claudeSessionMonitor.view")!.p.resolveWebviewView(
       webviewView({ options: {}, html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: (m: any) => { posted.push(m); } }),
     );
+    await rec.commands.get("claudeSessionMonitor.refresh")!(); // the first refresh, started by activate(), posts the rows
     return posted[posted.length - 1];
   }
 
-  it("on: an on-time ⏳ row moves to In background, right after Your turn, soonest finish first", () => {
+  it("on: an on-time ⏳ row moves to In background, right after Your turn, soonest finish first", async () => {
     rec.config.set("closingStatusMarkers", true);
     seedYourTurn();
     const now = Date.now() / 1000;
     const later = seedPending("s-later", 30, now + 7200);
     const sooner = seedPending("s-sooner", 30, now + 3600);
-    const p = sessionsPayload();
+    const p = await sessionsPayload();
     const keys = p.groups.map((g: { key: string }) => g.key);
     expect(keys.indexOf("background")).toBe(keys.indexOf("done") + 1);
     const done = p.groups.find((g: { key: string }) => g.key === "done");
@@ -2203,20 +2207,20 @@ describe("closingStatusMarkers setting", () => {
     expect(bar.tooltip).toContain("your turn: 1\nin background: 2");
   });
 
-  it("on: an overdue ⏳ row goes back to Your turn with the late warning", () => {
+  it("on: an overdue ⏳ row goes back to Your turn with the late warning", async () => {
     rec.config.set("closingStatusMarkers", true);
     const now = Date.now() / 1000;
     const due = seedPending("s-late", 7200, now - 3600);
-    const p = sessionsPayload();
+    const p = await sessionsPayload();
     expect(p.groups.find((g: { key: string }) => g.key === "background")).toBeUndefined();
     const row = p.groups.find((g: { key: string }) => g.key === "done").rows.find((r: { id: string }) => r.id === "claude:s-late");
     expect(row).toMatchObject({ closing: "pending", due, late: `past its finish time (~${due}); may be stuck` });
     expect(row.tip).toContain(`past its finish time (~${due}); may be stuck`);
   });
 
-  it("off: a ⏳ session stays a plain Your turn row with no In background group", () => {
+  it("off: a ⏳ session stays a plain Your turn row with no In background group", async () => {
     seedPending("s-off", 30, Date.now() / 1000 + 3600);
-    const p = sessionsPayload();
+    const p = await sessionsPayload();
     expect(p.groups.map((g: { key: string }) => g.key)).toEqual(["done"]);
     const row = p.groups[0].rows.find((r: { id: string }) => r.id === "claude:s-off");
     expect(row).toMatchObject({ closing: "", closingText: "", due: "", late: "" });
@@ -2257,7 +2261,11 @@ describe("resume terminals: reuse, and remote resume / send / kill without a hoo
     };
     lastCtx = mkCtx();
     ext.activate(lastCtx);
-    return (cmd) => rec.bridgeDeps.execute(cmd, new AbortController().signal, Date.now() + 60_000);
+    const ready = rec.commands.get("claudeSessionMonitor.refresh")!(); // the first refresh, started by activate(), lists the session
+    return async (cmd) => {
+      await ready;
+      return rec.bridgeDeps.execute(cmd, new AbortController().signal, Date.now() + 60_000);
+    };
   }
   const refresh = () => rec.commands.get("claudeSessionMonitor.refresh")!();
 
@@ -2298,7 +2306,7 @@ describe("resume terminals: reuse, and remote resume / send / kill without a hoo
     expect(rec.terminals[0].sent).toEqual(["resume\r"]);
 
     rec.terminals[0].exitStatus = { code: 0, reason: 0 };
-    refresh();
+    await refresh();
     expect((await execute({ id: "r3", type: "resume", sessionId: SID })).message).toBe(
       `resume terminal opened in the background for "${TITLE}"`,
     );
@@ -2507,10 +2515,11 @@ describe("the debug log: activation line, session summary, drop events and error
     vi.restoreAllMocks();
   });
 
-  it("the activation writes one line with the version, the pid and the window key first, and every line carries them", () => {
+  it("the activation writes one line with the version, the pid and the window key first, and every line carries them", async () => {
     const storage = `${HOME}/workspaceStorage/0123abcd`;
     lastCtx = { ...mkCtx(), storageUri: { fsPath: `${storage}/softween.claude-code-session-monitor` }, extension: { packageJSON: { version: "9.9.9" } } };
     ext.activate(lastCtx);
+    await rec.commands.get("claudeSessionMonitor.refresh")!(); // the first refresh, started by activate()
     const win = storageKey(storage);
     const out = logLines();
     const at = out.findIndex((l) => l.feature === "activation");

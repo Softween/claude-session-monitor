@@ -71,7 +71,9 @@ export function singleFlight(fn: () => Promise<void>, onError: (error: unknown) 
   let inflight: Promise<void> | undefined;
   return () => {
     inflight ??= fn()
-      .catch(onError)
+      .catch((error: unknown) => {
+        onError(error);
+      })
       .finally(() => {
         inflight = undefined;
       });

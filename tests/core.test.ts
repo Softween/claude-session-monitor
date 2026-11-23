@@ -996,6 +996,20 @@ describe("resolve / collectSessions branch coverage", () => {
     // A pid of the hook's own wins over the terminal's.
     expect(collect([{ ...ended, state: "idle", pid: 777 }], { resumePids }).find((x) => x.sessionId === "rs")?.pid).toBe(777);
   });
+
+  it("an ended session whose Claude Code tab is still open (a window reload) shows as your turn", () => {
+    const p = writeTranscript("rl.jsonl", [
+      { type: "ai-title", aiTitle: "GetFund v8 ana sayfa", timestamp: iso(NOW - 90) },
+      { type: "assistant", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "bitti" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 80) },
+    ]);
+    const ended: HookStatus = { session_id: "rl", state: "ended", ts: NOW - 60, cwd: "/repo", transcript_path: p };
+    const tabOpen = (labels: string[]) => labels.includes("GetFund v8 ana sayfa");
+    expect(collect([ended]).find((x) => x.sessionId === "rl")).toBeUndefined(); // no tab check: hidden as before
+    expect(collect([ended], { hasOpenTab: () => false }).find((x) => x.sessionId === "rl")).toBeUndefined(); // tab closed
+    const v = collect([ended], { hasOpenTab: tabOpen }).find((x) => x.sessionId === "rl");
+    expect(v).toMatchObject({ bucket: "attention", sub: "your turn", title: "GetFund v8 ana sayfa" });
+    expect(v?.pid).toBeUndefined(); // no process until the tab is shown
+  });
 });
 
 describe("parseClosingStatus", () => {

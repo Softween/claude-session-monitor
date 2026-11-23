@@ -192,6 +192,7 @@ import {
   codexPlanLabel,
   filterHistoryForAccount,
   topSessionRows,
+  labelsMatchStrict,
   type AccountView,
   type SessionTokenRow,
   type BurnEta,
@@ -3399,6 +3400,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     let collected = true;
     if (claudeEnabled()) {
       try {
+        const tabLabels = vscode.window.tabGroups.all.flatMap((g) => g.tabs.filter(isClaudePanelTab).map((t) => t.label));
         claudeViews = collectSessions({
           now,
           extraTranscripts: recentCache,
@@ -3410,6 +3412,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           showEnded: c.get<boolean>("showEnded", false),
           closingMarkers: c.get<boolean>("closingStatusMarkers", false),
           resumePids: resumeTerminals.livePids(),
+          hasOpenTab: (labels) => labels.some((title) => tabLabels.some((label) => labelsMatchStrict(label, title))),
           onError: (sid, e) => stages.fail(`collect ${sid}`, e),
         });
       } catch (e) {

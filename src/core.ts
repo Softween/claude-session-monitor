@@ -976,6 +976,7 @@ export interface CollectOpts {
   phantomGraceSec?: number; // default 600
   pidAlive?: (pid?: number) => boolean | undefined; // injectable for tests
   resumePids?: Map<string, number>; // session id -> pid of the live terminal this window resumed it in
+  hasOpenTab?: (labels: string[]) => boolean; // a Claude Code tab with one of these titles is open in this window
   onError?: (sessionId: string, error: unknown) => void; // a candidate that throws is dropped and reported here; the others still show
 }
 
@@ -1084,7 +1085,12 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
         hook && hook.pid === undefined && resumedPid
           ? { ...hook, pid: resumedPid, state: hook.state === "ended" ? "idle" : hook.state }
           : hook;
-      const view = resolve(sid, status, tx, { now, txPath, effort, closingMarkers: opts.closingMarkers });
+      const resolveOpts = { now, txPath, effort, closingMarkers: opts.closingMarkers };
+      let view = resolve(sid, status, tx, resolveOpts);
+      // A window reload ends every tab's process (SessionEnd) and Claude Code starts it again only
+      // when the tab is shown: while its tab is open the session is the user's turn, not closed.
+      if (status && view.bucket === "ended" && status.state === "ended" && opts.hasOpenTab?.(view.matchLabels))
+        view = resolve(sid, { ...status, state: "idle" }, tx, resolveOpts);
       views.push(view);
     } catch (error) {
       opts.onError?.(sid, error); // a malformed record or transcript drops only its own session

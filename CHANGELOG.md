@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.43.3
+- **Sessions stay listed after Developer: Reload Window.** A reload ends every Claude Code tab's process, and Claude Code starts it again only when the tab is shown, so each session's status record said `ended` and the list hid it until its tab was opened by hand. A session whose Claude Code tab is still open in the window now shows as your turn, without a process until the tab is shown; clicking its row opens the tab, which starts it.
+
 ## 2.43.2
 - **The project strip always shows `other`.** The chip for sessions no project pattern matches appeared only while at least one such session existed, so with every open session tagged it was missing while a named project with no sessions still showed `0`. It now shows with its count, `0` included, like the named projects.
 

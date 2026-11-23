@@ -31,6 +31,7 @@ import {
   type AccountsFile,
   type HookStatus,
   type RecentTranscript,
+  type TxInfo,
 } from "../src/core";
 import { groupOf } from "../src/view";
 
@@ -356,6 +357,38 @@ describe("collectSessions", () => {
     const st = fs.statSync(p);
     const views = run([], [{ sessionId: "f", path: p, mtimeMs: st.mtimeMs }]);
     expect(views.find((v) => v.sessionId === "f")?.title).toBe("Discovered");
+  });
+
+  it("forgets the cached parse of a transcript no hook record or recent scan names any more", () => {
+    const lines = [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 8) },
+      { type: "assistant", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 6) },
+    ];
+    const hooked = writeTranscript("hooked.jsonl", lines);
+    const recent = writeTranscript("recent.jsonl", lines);
+    const txCache = new Map<string, TxInfo>();
+    const collect = (hooks: HookStatus[], extra: RecentTranscript[]) =>
+      collectSessions({
+        now: NOW,
+        hookStatuses: new Map(hooks.map((h) => [h.session_id, h])),
+        extraTranscripts: extra,
+        txCache,
+        maxAgeSec: 24 * 3600,
+        hideEndedOlderThanSec: 24 * 3600,
+      });
+    const hook: HookStatus = { session_id: "hooked", state: "idle", ts: NOW - 5, cwd: "/repo", transcript_path: hooked };
+    const scanned: RecentTranscript = { sessionId: "recent", path: recent, mtimeMs: fs.statSync(recent).mtimeMs };
+
+    collect([hook], [scanned]);
+    expect([...txCache.keys()].sort()).toEqual([hooked, recent].sort());
+    const kept = txCache.get(hooked);
+
+    collect([hook], []); // the recent scan no longer lists it
+    expect([...txCache.keys()]).toEqual([hooked]);
+    expect(txCache.get(hooked)).toBe(kept); // unchanged file: the same cached parse
+
+    collect([], []); // the hook record is gone too
+    expect(txCache.size).toBe(0);
   });
 
   it("a malformed hook record (a non-string cwd) drops only its own session, and is reported", () => {

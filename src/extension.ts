@@ -49,6 +49,7 @@ import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, should
 import { OPEN_COMMAND, TabWaker, nodeProbes, ownSessions, readLiveSessions, readParentPids, summaryText } from "./wakeTabs";
 import { ContinuityServer, continuityDir, readText, storageDir, windowKey, writeTextAtomic } from "./continuity";
 import { focusGroupBySlot, revealTabByIndex, type TabFocusDeps } from "./tabFocus";
+import { OTHER_PROJECT, projectOf, readProjectRules } from "./projects";
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
 import { submitAnswer } from "./answers";
 import { nothingTyped, typeIntoPrompt, type TypeResult } from "./keystrokeTyping";
@@ -291,6 +292,8 @@ interface SessionRow {
   effort: string; // reasoning effort ("" when unknown)
   lastMs: number; // last activity epoch ms — age ticks client-side
   dir: string;
+  project: string; // project tag ("" when no project rules are set or none matched)
+  projectIdx: number; // the tag's color slot (-1: none)
   cpu: number | null;
   rssMb: number | null;
   cpuHog: boolean;
@@ -315,8 +318,16 @@ interface SessionsPayload {
   filter: string; // active list filter label, "" when none
   providerCounts: ProviderCounts;
   providerFilter: AgentProvider | "all";
+  projects: ProjectStrip | null; // null when no project rules are set
   health: ProviderHealth[];
   emptyMessage: string;
+}
+
+/** The project filter strip: rule names in order, sessions per project (and "other"), the active filter. */
+interface ProjectStrip {
+  names: string[];
+  counts: Record<string, number>;
+  filter: string; // "all", a rule name or "other"
 }
 
 class SessionsView implements vscode.WebviewViewProvider {
@@ -362,6 +373,9 @@ function sessionsHtml(): string {
     padding:2px 8px; font:inherit; font-size:11px; cursor:pointer; }
   .pfilter:hover { color:var(--vscode-foreground); }
   .pfilter.active { color:var(--vscode-foreground); background:var(--vscode-badge-background, rgba(127,127,127,.25)); }
+  .projrow { flex-wrap:wrap; padding-top:0; }
+  .pfilter.proj.active, .ptag { color:var(--pc, var(--vscode-foreground)); }
+  .ptag { font-weight:600; }
   .totals { margin-left:auto; font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .health { padding:2px 12px 6px; color:var(--vscode-descriptionForeground); font-size:10px; line-height:1.4; }
   /* Group header: quiet label + count; a chevron only when it is collapsible. */
@@ -435,6 +449,19 @@ function fmtAge(ms){
   return Math.floor(s/86400)+'d';
 }
 function fmtMb(mb){ return mb >= 1024 ? (mb/1024).toFixed(1)+'GB' : mb+'MB'; }
+const PCOLOR = ['var(--vscode-charts-blue)','var(--vscode-charts-orange)','var(--vscode-charts-green)','var(--vscode-charts-purple)','var(--vscode-charts-yellow)','var(--vscode-charts-red)'];
+function projectStrip(p){
+  if(!p) return '';
+  const chip = (key, label, i, n) => '<button class="pfilter proj'+(p.filter===key?' active':'')+'" data-project="'+esc(key)+'" aria-pressed="'+(p.filter===key)+'"'
+    + (i>=0?' style="--pc:'+PCOLOR[i % PCOLOR.length]+'"':'')+'>'+esc(label)+' '+n+'</button>';
+  let total = 0;
+  for(const k in p.counts) total += p.counts[k];
+  return '<div class="top projrow" role="toolbar" aria-label="Session project filter" data-testid="csm-project-filter">'
+    + chip('all','All projects',-1,total)
+    + p.names.map((n,i)=>chip(n,n,i,p.counts[n]||0)).join('')
+    + (p.counts.other?chip('other','other',-1,p.counts.other):'')
+    + '</div>';
+}
 function metaLine(r){
   const bits = [];
   const due = r.due ? 'bitiş '+r.due : '';
@@ -443,7 +470,8 @@ function metaLine(r){
   if(extra) bits.push('<span class="sub">'+esc(extra)+'</span>');
   if(r.model) bits.push(esc(r.model)+(r.effort?' · '+esc(r.effort):''));
   else bits.push(esc(r.providerLabel));
-  if(r.dir) bits.push(esc(r.dir));
+  if(r.project) bits.push('<span class="ptag" style="--pc:'+PCOLOR[r.projectIdx % PCOLOR.length]+'">'+esc(r.project)+'</span>');
+  else if(r.dir) bits.push(esc(r.dir));
   if(r.cpuHog && r.cpu!=null) bits.push('<span class="hot">cpu '+r.cpu+'%</span>');
   if(r.rssMb!=null && r.rssMb>=1024) bits.push(esc(fmtMb(r.rssMb)));
   return bits.join(' · ');
@@ -483,6 +511,7 @@ function render(){
     + (enabled.has('codex')?pill('codex','Codex',last.providerCounts.codex):'')
     + (totals.length?'<span class="totals num">'+totals.join(' · ')+'</span>':'')
     + '</div>';
+  h += projectStrip(last.projects);
   const health = (last.health||[]).filter(x=>x.state!=='ready' && x.message);
   if(health.length) h += '<div class="health">'+health.map(x=>'<div><b>'+esc(x.provider==='codex'?'Codex':'Claude')+':</b> '+esc(x.message)+'</div>').join('')+'</div>';
   if(!last.groups.length){
@@ -507,7 +536,8 @@ document.getElementById('root').addEventListener('click', (ev) => {
   while(el && el !== ev.currentTarget && !(el.classList && (el.classList.contains('pfilter') || el.classList.contains('act') || el.classList.contains('row') || el.classList.contains('fold')))) el = el.parentElement;
   if(!el || el === ev.currentTarget) return;
   if(el.classList.contains('pfilter')){
-    vscodeApi.postMessage({ type: 'filterProvider', id: el.dataset.provider });
+    if(el.dataset.project) vscodeApi.postMessage({ type: 'filterProject', id: el.dataset.project });
+    else vscodeApi.postMessage({ type: 'filterProvider', id: el.dataset.provider });
     return;
   }
   if(el.classList.contains('fold')){
@@ -1642,6 +1672,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const savedProviderFilter = ctx.globalState.get<string>("providerFilter", "all");
   let providerFilter: AgentProvider | "all" =
     savedProviderFilter === "claude" || savedProviderFilter === "codex" ? savedProviderFilter : "all";
+  let projectFilter = ctx.globalState.get<string>("projectFilter", "all");
+  let projectStrip: ProjectStrip | null = null; // set by refreshOnce, read by pushSessions
   const stages = stageGuard(log); // a refresh stage or feature start that throws is logged and skipped (safeStage.ts)
   // An Extension Development Host only reads and shows both panels; dev.enableFeatures lists what it may do besides (observerMode.ts).
   const observer = observerMode({
@@ -1656,6 +1688,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   const resourceCache = new Map<number, ResStat>();
   const sessionsView = new SessionsView((action, sessionId) => {
+    if (action === "filterProject") {
+      projectFilter = sessionId;
+      void ctx.globalState.update("projectFilter", projectFilter);
+      refresh();
+      return;
+    }
     if (action === "filterProvider") {
       if (sessionId === "all" || sessionId === "claude" || sessionId === "codex") {
         providerFilter = sessionId;
@@ -3115,6 +3153,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         [
           needsYouOnly ? "needs-you only" : "",
           providerFilter !== "all" ? providerLabel(providerFilter) : "",
+          projectStrip && projectFilter !== "all" ? projectFilter : "",
         ]
           .filter(Boolean)
           .join(" · "),
@@ -3130,10 +3169,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
           ? ""
           : enabledProviders().length === 0
             ? "Both providers are disabled. Enable Claude or Codex in Settings."
-            : providerFilter !== "all" || needsYouOnly
+            : providerFilter !== "all" || needsYouOnly || (projectStrip && projectFilter !== "all")
               ? "No sessions match the active filters."
               : "No recent Claude or Codex sessions. Start one and it will appear here.",
         burnShareBySession,
+        projectStrip,
       ),
     );
     let badge = 0;
@@ -3399,11 +3439,29 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
     if (dismissalsChanged) void persistDismissals();
     if (dismissed.size) allViews = allViews.filter((v) => !dismissed.has(v.key));
+    const projectRules = readProjectRules(cfg().get<unknown>("projects", []));
+    if (projectRules.length) {
+      allViews = allViews.map((v) => ({
+        ...v,
+        project: projectOf(projectRules, { cwd: v.cwd, title: v.title, prompt: v.lastPrompt, refs: v.toolRefs }),
+      }));
+    }
+    if (projectFilter !== "all" && projectFilter !== OTHER_PROJECT && !projectRules.some((r) => r.name === projectFilter)) {
+      projectFilter = "all";
+      void ctx.globalState.update("projectFilter", projectFilter);
+    }
     lastAllViews = allViews;
     const settled = settledOverrides(autoResumeOverrides(), allViews); // a session's auto-resume choice ends with its limit
     if (settled) void ctx.globalState.update(OVERRIDES_KEY, settled);
 
     let views = filterProvider(allViews, providerFilter);
+    projectStrip = null;
+    if (projectRules.length) {
+      const counts: Record<string, number> = {};
+      for (const v of views) counts[v.project ?? OTHER_PROJECT] = (counts[v.project ?? OTHER_PROJECT] ?? 0) + 1;
+      projectStrip = { names: projectRules.map((r) => r.name), counts, filter: projectFilter };
+      if (projectFilter !== "all") views = views.filter((v) => (v.project ?? OTHER_PROJECT) === projectFilter);
+    }
     if (needsYouOnly) views = views.filter((v) => NEEDS_YOU.includes(groupOf(v)));
     lastViews = views;
 
@@ -4721,6 +4779,7 @@ function buildSessionsPayload(
   health: ProviderHealth[],
   emptyMessage: string,
   burnShare: ReadonlyMap<string, number> | null = null,
+  projects: ProjectStrip | null = null,
 ): SessionsPayload {
   const nowSec = Date.now() / 1000;
   const grouped = new Map<GroupKey, SessionRow[]>();
@@ -4768,6 +4827,8 @@ function buildSessionsPayload(
       effort: shortEffort(v.effort) ?? "",
       lastMs: v.lastActivityMs,
       dir: v.cwdLabel ?? "",
+      project: projects && v.project ? v.project : "",
+      projectIdx: projects && v.project ? projects.names.indexOf(v.project) : -1,
       cpu: res ? Math.round(res.cpu) : null,
       rssMb: res ? res.rssMb : null,
       cpuHog: !!res && res.cpu >= cpuHogThreshold,
@@ -4806,6 +4867,7 @@ function buildSessionsPayload(
     filter,
     providerCounts,
     providerFilter,
+    projects,
     health,
     emptyMessage,
   };

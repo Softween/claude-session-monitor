@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.41.1",
+  "version": "2.42.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -426,6 +426,19 @@
           "type": "number",
           "default": 3000,
           "description": "CPU/RAM sampling interval (ms)."
+        },
+        "claudeSessionMonitor.projects": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "Project tags for the Agent Sessions list, in match order. Each session gets the first project whose pattern (case-insensitive substring) matches its cwd, else its title, else the paths and commands of its recent tool calls, else its last prompt; a filter strip appears above the list. List a more specific project first when its pattern contains another's. Example: `[{\"name\": \"getfund\", \"patterns\": [\"getfund\", \"glossgo-fund\"]}, {\"name\": \"glossgo\", \"patterns\": [\"glossgo\"]}]`.",
+          "items": {
+            "type": "object",
+            "required": ["name", "patterns"],
+            "properties": {
+              "name": { "type": "string", "description": "Tag shown on the row and in the filter strip." },
+              "patterns": { "type": "array", "items": { "type": "string" }, "description": "Case-insensitive substrings." }
+            }
+          }
         },
         "claudeSessionMonitor.cpuHogThreshold": {
           "type": "number",

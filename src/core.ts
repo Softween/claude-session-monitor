@@ -79,6 +79,7 @@ export interface TxInfo {
   effort?: string; // reasoning effort of the newest real assistant line (top-level `effort`)
   closing?: ClosingStatus; // closing status line of the newest end_turn text
   askPending?: boolean; // the newest tool_use is AskUserQuestion and no tool_result answered it yet
+  toolRefs?: string[]; // paths and commands of the newest tool calls, oldest first (projectOf)
 }
 
 export const BUCKET_ORDER: Record<Bucket, number> = {
@@ -369,6 +370,19 @@ function classifyConvLine(obj: any): {
   return { kind: "user_text", ctype: "user" };
 }
 
+const MAX_TOOL_REFS = 40;
+const MAX_REF_CHARS = 300;
+
+/** The paths and the command a tool call names, for project tagging ("" when it names none). */
+function toolRef(input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const o = input as Record<string, unknown>;
+  return ["file_path", "notebook_path", "path", "cwd", "command"]
+    .map((k) => (typeof o[k] === "string" ? (o[k] as string).slice(0, MAX_REF_CHARS) : ""))
+    .filter(Boolean)
+    .join(" ");
+}
+
 /** The newest tool_use block of a transcript, and whether a tool_result answered it (askPending). */
 interface LastUse {
   id: unknown;
@@ -394,7 +408,12 @@ function foldLines(info: TxInfo, lines: string[], lastUse: LastUse | undefined):
     const type = obj.type;
     const blocks = Array.isArray(obj.message?.content) ? obj.message.content : [];
     if (type === "assistant") {
-      for (const b of blocks) if (b?.type === "tool_use") lastUse = { id: b.id, name: b.name, answered: false };
+      for (const b of blocks) {
+        if (b?.type !== "tool_use") continue;
+        lastUse = { id: b.id, name: b.name, answered: false };
+        const ref = toolRef(b.input);
+        if (ref) info.toolRefs = [...(info.toolRefs ?? []), ref].slice(-MAX_TOOL_REFS);
+      }
     } else if (type === "user" && lastUse && !lastUse.answered) {
       const id = lastUse.id;
       lastUse = { ...lastUse, answered: blocks.some((b: any) => b?.type === "tool_result" && b.tool_use_id === id) };
@@ -828,6 +847,8 @@ function resolve(
     closingTiming,
     model,
     effort,
+    toolRefs: tx?.toolRefs,
+    lastPrompt: cleanTitle(hook?.prompt) || cleanTitle(tx?.lastPrompt),
     matchLabels,
     ...(aiTitle ? { aiTitle: true } : {}),
     ...(tx?.askPending ? { askPending: true } : {}),

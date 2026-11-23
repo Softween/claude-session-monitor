@@ -121,6 +121,22 @@ describe("humanizeAge", () => {
 
 // --- parseTranscriptTail ----------------------------------------------------
 
+describe("toolRefs (project tagging)", () => {
+  it("keeps the paths and commands of tool calls, oldest first", () => {
+    const use = (id: string, sec: number, input: Record<string, unknown>) => ({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", id, name: "Bash", input }] },
+      timestamp: iso(sec),
+    });
+    const tx = writeTranscript("refs.jsonl", [
+      use("a", NOW - 30, { file_path: "/r/glossgo/glossgo-fund/a.ts", content: "ignored body" }),
+      use("b", NOW - 20, { command: "cd /r/external/askdalam && ls" }),
+      use("c", NOW - 10, { questions: [] }),
+    ]);
+    expect(parseTranscriptTail(tx).toolRefs).toEqual(["/r/glossgo/glossgo-fund/a.ts", "cd /r/external/askdalam && ls"]);
+  });
+});
+
 describe("pending AskUserQuestion (askPending) and the notification type (notifType)", () => {
   const ask = (id: string, sec: number, name = "AskUserQuestion") => ({
     type: "assistant",

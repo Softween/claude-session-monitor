@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.42.0
+- **Sessions are tagged and filtered by project.** A new setting, `claudeSessionMonitor.projects`, lists projects with case-insensitive patterns. Each session gets the first project whose pattern matches its cwd, else its title (when it names one project), else the paths and commands of its last 40 tool calls (most hits wins), else its last prompt. The row shows the tag in its project color where the folder name was, and a strip under the provider filter ("All projects · getfund 12 · glossgo 9 · other 6") shows one project at a time. With no rules set, nothing changes.
+
 ## 2.41.1
 - **An offline Mac is said so in Usage Limits.** When claude-switch logged a network failure in the last 15 minutes and no usage reading arrived after it, the block at the top shows a yellow line, "offline: usage API unreachable (last try HH:MM) · last reading N min ago". Before, a Refresh click during an outage changed nothing visible and the stale "N m ago" ages read as a broken button. The line goes away with the first reading after the failure.
 

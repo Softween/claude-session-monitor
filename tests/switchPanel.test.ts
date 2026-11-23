@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { accountBadges, displayNames, excludedEmails, excludedOf, headerChip, headerGauges, installedPanel, mergePanelAccounts, orderCards, panelAge, panelFresh, readPanel, renderSwitchActivity, renderSwitchBlock, switchInstalled, useTargets, worstGauge, type SwitchPanel } from "../src/switchPanel";
+import { accountBadges, displayNames, excludedEmails, excludedOf, headerChip, headerGauges, installedPanel, mergePanelAccounts, orderCards, panelAge, panelFresh, quotaEngineLine, readPanel, readQuotaEngine, renderSwitchActivity, renderSwitchBlock, switchInstalled, useTargets, worstGauge, type SwitchPanel } from "../src/switchPanel";
 
 const NOW = 1_792_200_000_000;
 const sec = NOW / 1000;
@@ -228,5 +228,34 @@ describe("accountBadges", () => {
     expect(accountBadges(full(), "bilal@glossgo.com")).toEqual({ rank: 3 });
     expect(accountBadges(full(), "who@example.com")).toEqual({});
     expect(accountBadges(null, "x")).toEqual({});
+  });
+});
+
+describe("quota engine line", () => {
+  it("shows the level, the measured headroom and the effect", () => {
+    const h = renderSwitchBlock(full(), NOW, undefined, { level: 0, at: sec - 300, m: 1.26 });
+    expect(h).toContain(">quota · normal (0) · pool carries 1.26x today&#39;s pace · effort as set</div>");
+    expect(h).toContain('data-testid="csm-quota-engine"');
+    expect(quotaEngineLine({ level: 2, at: sec, m: 2.4 }, NOW)).toContain("plenty (+2) · pool carries 2.40x today&#39;s pace · effort +1, Fable on");
+    expect(quotaEngineLine({ level: 2, at: sec, m: 2.4 }, NOW)).toContain("sw-q-up");
+    const tight = quotaEngineLine({ level: -1, at: sec, m: 0.8 }, NOW);
+    expect(tight).toContain("tight (-1) · today&#39;s pace would stop us · main model Opus");
+    expect(tight).toContain("sw-q-tight");
+    expect(quotaEngineLine({ level: 1, at: sec, m: null }, NOW)).toContain("spare (+1) · pace not measured yet · effort +1");
+  });
+  it("hides when missing or over an hour old", () => {
+    expect(quotaEngineLine(null, NOW)).toBe("");
+    expect(quotaEngineLine({ level: 1, at: sec - 3601, m: 1.6 }, NOW)).toBe("");
+    expect(renderSwitchBlock(full(), NOW)).not.toContain("quota");
+  });
+  it("reads the engine file, null when missing or malformed", () => {
+    const d = mkdtempSync(join(tmpdir(), "qe-"));
+    writeFileSync(join(d, "ok.json"), JSON.stringify({ level: 1, at: sec, m: 1.6, why: "x" }));
+    writeFileSync(join(d, "bad.json"), "{nope");
+    writeFileSync(join(d, "nolevel.json"), JSON.stringify({ at: sec }));
+    expect(readQuotaEngine(join(d, "ok.json"))?.m).toBe(1.6);
+    expect(readQuotaEngine(join(d, "bad.json"))).toBeNull();
+    expect(readQuotaEngine(join(d, "nolevel.json"))).toBeNull();
+    expect(readQuotaEngine(join(d, "missing.json"))).toBeNull();
   });
 });

@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.43.0
+- **Usage Limits shows the quota engine's level.** Under the claude-switch lines a new line reads `~/.claude/state/quota-engine/state.json` (written by `~/.claude/bin/quota_engine.py` every 15 minutes): the level (tight -1, normal 0, spare +1, plenty +2), how many times today's pace the account pool carries for 7 days without a stop, and what the level does (main model Opus, effort as set, effort +1, effort +1 with Fable on). Spare and plenty read green, tight orange; the line hides when the file is missing or over an hour old, the same age the engine's consumers accept.
+
 ## 2.42.0
 - **Sessions are tagged and filtered by project.** A new setting, `claudeSessionMonitor.projects`, lists projects with case-insensitive patterns. Each session gets the first project whose pattern matches its cwd, else its title (when it names one project), else the paths and commands of its last 40 tool calls (most hits wins), else its last prompt. The row shows the tag in its project color where the folder name was, and a strip under the provider filter ("All projects · getfund 12 · glossgo 9 · other 6") shows one project at a time. With no rules set, nothing changes.
 

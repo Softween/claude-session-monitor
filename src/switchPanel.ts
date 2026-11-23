@@ -12,6 +12,9 @@ export const SWITCH_CLI = path.join(os.homedir(), ".claude", "bin", "claude-swit
 export const SWITCH_STATE_DIR = path.join(os.homedir(), ".claude", "state", "claude-switch");
 export const SWITCH_PANEL_FILE = path.join(SWITCH_STATE_DIR, "panel.json");
 export const PANEL_STALE_SEC = 600;
+/** ~/.claude/bin/quota_engine.py's decision (model-router runs it every 15 min); its consumers ignore it after an hour. */
+export const QUOTA_ENGINE_FILE = path.join(os.homedir(), ".claude", "state", "quota-engine", "state.json");
+export const QUOTA_ENGINE_STALE_SEC = 3600;
 const MAX_EVENTS = 8;
 
 /** True when the claude-switch CLI is installed (the one detection point for every claude-switch surface). */
@@ -50,6 +53,35 @@ export function readPanel(file: string = SWITCH_PANEL_FILE): SwitchPanel | null 
   } catch {
     return null;
   }
+}
+
+/** The quota engine's level: -1 tight, 0 normal, 1 spare, 2 plenty; m = how many times today's pace the pool carries for
+ * 7 days without a stop. Null when missing or unparsable. */
+export interface QuotaEngine { level: number; at: number; m?: number | null; demand?: number }
+export function readQuotaEngine(file: string = QUOTA_ENGINE_FILE): QuotaEngine | null {
+  try {
+    const q = JSON.parse(fs.readFileSync(file, "utf8")) as QuotaEngine;
+    return q && typeof q.level === "number" && typeof q.at === "number" ? q : null;
+  } catch {
+    return null;
+  }
+}
+
+const QUOTA_LEVELS: Record<number, [string, string, string]> = {
+  [-1]: ["tight", "today's pace would stop us", "main model Opus"],
+  0: ["normal", "", "effort as set"],
+  1: ["spare", "", "effort +1"],
+  2: ["plenty", "", "effort +1, Fable on"],
+};
+
+/** The quota engine line under the claude-switch status; empty while the engine's file is missing or over an hour old. */
+export function quotaEngineLine(q: QuotaEngine | null, nowMs: number): string {
+  if (!q || nowMs / 1000 - q.at > QUOTA_ENGINE_STALE_SEC) return "";
+  const [name, why, effect] = QUOTA_LEVELS[q.level] ?? QUOTA_LEVELS[0];
+  const fits = typeof q.m === "number" ? `pool carries ${q.m.toFixed(2)}x today's pace` : "pace not measured yet";
+  const text = ["quota", `${name} (${q.level > 0 ? "+" : ""}${q.level})`, why || fits, effect].join(" · ");
+  const tone = q.level < 0 ? " sw-q-tight" : q.level > 0 ? " sw-q-up" : "";
+  return `<div class="swline sw-hint${tone}" data-testid="csm-quota-engine">${esc(text)}</div>`;
 }
 
 /** The panel only while the CLI is installed: a leftover panel.json alone never counts. */
@@ -104,7 +136,7 @@ const MUTED_KINDS = new Set(["offline", "ratelimit"]);
 
 /** HTML for the claude-switch status lines at the top of the Usage Limits view (empty-state line when missing or stale).
  * lastReadSec: newest usage reading the extension holds (epoch seconds); a reading after the last network failure hides the offline line. */
-export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number, lastReadSec?: number): string {
+export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number, lastReadSec?: number, quota: QuotaEngine | null = null): string {
   const age = panel ? panelAge(panel, nowMs) : null;
   if (!panel || age === null || age > PANEL_STALE_SEC) {
     const why = panel && age !== null ? `${ageText(age)} old` : "file missing";
@@ -115,7 +147,7 @@ export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number, last
   let h = `<div class="swblock" data-testid="csm-switch-block"><div class="swline">${esc(parts.join(" · "))}</div>`;
   h += offlineLine(panel, nowMs, lastReadSec);
   if (panel.nextHint) h += `<div class="swline sw-hint">next: ${esc(panel.nextHint)}</div>`;
-  return h + "</div>";
+  return h + quotaEngineLine(quota, nowMs) + "</div>";
 }
 
 /** The Activity tab: claude-switch's latest meaningful events, newest first; null while the panel is missing or stale. */

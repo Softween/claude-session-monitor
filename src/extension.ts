@@ -17,7 +17,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, excludedEmails, excludedOf, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, renderSwitchActivity, headerGauges, switchInstalled, useTargets, type CardHeader } from "./switchPanel";
+import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, readQuotaEngine, displayNames, excludedEmails, excludedOf, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, renderSwitchActivity, headerGauges, switchInstalled, useTargets, type CardHeader } from "./switchPanel";
 import { gaugeColumn } from "./compact";
 import { calibrate } from "./burn";
 import { BURN_WINDOWS, DEFAULT_BURN_WINDOW_MS, buildBurnPayload, burnShares, gaugeSamplesFromHistory, resolveScale, type BurnPayload } from "./burnPayload";
@@ -1086,6 +1086,8 @@ function limitsHtml(): string {
   .swblock { padding:0 0 4px; margin-bottom:0; border-bottom:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
   .swline { font-size:11px; line-height:1.3; overflow-wrap:anywhere; }
   .swline.sw-hint, .swline.sw-info { color: var(--vscode-descriptionForeground); }
+  .swline.sw-q-up { color: var(--vscode-charts-green); }
+  .swline.sw-q-tight { color: var(--vscode-charts-orange); }
   .swline.sw-offline { color: var(--vscode-charts-yellow, #e6b800); }
   .swline.sw-error, .swline.sw-needsLogin { color: var(--vscode-descriptionForeground); }
   .swrank { color: var(--vscode-descriptionForeground); font-size:11px; }
@@ -3275,7 +3277,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       limitsView.update({
         ...payload,
         providers,
-        switchHtml: installed ? renderSwitchBlock(panel, Date.now(), newestReadingSec()) : undefined,
+        switchHtml: installed ? renderSwitchBlock(panel, Date.now(), newestReadingSec(), readQuotaEngine()) : undefined,
         switchActivity: renderSwitchActivity(panel, Date.now()) ?? undefined, // panel is null without claude-switch
         switchBadges: allBadges(panel),
         panelFresh: fresh,

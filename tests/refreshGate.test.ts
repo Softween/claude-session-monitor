@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { codexSignature, monitorEventMatters, projectsEventMatters, throttle } from "../src/refreshGate";
+import { codexSignature, monitorEventMatters, projectsEventMatters, singleFlight, throttle } from "../src/refreshGate";
 import type { CodexProviderSnapshot } from "../src/providers/codex";
 
 const UUID = "e7ec778d-bd90-48a0-8fad-0dbd854ddb1e";
@@ -162,5 +162,40 @@ describe("codexSignature", () => {
     expect(codexSignature(snap({ usage: usage(41) }))).not.toBe(base);
     expect(codexSignature(snap({ usage: null }))).not.toBe(base);
     expect(codexSignature(snap({ health: { provider: "codex", state: "degraded", message: "Codex CLI not found.", updatedAt: 100 } }))).not.toBe(base);
+  });
+});
+
+describe("singleFlight", () => {
+  it("a call while a run is in flight gets that run; the next call after it starts a new one", async () => {
+    let runs = 0;
+    let finish = (): void => undefined;
+    const run = singleFlight(
+      () => {
+        runs++;
+        return new Promise<void>((resolve) => (finish = resolve));
+      },
+      () => undefined,
+    );
+    const first = run();
+    expect(run()).toBe(first);
+    expect(runs).toBe(1);
+    finish();
+    await first;
+    const next = run();
+    expect(next).not.toBe(first);
+    expect(runs).toBe(2);
+    finish();
+    await next;
+  });
+
+  it("a run that throws goes to onError and the promise resolves", async () => {
+    const errors: unknown[] = [];
+    const run = singleFlight(async () => {
+      throw new Error("refresh broke");
+    }, (e) => errors.push(e));
+    await expect(run()).resolves.toBeUndefined();
+    expect(errors).toEqual([new Error("refresh broke")]);
+    await expect(run()).resolves.toBeUndefined(); // the failed run does not stay in flight
+    expect(errors).toHaveLength(2);
   });
 });

@@ -514,7 +514,7 @@ describe("readCodexHookStatuses", () => {
     fs.writeFileSync(path.join(dir, `${name}.json`), JSON.stringify(value));
   }
 
-  it("accepts native/providerless Codex records and only Codex records from the legacy directory", () => {
+  it("accepts native/providerless Codex records and only Codex records from the legacy directory", async () => {
     write(codexDir, "native", hook("native", "working", { ts: 10 }));
     write(codexDir, "providerless", {
       session_id: "providerless",
@@ -559,7 +559,7 @@ describe("readCodexHookStatuses", () => {
       true,
     );
 
-    const claudeStatuses = readHookStatuses(legacyDir);
+    const claudeStatuses = await readHookStatuses(legacyDir);
     expect([...claudeStatuses.keys()]).toEqual(["claude"]);
     expect(claudeStatuses.get("claude")?.provider).toBe("claude");
   });

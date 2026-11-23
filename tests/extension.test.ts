@@ -92,6 +92,12 @@ vi.mock("fs", async (orig) => {
     if (typeof (real as any)[name] === "function") writers[name] = recorded(name, (real as any)[name]);
     if (typeof (real.promises as any)[name] === "function") promises[name] = recorded(`promises.${name}`, (real.promises as any)[name].bind(real.promises));
   }
+  // Reads through fs.promises settle in a microtask (the sync call underneath), so a test that
+  // awaits a refresh, or advances fake timers asynchronously, sees the refresh finish.
+  for (const name of ["readdir", "stat", "readFile"]) {
+    const sync = (real as any)[`${name}Sync`];
+    promises[name] = async (...args: any[]) => sync(...args);
+  }
   promises.open = (p: any, flags?: any, ...rest: any[]) => {
     if (writing(flags)) note("promises.open", [p]);
     return real.promises.open(p, flags, ...rest);
@@ -1060,6 +1066,17 @@ describe("refreshes wake only for files that matter and start at least 1 s apart
     const gaps = starts.slice(1).map((t, i) => t - starts[i]);
     expect(starts.length).toBeGreaterThan(4);
     expect(Math.min(...gaps)).toBeGreaterThanOrEqual(1000);
+  });
+
+  it("refresh requests made while one runs share it", async () => {
+    const cont = vi.spyOn(ContinuityServer.prototype, "observe"); // one call per refresh
+    lastCtx = mkCtx();
+    ext.activate(lastCtx);
+    const refresh = rec.commands.get("claudeSessionMonitor.refresh")!;
+    await refresh(); // the first refresh, started by activate()
+    const base = cont.mock.calls.length;
+    await Promise.all([refresh(), refresh(), refresh()]);
+    expect(cont.mock.calls.length).toBe(base + 1);
   });
 
   it("a Codex poll refreshes only when its data changed", async () => {

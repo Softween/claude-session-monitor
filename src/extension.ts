@@ -459,7 +459,7 @@ function projectStrip(p){
   return '<div class="top projrow" role="toolbar" aria-label="Session project filter" data-testid="csm-project-filter">'
     + chip('all','All projects',-1,total)
     + p.names.map((n,i)=>chip(n,n,i,p.counts[n]||0)).join('')
-    + (p.counts.other?chip('other','other',-1,p.counts.other):'')
+    + chip('other','other',-1,p.counts.other||0)
     + '</div>';
 }
 function metaLine(r){

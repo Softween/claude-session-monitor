@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.43.2
+- **The project strip always shows `other`.** The chip for sessions no project pattern matches appeared only while at least one such session existed, so with every open session tagged it was missing while a named project with no sessions still showed `0`. It now shows with its count, `0` included, like the named projects.
+
 ## 2.43.1
 - **A click opens a session that runs behind a process wrapper.** With `claudeCode.claudeProcessWrapper` set (for example `prompt-split`), each tab's `claude` process is a child of the wrapper, not of the extension host, so no session counted as this window's own: a click fell back to the tab label, and a session without an AI title (its row reads "session 1a2b3c4d") ended in "has no open tab or terminal in this window" although its tab was open. Tab waking after a restart missed the same sessions. A session now counts as this window's when the extension host is its parent or sits at most three wrapper processes above it.
 

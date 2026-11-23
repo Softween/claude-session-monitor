@@ -33,9 +33,10 @@ import { stageGuard } from "./safeStage";
 import { DebugLog } from "./debugLog";
 import { readIfThere, saveErrors } from "./errorRegistry";
 import { SUMMARY_EVERY_SEC, SessionDrops, liveKeys, sessionSummary } from "./sessionLog";
-import { DurationRing, HEALTH_EVERY_MS, removeHealth, timed, writeHealth, type HealthDeps } from "./health";
+import { BusyClock, DurationRing, HEALTH_EVERY_MS, removeHealth, writeHealth, type HealthDeps } from "./health";
 import { OverseerBeat, nodeBeatDeps, overseerBin } from "./overseerBeat";
-import { REFRESH_GAP_MS, codexSignature, monitorEventMatters, projectsEventMatters, throttle } from "./refreshGate";
+import { REFRESH_GAP_MS, codexSignature, monitorEventMatters, projectsEventMatters, singleFlight, throttle } from "./refreshGate";
+import { SessionCollector } from "./sessionCollector";
 import { sendToSession } from "./peerSend";
 import { activeName, alreadyActive, markActive, newerUsage, panelActive, pickActive, snapshotAccount, usageForActive, useOutcome, useStartMs, USE_STUCK_MS, type ActiveCandidate } from "./activeAccount";
 import { SwitchRunner, busyText, exitText, lastLine, spawnFailureText } from "./switchRunner";
@@ -112,7 +113,6 @@ import {
   type PendingCapture,
 } from "./capture";
 import {
-  collectSessions,
   countBuckets,
   findRecentTranscripts,
   cleanupMonitorFiles,
@@ -140,7 +140,6 @@ import {
   type AccountsFile,
   type SessionView,
   type RecentTranscript,
-  type TxInfo,
   type TokenUsage,
   pidAlive,
 } from "./core";
@@ -1997,7 +1996,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   statusBar.show();
   ctx.subscriptions.push(statusBar);
 
-  const txCache = new Map<string, TxInfo>();
+  const collector = new SessionCollector();
   const lastSeen = new Map<string, GroupKey>();
   const stuckNotified = new Set<string>();
   let recentCache: RecentTranscript[] = [];
@@ -2013,7 +2012,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastSessLog = 0;
   const sessionDrops = new SessionDrops(); // one log line when 5+ live sessions are gone within 60 s
   let lastRefreshMs = 0; // start of the last refresh from any path; timer, watcher and Codex poll refreshes wait REFRESH_GAP_MS after it
-  const refreshMs = new DurationRing(); // the recent refresh durations, for the health file's p95
+  const refreshMs = new DurationRing(); // the main-thread time of the recent refreshes, for the health file's p95
+  const refresh = singleFlight(timedRefresh, (e) => stages.fail("refresh", e)); // a request while one runs shares it
   let tokenUsage: TokenUsage | null = null;
   let officialUsage: OfficialUsage | null = null;
   let officialUsageAcct: string | null = null; // account officialUsage was fetched for (the active card only shows its own)
@@ -3196,12 +3196,17 @@ export function activate(ctx: vscode.ExtensionContext): void {
     );
   }
 
-  /** Every refresh is timed: the health file reports the 95th percentile of the recent ones (health.ts). */
-  function refresh(): void {
-    timed(refreshMs, refreshOnce);
+  /** Every refresh is timed: the health file reports the 95th percentile of their main-thread time (health.ts). */
+  async function timedRefresh(): Promise<void> {
+    const clock = new BusyClock();
+    try {
+      await refreshOnce(clock);
+    } finally {
+      refreshMs.add(clock.total());
+    }
   }
 
-  function refreshOnce(): void {
+  async function refreshOnce(clock: BusyClock): Promise<void> {
     if (disposed) return;
     lastRefreshMs = Date.now();
     const now = Date.now() / 1000;
@@ -3215,7 +3220,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     const maxAgeHours = c.get<number>("recentScanMaxAgeHours", 6);
     if (claudeEnabled() && now - lastRecentScan > 25) {
       try {
-        recentCache = findRecentTranscripts(maxAgeHours * 3600 * 1000, 120, now);
+        recentCache = await clock.wait(findRecentTranscripts(maxAgeHours * 3600 * 1000, 120, now));
       } catch {
         /* ignore */
       }
@@ -3236,7 +3241,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (claudeEnabled() && now - lastTokenScan > 60) {
       lastTokenScan = now;
       try {
-        const tx7 = findRecentTranscripts(7 * 86400 * 1000, 400, now);
+        const tx7 = await clock.wait(findRecentTranscripts(7 * 86400 * 1000, 400, now));
         tokenUsage = scanTokenUsage(tx7, now, { persist: allowed("sharedFiles") }); // observer mode reads the shared token-count cache, never writes it
       } catch {
         /* ignore */
@@ -3287,10 +3292,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
     let collected = true;
     if (claudeEnabled()) {
       try {
-        claudeViews = collectSessions({
+        claudeViews = await collector.collect({
           now,
           extraTranscripts: recentCache,
-          txCache,
           allowedEntrypoints: DEFAULT_ENTRYPOINTS,
           maxAgeSec: maxAgeHours * 3600,
           hideEndedOlderThanSec: c.get<number>("hideEndedAfterMinutes", 30) * 60,
@@ -3299,12 +3303,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
           closingMarkers: c.get<boolean>("closingStatusMarkers", false),
           resumePids: resumeTerminals.livePids(),
           onError: (sid, e) => stages.fail(`collect ${sid}`, e),
-        });
+        }, clock);
       } catch (e) {
         claudeViews = [];
         collected = false;
         stages.fail("collect", e);
       }
+      if (disposed) return;
     }
 
     let allViews = mergeProviderSessions(
@@ -3751,7 +3756,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       // their provider-scoped identities before deleting the lifecycle files,
       // otherwise transcript/app-server fallback can resurrect them as unknown
       // immediately (or after a VS Code reload).
-      for (const [sessionId, status] of readHookStatuses()) {
+      for (const [sessionId, status] of await readHookStatuses()) {
         if (status.state === "ended") {
           dismissed.set(sessionKey("claude", sessionId), dismissedAt);
         }
@@ -3774,7 +3779,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const removed =
         cleanupEndedMonitorFiles(now) + cleanupEndedMonitorFiles(now, 12 * 3600 * 1000, CODEX_MONITOR_DIR);
       vscode.window.showInformationMessage(`Agent Sessions: cleared ${removed} ended status file(s).`);
-      txCache.clear();
+      collector.forget();
       refresh();
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.removeSession", async (arg?: SessionView) => {
@@ -4453,8 +4458,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
     ctx.subscriptions.push(vscode.commands.registerCommand(command, () => observer.actionAllowed(feature)));
   }
 
-  stages.safe("first refresh", refresh);
-
   // Now, every 30 s and at dispose: new occurrences of the errors the stage guard caught go to errors.json
   // (errorRegistry.ts), this window's health file is rewritten (health.ts), and one window sends the
   // overseer heartbeat for all of them (overseerBeat.ts; only where overseer is installed).
@@ -4493,7 +4496,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     stages.safe("health", () => writeHealth(health));
     void overseer.tick().catch((e: unknown) => stages.fail("overseer", e));
   };
-  observe();
+  // The first write waits for the first refresh, so the health file and errors.json carry what it found.
+  void stages.safe("first refresh", refresh)?.then(() => {
+    if (!disposed) observe();
+  });
   const observeTimer = setInterval(observe, HEALTH_EVERY_MS);
   ctx.subscriptions.push({
     dispose: () => {

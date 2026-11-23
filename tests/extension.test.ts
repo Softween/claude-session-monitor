@@ -462,7 +462,7 @@ describe("extension activate()", () => {
     expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ groups: [] });
   });
 
-  it("silently seeds a working session that was already stale at startup", () => {
+  it("silently seeds a working session that was already stale at startup", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-28T00:00:00Z"));
     const monitorDir = `${HOME}/.claude/session-monitor`;
@@ -481,7 +481,7 @@ describe("extension activate()", () => {
 
     lastCtx = mkCtx();
     ext.activate(lastCtx);
-    vi.advanceTimersByTime(5000);
+    await vi.advanceTimersByTimeAsync(5000);
 
     expect(
       rec.warningMessages.some((args) => String(args[0]).includes("Possibly stuck")),
@@ -742,7 +742,7 @@ describe("extension activate()", () => {
     expect(rec.spawns).toHaveLength(2);
   });
 
-  it("cancels a scheduled auto-resume when Claude is disabled", () => {
+  it("cancels a scheduled auto-resume when Claude is disabled", async () => {
     vi.useFakeTimers();
     const now = new Date("2030-01-01T00:00:00.000Z");
     vi.setSystemTime(now);
@@ -767,13 +767,14 @@ describe("extension activate()", () => {
     lastCtx = mkCtx();
 
     ext.activate(lastCtx);
+    await rec.commands.get("claudeSessionMonitor.refresh")!(); // the first refresh, started by activate()
     expect(fs.readFileSync(`${monitorDir}/csm-debug.log`, "utf8")).toContain(
       "auto-resume scheduled",
     );
 
     rec.config.set("enableClaude", false);
     fireConfigurationChange("claudeSessionMonitor.enableClaude");
-    vi.advanceTimersByTime(120_000);
+    await vi.advanceTimersByTimeAsync(120_000);
 
     expect(
       rec.executeCalls.filter(
@@ -893,7 +894,7 @@ describe("a failing refresh stage or feature start does not stop the others", ()
   // Activates with a workspace state (so the limits payload is built) and resolves both views;
   // setting broken.sessions / broken.limits makes that view's postMessage throw. A view is sent
   // a payload only when it changed: change() gives the next refresh a new one for each view.
-  function activateWithViews() {
+  async function activateWithViews() {
     const ctx = mkCtx();
     const workspace = new Map<string, unknown>();
     ctx.workspaceState = { get: (k: string, def?: unknown) => (workspace.has(k) ? workspace.get(k) : def), update: () => Promise.resolve() };
@@ -924,90 +925,90 @@ describe("a failing refresh stage or feature start does not stop the others", ()
       workspace.set("csm.expandedAccounts", { [`card-${changes}`]: true }); // the limits payload carries it back (ui)
       fs.writeFileSync(`${MON}/${SID}.json`, JSON.stringify({ ...hook, prompt: `prompt ${changes}` })); // the session row's title
     };
+    await rec.commands.get("claudeSessionMonitor.refresh")!(); // the first refresh, started by activate(), reaches both views
     return { sessions, limits, broken, webviews, change };
   }
 
-  it("a throwing continuity stage still lets the sessions payload, the tab waker and the sampler run, and is logged once", () => {
+  it("a throwing continuity stage still lets the sessions payload, the tab waker and the sampler run, and is logged once", async () => {
     vi.spyOn(ContinuityServer.prototype, "observe").mockImplementation(() => {
       throw new Error("continuity broke");
     });
     const wake = vi.spyOn(TabWaker.prototype, "observe");
-    const { sessions } = activateWithViews(); // the first refresh runs inside activate()
+    const { sessions } = await activateWithViews();
     expect(rowIds(sessions[sessions.length - 1])).toContain(`claude:${SID}`);
     expect(wake).toHaveBeenCalledTimes(1);
     expect(samples).toBe(1);
-    refresh();
+    await refresh();
     expect(wake).toHaveBeenCalledTimes(2);
     expect(logged("continuity broke")).toBe(1);
   });
 
-  it("a throwing limits payload is logged once while the sessions payload and the later stages still run", () => {
+  it("a throwing limits payload is logged once while the sessions payload and the later stages still run", async () => {
     const cont = vi.spyOn(ContinuityServer.prototype, "observe");
     const wake = vi.spyOn(TabWaker.prototype, "observe");
-    const { sessions, limits, broken, change } = activateWithViews();
+    const { sessions, limits, broken, change } = await activateWithViews();
     expect(limits.length).toBeGreaterThan(0);
     broken.limits = true;
     const before = [sessions.length, cont.mock.calls.length, wake.mock.calls.length];
     change();
-    refresh();
+    await refresh();
     change();
-    refresh();
+    await refresh();
     expect([sessions.length, cont.mock.calls.length, wake.mock.calls.length]).toEqual(before.map((n) => n + 2));
     expect(logged("limits view gone")).toBe(1);
   });
 
-  it("a throwing sessions push is logged once while the limits payload and the later stages still run", () => {
+  it("a throwing sessions push is logged once while the limits payload and the later stages still run", async () => {
     const cont = vi.spyOn(ContinuityServer.prototype, "observe");
     const wake = vi.spyOn(TabWaker.prototype, "observe");
-    const { sessions, limits, broken, change } = activateWithViews();
+    const { sessions, limits, broken, change } = await activateWithViews();
     broken.sessions = true;
     const before = [limits.length, cont.mock.calls.length, wake.mock.calls.length];
     change();
-    expect(() => refresh()).not.toThrow();
+    await expect(refresh()).resolves.toBeUndefined();
     change();
-    refresh();
+    await refresh();
     expect([limits.length, cont.mock.calls.length, wake.mock.calls.length]).toEqual(before.map((n) => n + 2));
     expect(logged("sessions view gone")).toBe(1);
     broken.sessions = false; // the view is back: the next refresh delivers the payload it could not post
     const shown = sessions.length;
-    refresh();
+    await refresh();
     expect(sessions.length).toBe(shown + 1);
     expect(rowIds(sessions[sessions.length - 1])).toContain(`claude:${SID}`);
   });
 
-  it("a view is sent a payload only when it changed and nothing while hidden; shown again, it gets the latest at once", () => {
+  it("a view is sent a payload only when it changed and nothing while hidden; shown again, it gets the latest at once", async () => {
     vi.useFakeTimers(); // a still clock: the row ages do not move between refreshes
-    const { sessions, limits, webviews, change } = activateWithViews();
+    const { sessions, limits, webviews, change } = await activateWithViews();
     const posts = () => [sessions.length, limits.length];
     expect(posts()).toEqual([1, 1]); // resolving a view posts what the first refresh built
-    refresh();
-    refresh();
+    await refresh();
+    await refresh();
     expect(posts()).toEqual([1, 1]);
     change();
-    refresh();
+    await refresh();
     expect(posts()).toEqual([2, 2]);
     setVisible(webviews.sessions, false);
     change();
-    refresh();
+    await refresh();
     expect(posts()).toEqual([2, 3]); // the hidden view was sent nothing
     setVisible(webviews.sessions, true);
     expect(posts()).toEqual([3, 3]); // shown again: the latest payload, without waiting for a refresh
     expect(sessions[2].groups.flatMap((g: any) => g.rows.map((r: any) => r.title))).toContain("prompt 2");
   });
 
-  it("a feature that throws at activation leaves the others registered and the first refresh running", () => {
+  it("a feature that throws at activation leaves the others registered and the first refresh running", async () => {
     vi.spyOn(TabWaker.prototype, "start").mockImplementation(() => {
       throw new Error("waker start broke");
     });
     const cont = vi.spyOn(ContinuityServer.prototype, "observe");
-    let views: ReturnType<typeof activateWithViews> | undefined;
-    expect(() => {
-      views = activateWithViews();
-    }).not.toThrow();
+    const pending = activateWithViews();
+    await expect(pending).resolves.toBeDefined();
+    const views = await pending;
     expect(rec.commands.has("claudeSessionMonitor.remoteStatus")).toBe(true); // the remote bridge, started before
     expect(cont).toHaveBeenCalledTimes(1); // the continuity server, started after, observed by the first refresh
     expect(rec.commands.has("claudeSessionMonitor.openRestartGuard")).toBe(true); // the restart guard, started last
-    expect(rowIds(views!.sessions[views!.sessions.length - 1])).toContain(`claude:${SID}`);
+    expect(rowIds(views.sessions[views.sessions.length - 1])).toContain(`claude:${SID}`);
     expect(logged("waker start broke")).toBe(1);
   });
 });
@@ -1023,13 +1024,13 @@ describe("refreshes wake only for files that matter and start at least 1 s apart
     vi.restoreAllMocks();
   });
 
-  it("only a hook record or a top-level transcript wakes a refresh; the log, state and temp files never do", () => {
+  it("only a hook record or a top-level transcript wakes a refresh; the log, state and temp files never do", async () => {
     vi.useFakeTimers();
     rec.config.set("pollIntervalMs", 600_000); // the timer stays out of the way
     const cont = vi.spyOn(ContinuityServer.prototype, "observe"); // one call per refresh
     lastCtx = mkCtx();
     ext.activate(lastCtx);
-    vi.advanceTimersByTime(5_000);
+    await vi.advanceTimersByTimeAsync(5_000);
     const monitor = watcher(`${HOME}/.claude/session-monitor`);
     const projects = watcher(`${HOME}/.claude/projects`);
     const base = cont.mock.calls.length;
@@ -1037,18 +1038,18 @@ describe("refreshes wake only for files that matter and start at least 1 s apart
       monitor.fire("change", name);
     }
     projects.fire("change", `-repo/${UUID}/subagents/agent-a1.jsonl`);
-    vi.advanceTimersByTime(5_000);
+    await vi.advanceTimersByTimeAsync(5_000);
     expect(cont.mock.calls.length).toBe(base);
     monitor.fire("rename", `${UUID}.json`);
-    vi.advanceTimersByTime(300);
+    await vi.advanceTimersByTimeAsync(300);
     expect(cont.mock.calls.length).toBe(base + 1);
-    vi.advanceTimersByTime(2_000);
+    await vi.advanceTimersByTimeAsync(2_000);
     projects.fire("change", `-repo/${UUID}.jsonl`);
-    vi.advanceTimersByTime(300);
+    await vi.advanceTimersByTimeAsync(300);
     expect(cont.mock.calls.length).toBe(base + 2);
   });
 
-  it("timer and watcher refreshes start at least 1 s apart", () => {
+  it("timer and watcher refreshes start at least 1 s apart", async () => {
     vi.useFakeTimers();
     rec.config.set("pollIntervalMs", 500); // the timer asks twice a second
     const starts: number[] = [];
@@ -1059,10 +1060,10 @@ describe("refreshes wake only for files that matter and start at least 1 s apart
     ext.activate(lastCtx);
     const monitor = watcher(`${HOME}/.claude/session-monitor`);
     for (let i = 0; i < 20; i++) {
-      vi.advanceTimersByTime(250);
+      await vi.advanceTimersByTimeAsync(250);
       monitor.fire("rename", `${UUID}.json`); // and a hook record changes every 250 ms
     }
-    vi.advanceTimersByTime(1_000);
+    await vi.advanceTimersByTimeAsync(1_000);
     const gaps = starts.slice(1).map((t, i) => t - starts[i]);
     expect(starts.length).toBeGreaterThan(4);
     expect(Math.min(...gaps)).toBeGreaterThanOrEqual(1000);
@@ -1099,15 +1100,15 @@ describe("refreshes wake only for files that matter and start at least 1 s apart
 });
 
 describe("the token scan", () => {
-  it("runs no earlier than 60 s after activation, when Claude Code has restored its tabs", () => {
+  it("runs no earlier than 60 s after activation, when Claude Code has restored its tabs", async () => {
     vi.useFakeTimers();
     const buckets = `${HOME}/.claude/session-monitor/token-buckets.json`; // written by every scan
     lastCtx = mkCtx();
     ext.activate(lastCtx);
     expect(fs.existsSync(buckets)).toBe(false);
-    vi.advanceTimersByTime(59_000);
+    await vi.advanceTimersByTimeAsync(59_000);
     expect(fs.existsSync(buckets)).toBe(false);
-    vi.advanceTimersByTime(4_000);
+    await vi.advanceTimersByTimeAsync(4_000);
     expect(fs.existsSync(buckets)).toBe(true);
   });
 });
@@ -1407,7 +1408,7 @@ describe("active login and Use this account", () => {
     const texts: string[] = [];
     let text: string = bar.text;
     Object.defineProperty(bar, "text", { get: () => text, set: (v: string) => { text = v; texts.push(v); } });
-    vi.advanceTimersByTime(10_000); // ~6 ticks and 2-3 resource samples (no session pids: the sampler redraws at once)
+    await vi.advanceTimersByTimeAsync(10_000); // ~6 ticks and 2-3 resource samples (no session pids: the sampler redraws at once)
     expect(texts.length).toBeGreaterThan(6);
     for (const t of texts) expect(t).toContain("$(account) b 12%");
   });
@@ -1462,9 +1463,9 @@ describe("active login and Use this account", () => {
     const at = Date.now();
     send({ type: "useAccount", email: "b@x.com", at });
     expect(posted[posted.length - 1].usePending).toBe("b@x.com");
-    vi.advanceTimersByTime(88_000);
+    await vi.advanceTimersByTimeAsync(88_000);
     expect(posted[posted.length - 1].usePending).toBe("b@x.com");
-    vi.advanceTimersByTime(4_000);
+    await vi.advanceTimersByTimeAsync(4_000);
     expect(posted[posted.length - 1].usePending).toBeUndefined();
     expect(posted[posted.length - 1].useResult).toEqual({
       email: "b@x.com",
@@ -1480,7 +1481,7 @@ describe("active login and Use this account", () => {
     expect(sw.calls).toEqual([["use", "b@x.com"]]);
     expect(posted[posted.length - 1].useResult).toEqual({ email: "b@x.com", at: again, ok: false, text: "claude-switch use b@x.com is still running (started 92 s ago)" });
 
-    vi.advanceTimersByTime(150_000); // minutes past any old timeout
+    await vi.advanceTimersByTimeAsync(150_000); // minutes past any old timeout
     expect(sw.children[0].kill).not.toHaveBeenCalled();
     writeLogin(UB, "b@x.com");
     writePanel(UB, "b@x.com");
@@ -1543,9 +1544,9 @@ describe("active login and Use this account", () => {
     await settleAsync();
     const accounts = [{ id: UB, email: "b@x.com", lastSeenTs: 200 }, { id: UA, email: "a@x.com", lastSeenTs: 100 }];
     fs.writeFileSync(`${MON}/accounts.json`, JSON.stringify({ v: 1, activeId: UB, accounts }));
-    vi.advanceTimersByTime(32_000); // the 30 s registry reload moves activeId to B
+    await vi.advanceTimersByTimeAsync(32_000); // the 30 s registry reload moves activeId to B
     await settleAsync();
-    vi.advanceTimersByTime(7_000); // a usage poll reads the untagged snapshot
+    await vi.advanceTimersByTimeAsync(7_000); // a usage poll reads the untagged snapshot
     await settleAsync();
     const last = posted[posted.length - 1];
     expect(card(last, UB).active).toBe(true);
@@ -2527,19 +2528,20 @@ describe("the debug log: activation line, session summary, drop events and error
     expect(logLines().find((l) => l.feature === "activation")).toMatchObject({ win: `empty-${process.pid}`, ver: "0.0.0" });
   });
 
-  it("logs the session count every 5 minutes instead of every 20 s", () => {
+  it("logs the session count every 5 minutes instead of every 20 s", async () => {
     vi.useFakeTimers();
     lastCtx = mkCtx();
     ext.activate(lastCtx);
+    await rec.commands.get("claudeSessionMonitor.refresh")!(); // the first refresh, started by activate()
     const summaries = (): number => logLines().filter((l) => l.msg.startsWith("sessions=")).length;
     expect(summaries()).toBe(1); // the first refresh
-    vi.advanceTimersByTime(4 * 60_000);
+    await vi.advanceTimersByTimeAsync(4 * 60_000);
     expect(summaries()).toBe(1);
-    vi.advanceTimersByTime(61_000);
+    await vi.advanceTimersByTimeAsync(61_000);
     expect(summaries()).toBe(2);
   });
 
-  it("one line when 5 or more live sessions are gone within 60 s", () => {
+  it("one line when 5 or more live sessions are gone within 60 s", async () => {
     const now = Date.now() / 1000;
     const dir = `${HOME}/.claude/projects/-repo`;
     fs.mkdirSync(dir, { recursive: true });
@@ -2555,9 +2557,10 @@ describe("the debug log: activation line, session summary, drop events and error
     lastCtx = mkCtx();
     ext.activate(lastCtx);
     const refresh = rec.commands.get("claudeSessionMonitor.refresh")!;
+    await refresh(); // the first refresh, started by activate(), sees them live
     for (const sid of sids) record(sid, "ended", now);
-    refresh();
-    refresh();
+    await refresh();
+    await refresh();
     const events = logLines().filter((l) => l.msg.includes("live sessions gone within 60 s"));
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ feature: "sessions", lvl: "info" });
@@ -2565,17 +2568,18 @@ describe("the debug log: activation line, session summary, drop events and error
     for (const sid of sids) expect(events[0].msg).toContain(sid.slice(0, 8));
   });
 
-  it("errors.json gets the first stack and the count of a failing stage, saved after the first refresh and at dispose", () => {
+  it("errors.json gets the first stack and the count of a failing stage, saved after the first refresh and at dispose", async () => {
     vi.spyOn(ContinuityServer.prototype, "observe").mockImplementation(() => {
       throw new Error("continuity broke");
     });
     lastCtx = mkCtx();
     ext.activate(lastCtx);
+    await rec.commands.get("claudeSessionMonitor.refresh")!(); // the first refresh; errors.json is saved after it
     const file = `${MON}/health/errors.json`;
     expect(JSON.parse(fs.readFileSync(file, "utf8")).errors["continuity: Error: continuity broke"].count).toBe(1);
     const refresh = rec.commands.get("claudeSessionMonitor.refresh")!;
-    refresh();
-    refresh();
+    await refresh();
+    await refresh();
     disposeCtx(lastCtx);
     lastCtx = undefined;
     const entry = JSON.parse(fs.readFileSync(file, "utf8")).errors["continuity: Error: continuity broke"];
@@ -2600,10 +2604,11 @@ describe("the health file and the overseer heartbeat", () => {
     vi.restoreAllMocks();
   });
 
-  it("writes this window's health file at activation and every 30 s, and removes it at dispose", () => {
+  it("writes this window's health file at activation and every 30 s, and removes it at dispose", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     lastCtx = ctxWithFolder();
     ext.activate(lastCtx);
+    await rec.commands.get("claudeSessionMonitor.refresh")!(); // the first refresh; the first health write waits for it
     const first = JSON.parse(fs.readFileSync(healthPath(), "utf8"));
     expect(first).toEqual({
       v: 1,
@@ -2618,7 +2623,7 @@ describe("the health file and the overseer heartbeat", () => {
     });
     expect(first.refreshSamples).toBeGreaterThanOrEqual(1); // the first refresh, timed
     expect(fs.statSync(healthPath()).mode & 0o777).toBe(0o600);
-    vi.advanceTimersByTime(30_000);
+    await vi.advanceTimersByTimeAsync(30_000);
     const second = JSON.parse(fs.readFileSync(healthPath(), "utf8"));
     expect(second.ts).toBe(first.ts + 30);
     expect(second.refreshSamples).toBeGreaterThan(10); // every refresh in between was timed
@@ -2627,13 +2632,14 @@ describe("the health file and the overseer heartbeat", () => {
     expect(fs.existsSync(healthPath())).toBe(false);
   });
 
-  it("a feature whose refresh stage throws is in error in the health file", () => {
+  it("a feature whose refresh stage throws is in error in the health file", async () => {
     vi.spyOn(ContinuityServer.prototype, "observe").mockImplementation(() => {
       throw new Error("continuity broke");
     });
     rec.config.set("continuityChannel", true);
     lastCtx = ctxWithFolder();
     ext.activate(lastCtx);
+    await rec.commands.get("claudeSessionMonitor.refresh")!(); // the first refresh; the first health write waits for it
     expect(JSON.parse(fs.readFileSync(healthPath(), "utf8")).features).toMatchObject({ continuity: "error", sessions: "ok" });
   });
 

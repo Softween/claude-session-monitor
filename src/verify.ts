@@ -12,6 +12,7 @@ import {
   countBuckets,
   findRecentTranscripts,
   parseTranscriptTail,
+  readHookStatuses,
   humanizeAge,
   DEFAULT_ENTRYPOINTS,
 } from "./core";
@@ -32,34 +33,39 @@ for (const s of [
   console.log(`  ${JSON.stringify(s.slice(0, 56))} -> ${JSON.stringify(classifyLimit(s, 429))}`);
 }
 
-section("2) Recent transcripts (24h) — entrypoint + convKind + limit");
-const recent = findRecentTranscripts(24 * 3600 * 1000, 60, now);
-console.log(`  found ${recent.length} transcripts (24h, observer dirs excluded)`);
-const epCount: Record<string, number> = {};
-for (const rt of recent) {
-  const tx = parseTranscriptTail(rt.path);
-  const ep = tx.entrypoint || "(yok)";
-  epCount[ep] = (epCount[ep] || 0) + 1;
-}
-console.log(`  entrypoint distribution: ${JSON.stringify(epCount)}`);
+async function main(): Promise<void> {
+  section("2) Recent transcripts (24h) — entrypoint + convKind + limit");
+  const recent = await findRecentTranscripts(24 * 3600 * 1000, 60, now);
+  console.log(`  found ${recent.length} transcripts (24h, observer dirs excluded)`);
+  const epCount: Record<string, number> = {};
+  for (const rt of recent) {
+    const tx = parseTranscriptTail(rt.path);
+    const ep = tx.entrypoint || "(yok)";
+    epCount[ep] = (epCount[ep] || 0) + 1;
+  }
+  console.log(`  entrypoint distribution: ${JSON.stringify(epCount)}`);
 
-section("3) collectSessions() — DEFAULT filter (claude-vscode + cli)");
-const views = collectSessions({
-  now,
-  extraTranscripts: recent,
-  maxAgeSec: 24 * 3600,
-  hideEndedOlderThanSec: 24 * 3600,
-  allowedEntrypoints: DEFAULT_ENTRYPOINTS,
-  closingMarkers: process.argv.includes("--closing-markers"),
-});
-console.log(`  buckets: ${JSON.stringify(countBuckets(views))}  (total ${views.length})\n`);
-for (const v of views) {
-  const age = humanizeAge(v.lastActivityMs ? now - v.lastActivityMs / 1000 : 0);
-  const me = [v.model, v.effort].filter(Boolean).join("·") || "-";
-  const mark = v.closing ? ` ${closingEmoji(v.closing.kind)} ${v.closing.text.slice(0, 40)}` : "";
-  console.log(
-    `  [${v.bucket.padEnd(9)}] ${v.sub.padEnd(22)} ${age.padEnd(5)} ${me.padEnd(26)} ${JSON.stringify(v.title.slice(0, 42))} ${v.cwdLabel ?? ""}${mark}`,
-  );
+  section("3) collectSessions() — DEFAULT filter (claude-vscode + cli)");
+  const views = collectSessions({
+    now,
+    hookStatuses: await readHookStatuses(),
+    extraTranscripts: recent,
+    maxAgeSec: 24 * 3600,
+    hideEndedOlderThanSec: 24 * 3600,
+    allowedEntrypoints: DEFAULT_ENTRYPOINTS,
+    closingMarkers: process.argv.includes("--closing-markers"),
+  });
+  console.log(`  buckets: ${JSON.stringify(countBuckets(views))}  (total ${views.length})\n`);
+  for (const v of views) {
+    const age = humanizeAge(v.lastActivityMs ? now - v.lastActivityMs / 1000 : 0);
+    const me = [v.model, v.effort].filter(Boolean).join("·") || "-";
+    const mark = v.closing ? ` ${closingEmoji(v.closing.kind)} ${v.closing.text.slice(0, 40)}` : "";
+    console.log(
+      `  [${v.bucket.padEnd(9)}] ${v.sub.padEnd(22)} ${age.padEnd(5)} ${me.padEnd(26)} ${JSON.stringify(v.title.slice(0, 42))} ${v.cwdLabel ?? ""}${mark}`,
+    );
+  }
+
+  section("DONE");
 }
 
-section("DONE");
+void main();

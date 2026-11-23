@@ -135,6 +135,25 @@ describe("registry", () => {
     expect(ownSessions(live, new Map([[11, 100], [12, 200], [13, 100]]), 100)).toEqual(["tab"]);
   });
 
+  it("counts a tab session behind a claudeProcessWrapper (claude -> wrapper -> host), not one in another window", () => {
+    const live: LiveSession[] = [
+      { sessionId: "wrapped", pid: 21, entrypoint: "claude-vscode" },
+      { sessionId: "wrapped-twice", pid: 22, entrypoint: "claude-vscode" },
+      { sessionId: "other-window", pid: 23, entrypoint: "claude-vscode" },
+      { sessionId: "too-deep", pid: 24, entrypoint: "claude-vscode" },
+      { sessionId: "orphan", pid: 25, entrypoint: "claude-vscode" },
+    ];
+    const parents = new Map([
+      [21, 31], [31, 100], // claude -> prompt-split -> this host
+      [22, 32], [32, 33], [33, 100],
+      [23, 34], [34, 200], [200, 1], // the other window's host
+      [24, 41], [41, 42], [42, 43], [43, 44], [44, 100], // four wrappers: past the bound
+      [100, 1],
+    ]);
+    expect(ownSessions(live, parents, 100)).toEqual(["wrapped", "wrapped-twice"]);
+    expect(ownSessions(live, parents, 200)).toEqual(["other-window"]);
+  });
+
   it("observes at most every 10 s, keeps the row title and writes workspaceState only on change", async () => {
     const h = harness({ titleOf: (sid) => (sid === "s1" ? "Fix the build" : undefined) });
     h.parentPids.mockResolvedValue(new Map([[11, 100]]));

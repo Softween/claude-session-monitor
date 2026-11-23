@@ -139,7 +139,17 @@ function sameShape(a: readonly RegistryEntry[], b: readonly RegistryEntry[]): bo
 
 /** This window's Claude Code tab sessions: claude-vscode processes whose parent is this extension host. */
 export function ownSessions(live: readonly LiveSession[], parents: ReadonlyMap<number, number>, hostPid: number): string[] {
-  return live.filter((s) => s.entrypoint === "claude-vscode" && parents.get(s.pid) === hostPid).map((s) => s.sessionId);
+  return live.filter((s) => s.entrypoint === "claude-vscode" && hostedBy(s.pid, parents, hostPid)).map((s) => s.sessionId);
+}
+
+/** Wrappers (claudeCode.claudeProcessWrapper) that may sit between the extension host and `claude`. */
+const MAX_WRAPPER_DEPTH = 3;
+
+/** `hostPid` is the parent of `pid` or, through at most MAX_WRAPPER_DEPTH wrapper processes, an ancestor of it. */
+function hostedBy(pid: number, parents: ReadonlyMap<number, number>, hostPid: number): boolean {
+  let p = parents.get(pid);
+  for (let i = 0; p !== undefined && i <= MAX_WRAPPER_DEPTH; i++, p = parents.get(p)) if (p === hostPid) return true;
+  return false;
 }
 
 /** Pending at activation: remembered sessions (the last activation's pending, then the registry) that run nowhere. */

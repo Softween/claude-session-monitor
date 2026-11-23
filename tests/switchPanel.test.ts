@@ -71,6 +71,16 @@ describe("renderSwitchBlock", () => {
     expect(renderSwitchActivity(full({ ts: sec - 11 * 60 }), NOW)).toBeNull();
     expect(renderSwitchActivity(full({ events: [] }), NOW)).toEqual({ count: 0, html: '<div class="swevents" data-testid="csm-switch-activity"><div class="swline sw-muted">No claude-switch activity yet</div></div>' });
   });
+  it("offline line: a recent network failure with no reading after it", () => {
+    const off = (last: number) => full({ health: { offline: { count1h: 3, last } } });
+    const h = renderSwitchBlock(off(sec - 60), NOW, sec - 71 * 60);
+    expect(h).toContain('data-testid="csm-switch-offline"');
+    expect(h).toContain(`offline: usage API unreachable (last try ${hhmm(sec - 60)}) · last reading 71 min ago`);
+    expect(renderSwitchBlock(off(sec - 60), NOW)).toContain(`(last try ${hhmm(sec - 60)})</div>`); // no reading yet
+    expect(renderSwitchBlock(off(sec - 60), NOW, sec - 30)).not.toContain("offline"); // read after the failure: back online
+    expect(renderSwitchBlock(off(sec - 16 * 60), NOW, sec - 71 * 60)).not.toContain("offline"); // failure too old
+    expect(renderSwitchBlock(full(), NOW, sec - 71 * 60)).not.toContain("offline"); // no health block (older CLI)
+  });
   it("shows PAUSED and omits the rank when unknown", () => {
     expect(renderSwitchBlock(full({ paused: true }), NOW)).toContain("#2 · PAUSED<");
     expect(renderSwitchBlock(full({ active: { email: "x@y.z" } }), NOW)).toContain("claude-switch · x@y.z · auto<");

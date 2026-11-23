@@ -39,6 +39,7 @@ export interface SwitchPanel {
   nextHint?: string;
   accounts?: PanelAccount[];
   events?: PanelEvent[];
+  health?: { offline?: { count1h?: number; last?: number | null } }; // log-tail counters (last = epoch seconds)
 }
 
 /** Parsed panel, or null when missing, unparsable or not schema v1. */
@@ -69,6 +70,16 @@ const hhmm = (tsSec: number): string => {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 };
 const ageText = (sec: number): string => (sec < 90 ? `${sec}s` : `${Math.round(sec / 60)} min`);
+export const OFFLINE_WINDOW_SEC = 900;
+
+/** The offline line: claude-switch logged a network failure in the last OFFLINE_WINDOW_SEC and no reading arrived after it. */
+export function offlineLine(panel: SwitchPanel, nowMs: number, lastReadSec?: number): string {
+  const last = panel.health?.offline?.last;
+  if (typeof last !== "number" || nowMs / 1000 - last > OFFLINE_WINDOW_SEC) return "";
+  if (typeof lastReadSec === "number" && lastReadSec >= last) return "";
+  const read = typeof lastReadSec === "number" && lastReadSec > 0 ? ` · last reading ${ageText(Math.max(0, Math.round(nowMs / 1000 - lastReadSec)))} ago` : "";
+  return `<div class="swline sw-offline" data-testid="csm-switch-offline">offline: usage API unreachable (last try ${hhmm(last)})${esc(read)}</div>`;
+}
 
 function findAccount(panel: SwitchPanel, email: string): PanelAccount | undefined {
   return panel.accounts?.find((a) => a.email === email);
@@ -91,8 +102,9 @@ export function panelFresh(panel: SwitchPanel | null, nowMs: number): panel is S
 const ACTIVITY_KINDS = new Set(["switch", "restore", "needsLogin", "cleared", "error", "rollback", "paused", "resumed", "offline", "ratelimit"]);
 const MUTED_KINDS = new Set(["offline", "ratelimit"]);
 
-/** HTML for the claude-switch status lines at the top of the Usage Limits view (empty-state line when missing or stale). */
-export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number): string {
+/** HTML for the claude-switch status lines at the top of the Usage Limits view (empty-state line when missing or stale).
+ * lastReadSec: newest usage reading the extension holds (epoch seconds); a reading after the last network failure hides the offline line. */
+export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number, lastReadSec?: number): string {
   const age = panel ? panelAge(panel, nowMs) : null;
   if (!panel || age === null || age > PANEL_STALE_SEC) {
     const why = panel && age !== null ? `${ageText(age)} old` : "file missing";
@@ -101,6 +113,7 @@ export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number): str
   const rank = rankOf(panel, panel.active?.email);
   const parts = [`claude-switch`, panel.active?.email ?? "?", ...(rank !== undefined ? [`#${rank}`] : []), panel.paused ? "PAUSED" : "auto"];
   let h = `<div class="swblock" data-testid="csm-switch-block"><div class="swline">${esc(parts.join(" · "))}</div>`;
+  h += offlineLine(panel, nowMs, lastReadSec);
   if (panel.nextHint) h += `<div class="swline sw-hint">next: ${esc(panel.nextHint)}</div>`;
   return h + "</div>";
 }

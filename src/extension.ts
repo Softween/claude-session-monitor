@@ -1056,6 +1056,7 @@ function limitsHtml(): string {
   .swblock { padding:0 0 4px; margin-bottom:0; border-bottom:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
   .swline { font-size:11px; line-height:1.3; overflow-wrap:anywhere; }
   .swline.sw-hint, .swline.sw-info { color: var(--vscode-descriptionForeground); }
+  .swline.sw-offline { color: var(--vscode-charts-yellow, #e6b800); }
   .swline.sw-error, .swline.sw-needsLogin { color: var(--vscode-descriptionForeground); }
   .swrank { color: var(--vscode-descriptionForeground); font-size:11px; }
   .clogin { color: var(--vscode-charts-red, #f14c4c); font-size:10px; font-weight:600; }
@@ -1687,6 +1688,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
     accountsFile = next;
   }
   const usageByAccount = new Map<string, { usage: OfficialUsage | null; stale: boolean }>();
+  /** Newest usage reading held for any account (epoch seconds), or undefined before the first one. */
+  function newestReadingSec(): number | undefined {
+    let best = officialUsage?.ts ?? 0;
+    for (const { usage } of usageByAccount.values()) if (usage && usage.ts > best) best = usage.ts;
+    return best > 0 ? best : undefined;
+  }
   let othersInflight = false;
   let lastOthersCheck = 0;
 
@@ -3228,7 +3235,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       limitsView.update({
         ...payload,
         providers,
-        switchHtml: installed ? renderSwitchBlock(panel, Date.now()) : undefined,
+        switchHtml: installed ? renderSwitchBlock(panel, Date.now(), newestReadingSec()) : undefined,
         switchActivity: renderSwitchActivity(panel, Date.now()) ?? undefined, // panel is null without claude-switch
         switchBadges: allBadges(panel),
         panelFresh: fresh,

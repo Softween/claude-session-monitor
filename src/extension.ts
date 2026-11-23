@@ -22,6 +22,7 @@ import { gaugeColumn } from "./compact";
 import { calibrate } from "./burn";
 import { BURN_WINDOWS, DEFAULT_BURN_WINDOW_MS, buildBurnPayload, burnShares, gaugeSamplesFromHistory, resolveScale, type BurnPayload } from "./burnPayload";
 import { BurnTracker } from "./burnTracker";
+import { ViewPoster } from "./viewPost";
 import { TYPED_REASON, deliverText, registerRemoteBridge, remoteCwdRoots, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt, type RemoteBridge } from "./remoteBridge";
 import { runTool } from "./remote";
 import { sanitizeRemoteLine } from "./remoteInput";
@@ -319,7 +320,7 @@ interface SessionsPayload {
 
 class SessionsView implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
-  private pending?: SessionsPayload;
+  private readonly poster = new ViewPoster(); // a changed payload only, while the view shows (viewPost.ts)
 
   constructor(private readonly onAction: (action: string, sessionId: string) => void) {}
 
@@ -330,12 +331,11 @@ class SessionsView implements vscode.WebviewViewProvider {
     view.webview.onDidReceiveMessage((m) => {
       if (m && typeof m.type === "string" && typeof m.id === "string") this.onAction(m.type, m.id);
     });
-    if (this.pending) view.webview.postMessage(this.pending);
+    this.poster.attach(view);
   }
 
   update(payload: SessionsPayload): void {
-    this.pending = payload;
-    this.view?.webview.postMessage(payload);
+    this.poster.post(payload);
   }
 
   setBadge(value: number, tooltip: string): void {
@@ -975,9 +975,7 @@ function buildLimitsPayload(
 }
 
 class LimitsView implements vscode.WebviewViewProvider {
-  private view?: vscode.WebviewView;
-  private pending?: LimitsPayload;
-  private pendingBurn?: BurnPayload; // the Burn tab's last ranking, replayed when the view resolves again
+  private readonly poster = new ViewPoster(); // the limits "update" and the Burn tab's "burn", each only when changed and shown (viewPost.ts)
 
   constructor(
     private readonly onRefresh: () => void,
@@ -991,7 +989,6 @@ class LimitsView implements vscode.WebviewViewProvider {
   ) {}
 
   resolveWebviewView(view: vscode.WebviewView): void {
-    this.view = view;
     view.webview.options = { enableScripts: true };
     view.webview.html = limitsHtml();
     view.webview.onDidReceiveMessage((m) => {
@@ -1005,19 +1002,16 @@ class LimitsView implements vscode.WebviewViewProvider {
       else if (m && m.type === "burnWindow" && typeof m.ms === "number" && Number.isFinite(m.ms) && m.ms > 0) this.onBurn("window", String(m.ms));
       else if (m && m.type === "openSession" && typeof m.id === "string" && m.id !== "") this.onBurn("open", m.id);
     });
-    if (this.pending) view.webview.postMessage(this.pending);
-    if (this.pendingBurn) view.webview.postMessage({ ...this.pendingBurn, type: "burn" });
+    this.poster.attach(view);
   }
 
   update(payload: LimitsPayload): void {
-    this.pending = payload;
-    this.view?.webview.postMessage(payload);
+    this.poster.post(payload);
   }
 
   /** The Burn tab's ranking, every few seconds; posted as type "burn" beside the limits "update". */
   updateBurn(payload: BurnPayload): void {
-    this.pendingBurn = payload;
-    this.view?.webview.postMessage({ ...payload, type: "burn" });
+    this.poster.post({ ...payload, type: "burn" });
   }
 }
 

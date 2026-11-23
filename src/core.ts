@@ -953,6 +953,9 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
     if (!candidates.has(rt.sessionId) || !candidates.get(rt.sessionId))
       candidates.set(rt.sessionId, rt.path);
   }
+  // The cache keeps only the transcripts named now: one whose hook record went or that left the recent scan is forgotten.
+  const named = new Set(candidates.values());
+  for (const txPath of txCache.keys()) if (!named.has(txPath)) txCache.delete(txPath);
 
   const views: SessionView[] = [];
   for (const [sid, txPath] of candidates) {

@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.43.1
+- **A click opens a session that runs behind a process wrapper.** With `claudeCode.claudeProcessWrapper` set (for example `prompt-split`), each tab's `claude` process is a child of the wrapper, not of the extension host, so no session counted as this window's own: a click fell back to the tab label, and a session without an AI title (its row reads "session 1a2b3c4d") ended in "has no open tab or terminal in this window" although its tab was open. Tab waking after a restart missed the same sessions. A session now counts as this window's when the extension host is its parent or sits at most three wrapper processes above it.
+
 ## 2.43.0
 - **Usage Limits shows the quota engine's level.** Under the claude-switch lines a new line reads `~/.claude/state/quota-engine/state.json` (written by `~/.claude/bin/quota_engine.py` every 15 minutes): the level (tight -1, normal 0, spare +1, plenty +2), how many times today's pace the account pool carries for 7 days without a stop, and what the level does (main model Opus, effort as set, effort +1, effort +1 with Fable on). Spare and plenty read green, tight orange; the line hides when the file is missing or over an hour old, the same age the engine's consumers accept.
 

@@ -1430,6 +1430,16 @@ describe("account registry", () => {
     expect(readAccountsFile(file).accounts).toEqual([{ id: "ok", email: "x@y.z", lastSeenTs: 2 }]);
   });
 
+  it("upsertActiveAccount keeps a known Team seat tier when the keychain only says team", () => {
+    let f: AccountsFile = { v: 1, accounts: [{ id: "t", email: "t@x.com", lastSeenTs: 1, tier: "team_tier_1" }] };
+    f = upsertActiveAccount(f, { id: "t", email: "t@x.com", tier: "team" }, 2);
+    expect(f.accounts[0].tier).toBe("team_tier_1");
+    f = upsertActiveAccount(f, { id: "t", email: "t@x.com", tier: "default_claude_max_20x" }, 3);
+    expect(f.accounts[0].tier).toBe("default_claude_max_20x");
+    f = upsertActiveAccount({ v: 1, accounts: [] }, { id: "n", email: "n@x.com", tier: "team" }, 4);
+    expect(f.accounts[0].tier).toBe("team");
+  });
+
   it("upsertActiveAccount switches the active id, keeps history, and preserves expiry", () => {
     let f: AccountsFile = { v: 1, accounts: [] };
     f = upsertActiveAccount(f, { id: "a", email: "a@x.com", tokenExpiresAt: 111 }, 1000);

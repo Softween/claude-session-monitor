@@ -202,15 +202,26 @@ export function excludedEmails(panel: SwitchPanel | null): Set<string> {
   return new Set((panel?.accounts ?? []).filter((a) => a.excluded === true).map((a) => a.email.toLowerCase()));
 }
 
-/** Claude cards by claude-switch priority (rank, else priority order); unranked after, Codex last. Stable. */
-export function orderCards<T extends { provider: string; label: string; email?: string }>(cards: T[], panel: SwitchPanel | null): T[] {
+/**
+ * Claude cards by plan price (highest first, when `price` is given), then claude-switch priority
+ * (rank, else priority order); unranked after, Codex last. Stable.
+ */
+export function orderCards<T extends { provider: string; label: string; email?: string }>(
+  cards: T[],
+  panel: SwitchPanel | null,
+  price?: (c: T) => number | null,
+): T[] {
   const email = (c: T): string => c.email ?? c.label.replace(/^(Claude|Codex) · /, "");
   const key = (c: T): number => {
     if (c.provider !== "claude") return Infinity;
     const r = panel ? rankOf(panel, email(c)) : undefined;
     return r ?? 1e6;
   };
-  return cards.map((c, i) => ({ c, i })).sort((x, y) => key(x.c) - key(y.c) || x.i - y.i).map((x) => x.c);
+  const cost = (c: T): number => (c.provider === "claude" && price ? price(c) ?? -1 : -1);
+  return cards
+    .map((c, i) => ({ c, i }))
+    .sort((x, y) => (x.c.provider === "claude" && y.c.provider === "claude" ? cost(y.c) - cost(x.c) : 0) || key(x.c) - key(y.c) || x.i - y.i)
+    .map((x) => x.c);
 }
 
 /** Add every panel account (uuid + email) missing from the registry; no tokens, active login untouched. */

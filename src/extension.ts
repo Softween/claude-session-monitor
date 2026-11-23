@@ -186,6 +186,7 @@ import {
   nextUsageBackoffSec,
   accountPillLabels,
   claudePlanLabel,
+  planPrice,
   claudePlanTier,
   codexPlanLabel,
   filterHistoryForAccount,
@@ -1111,26 +1112,46 @@ function limitsHtml(): string {
   .bmore { padding:3px 0; font-size:11px; color: var(--vscode-descriptionForeground); }
   .bnote { padding:8px 0 10px; font-size:10px; line-height:1.4; color: var(--vscode-descriptionForeground); }
   .bempty { padding:14px 0; color: var(--vscode-descriptionForeground); line-height:1.5; }
-  /* Collapsed card = one 16px line + 4px padding top and bottom + 1px separator = 25px. */
-  .card.ccard { padding:4px 0; }
-  .card.ccard:first-child { padding-top:0; }
+  /* Collapsed card = one table row: 16px line + 1px padding top and bottom + 1px hairline = 19px, so 25-30 logins fit. */
+  .card.ccard { padding:1px 0; border-top:1px solid color-mix(in srgb, var(--vscode-editorWidget-border, rgba(127,127,127,.25)) 55%, transparent); }
+  .card.ccard:first-child, .lhead + .card.ccard { border-top:0; }
+  .card.ccard.act { background: color-mix(in srgb, var(--vscode-charts-green, #4caf50) 9%, transparent); border-radius:3px; }
+  .card.ccard:not(.act) .chrow:hover { background: var(--vscode-list-hoverBackground, rgba(127,127,127,.1)); border-radius:3px; }
   .chdr { display:flex; align-items:center; gap:6px; cursor:pointer; min-width:0; overflow:hidden; height:16px; line-height:16px; user-select:none; }
   .chdr { container-type:inline-size; }
   .chdr .ctitle { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .chdr .chip { flex:none; }
   .chdr .cold { flex:none; font-size:10px; color: var(--vscode-charts-yellow, #cca700); white-space:nowrap; }
-  .chdr .chev { color: var(--vscode-descriptionForeground); font-size:10px; width:10px; flex:none; }
-  .chdr .cgauges { margin-left:auto; flex:none; font-size:11px; white-space:nowrap; }
-  .chdr .cgauges .hot { color: var(--vscode-charts-red, #f14c4c); }
-  .chdr .gs { display:none; }
-  @container (max-width: 360px) { .chdr .gl { display:none; } .chdr .gs { display:inline; } }
+  .chdr .chev, .lhead .chev { color: var(--vscode-descriptionForeground); font-size:10px; width:10px; flex:none; }
+  .ptag, .lhp { flex:none; width:36px; text-align:center; font-family: var(--vscode-editor-font-family, monospace); font-size:10px; font-weight:700; line-height:14px; border-radius:3px; }
+  .ptag.phi { color: var(--vscode-charts-purple, #b180d7); background: color-mix(in srgb, var(--vscode-charts-purple, #b180d7) 20%, transparent); }
+  .ptag.pmid { color: var(--vscode-charts-blue, #3794ff); background: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 18%, transparent); }
+  .ptag.plo { color: var(--vscode-descriptionForeground); background: color-mix(in srgb, var(--vscode-foreground) 10%, transparent); }
+  .ptag.pnone { color: var(--vscode-descriptionForeground); font-weight:400; overflow:hidden; }
+  .chdr .cgauges, .lhg { margin-left:auto; flex:none; display:flex; gap:6px; font-size:11px; white-space:nowrap; }
+  .hg, .gnil, .lhc { width:76px; flex:none; display:flex; align-items:center; justify-content:flex-end; gap:4px; }
+  .hg .gl, .hg .gs { display:none; }
+  .hg.zero { color: var(--vscode-descriptionForeground); }
+  .hg.warn { color: var(--vscode-charts-yellow, #cca700); }
+  .hg.hot { color: var(--vscode-charts-red, #f14c4c); font-weight:600; }
+  .hgb { order:-1; width:34px; height:3px; border-radius:2px; overflow:hidden; background: color-mix(in srgb, var(--vscode-foreground) 12%, transparent); }
+  .hgb b { display:block; height:100%; background: currentColor; opacity:.75; }
+  .hg.zero .hgb b { display:none; }
+  .lhead { display:flex; align-items:center; gap:6px; height:15px; padding-bottom:1px; font-size:10px; color: var(--vscode-descriptionForeground); border-bottom:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); margin-top:4px; }
+  .lhp { font-family: inherit; font-weight:400; }
+  .lhn { flex:1; min-width:0; }
+  .lhg { font-size:10px; }
+  .lhc { justify-content:flex-end; }
+  .lhs, .skipnil { flex:none; width:22px; text-align:center; }
+  .card.ccard.rdy .chip { color: var(--vscode-charts-green, #4caf50); }
+  @media (max-width: 440px) { .hgb { display:none; } .hg, .gnil, .lhc { width:38px; } }
   .chip { font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .chip.login { color: var(--vscode-charts-red, #f14c4c); font-weight:600; }
   /* Skip box: outside the role=button header so it never toggles the card; an excluded header is dimmed. */
   .chrow { display:flex; align-items:center; gap:6px; min-width:0; }
   .chrow .chdr { flex:1; min-width:0; }
   .chdr.excl { opacity:.55; }
-  .skipbox { flex:none; display:flex; align-items:center; gap:3px; font-size:10px; line-height:16px; color: var(--vscode-descriptionForeground); cursor:pointer; user-select:none; }
+  .skipbox { flex:none; width:22px; justify-content:center; display:flex; align-items:center; gap:3px; font-size:10px; line-height:16px; color: var(--vscode-descriptionForeground); cursor:pointer; user-select:none; }
   .skipbox input { margin:0; width:11px; height:11px; cursor:pointer; accent-color: var(--vscode-checkbox-background, auto); }
   body.vscode-dark .skipbox input { color-scheme: dark; }
   .cbody { margin-top:4px; padding-bottom:4px; }
@@ -1307,19 +1328,50 @@ function skipBox(card, email){
   if(card.provider!=='claude' || typeof h.excluded!=='boolean') return '';
   const p = pendingSkip[email], on = p ? p.value : h.excluded;
   return '<label class="skipbox" title="Skip: claude-switch never switches to this account. Untick to use it again.">'
-    + '<input type="checkbox" data-skip="'+esc(email)+'" aria-label="Skip '+esc(email)+' in claude-switch" data-testid="csm-account-skip"'+(on?' checked':'')+'> skip</label>';
+    + '<input type="checkbox" data-skip="'+esc(email)+'" aria-label="Skip '+esc(email)+' in claude-switch" data-testid="csm-account-skip"'+(on?' checked':'')+'></label>';
 }
-// Simplified card: ONE always-visible header line, gauge rows only when expanded.
+// Plan price tag: "$200" with the full plan in its title; tiers colour by price so the costly logins stand out.
+function planTag(card){
+  const m = /\$\s*(\d+)/.exec(card.plan||'');
+  if(!m) return '<span class="ptag pnone" title="'+esc(card.plan||'plan unknown')+'">'+(card.plan?esc(card.plan.slice(0,5)):'–')+'</span>';
+  const n = Number(m[1]);
+  return '<span class="ptag '+(n>=200?'phi':n>=100?'pmid':'plo')+'" title="'+esc(card.plan)+' / month" data-testid="csm-account-plan">$'+n+'</span>';
+}
+// Gauge columns of the account table: Session, Weekly, then every scoped weekly any card has (Fable, …).
+let gcols = [];
+function gaugeCols(cards){
+  const sc = [];
+  for(const c of cards) for(const g of ((c.hdr && c.hdr.gauges) || [])) if(!/^(Session|Weekly)$/i.test(g.label) && sc.indexOf(g.label)<0) sc.push(g.label);
+  return ['Session','Weekly'].concat(sc);
+}
+function gaugeCell(g, old){
+  if(!g) return '<span class="gnil"></span>';
+  const p = Math.max(0, Math.min(100, Number(g.pct)||0));
+  return '<span class="hg'+(g.hot?' hot':p>=70?' warn':'')+(p<=0?' zero':'')+'"><span class="gl">'+esc(g.label)+'</span><span class="gs">'+esc(g.short)+'</span> '+(old?'~':'')+fmtPct(g.pct)+'%'
+    + '<i class="hgb"><b style="width:'+p+'%"></b></i></span>';
+}
+function gaugeCells(h, old){
+  const gs = h.gauges || [];
+  return gcols.map(l=>gaugeCell(gs.find(g=>g.label.toLowerCase()===l.toLowerCase()), old)).join('');
+}
+// Column header above the account rows (same widths as the row cells).
+function tableHead(){
+  return '<div class="lhead" aria-hidden="true"><span class="chev"></span><span class="lhp">plan</span><span class="lhn">account</span>'
+    + '<span class="lhg">'+gcols.map(l=>'<span class="lhc">'+esc(l)+'</span>').join('')+'</span><span class="lhs">skip</span></div>';
+}
+// Simplified card: ONE always-visible table row, gauge rows only when expanded.
 function collapsibleCard(card){
   const h = card.hdr, open = expandedOf(card), age = readingAge(card), old = readingOld(card, age);
   const email = card.email || card.label.replace(/^(Claude|Codex) · /,'');
-  let out = '<div class="card ccard" data-testid="csm-account-row"><div class="chrow"><div class="chdr'+(h.excluded?' excl':'')+'" role="button" tabindex="0" data-toggle="'+esc(card.id)+'" aria-expanded="'+open+'" title="'+esc(card.label)+'">'
+  const box = skipBox(card, email);
+  let out = '<div class="card ccard'+(card.active?' act':'')+(h.chip==='ready'?' rdy':'')+'" data-testid="csm-account-row"><div class="chrow"><div class="chdr'+(h.excluded?' excl':'')+'" role="button" tabindex="0" data-toggle="'+esc(card.id)+'" aria-expanded="'+open+'" title="'+esc(card.label)+'">'
     + '<span class="chev">'+(open?'▾':'▸')+'</span>'
+    + planTag(card)
     + '<span class="ctitle">'+(h.rank?'<span class="swrank num">#'+h.rank+'</span> ':'')+esc(h.name)+'</span>'
     + chipHtml(h)
     + (old ? '<span class="cold num" title="time since the last successful usage read">'+fmtAge(age)+' ago</span>' : '')
-    + (h.gauges && h.gauges.length ? '<span class="cgauges num" data-testid="csm-account-gauges">'+h.gauges.map(g=>'<span class="hg'+(g.hot?' hot':'')+'"><span class="gl">'+esc(g.label)+'</span><span class="gs">'+esc(g.short)+'</span> '+(old?'~':'')+fmtPct(g.pct)+'%</span>').join(' · ')+'</span>' : '')
-    + '</div>' + skipBox(card, email) + '</div>';
+    + '<span class="cgauges num" data-testid="csm-account-gauges">'+gaugeCells(h, old)+'</span>'
+    + '</div>' + (box || '<span class="skipnil"></span>') + '</div>';
   if(open){
     out += '<div class="cbody">';
     const gauges = card.official ? (card.gauges||[]) : [];
@@ -1457,6 +1509,8 @@ function accountsHtml(){
     note:last.usageNote||last.accountNote||null, sevenDayTokens:null, lifetimeTokens:null
   }];
   if(!last.panelFresh && last.accounts && last.accounts.length > 1) h += '<div class="rot"><button type="button" class="rotbtn" data-rotate="1" title="Switch Claude Code to the account with the most headroom">Rotate ▸</button></div>';
+  const table = last.panelFresh && cards.some(c=>c.hdr);
+  if(table){ gcols = gaugeCols(cards); h += tableHead(); }
   for(const c of cards) h += (last.panelFresh && c.hdr) ? collapsibleCard(c) : providerCard(c);
   if(cards.some(c=>c.provider==='claude')){
     const multiAcct = !!(last.accounts && last.accounts.length > 1);
@@ -2338,6 +2392,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
         let vault = await readVaultOauth(a.id);
         const cliBlob = cliPresent ? await readCliVault(a.id, log) : null;
         const cliOauth = cliBlob?.claudeAiOauth;
+        const seatTier = cliOauth ? claudePlanTier(cliOauth.rateLimitTier, cliOauth.subscriptionType, cliBlob?.oauthAccount?.seatTier) : undefined;
+        if (seatTier && seatTier !== a.tier && allowed("accountWrites")) {
+          // The plan label (and the panel's price order) follows the CLI vault's seat tier, also for never-active logins.
+          const f = readAccountsFile();
+          setAccounts({ ...f, accounts: f.accounts.map((x) => (x.id === a.id ? { ...x, tier: seatTier } : x)) });
+          writeAccountsFile(accountsFile);
+          a = accountsFile.accounts.find((x) => x.id === a.id) ?? a;
+          changed = true;
+        }
         const source = decidePassiveSource(vault, cliOauth);
         let seeded = false;
         let cliToken: string | undefined;
@@ -3146,7 +3209,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const emailById = new Map(payload.accounts.map((a) => [a.id, a.email] as const));
       let providers = decorateCards(payload.providers).map((p) => ({ ...p, email: p.accountId ? emailById.get(p.accountId) ?? p.label.replace(/^Claude · /, "") : p.label.replace(/^(Claude|Codex) · /, "") }));
       if (fresh) {
-        providers = orderCards(providers, panel);
+        providers = orderCards(providers, panel, (p) => planPrice(p.plan));
         const claudeNames = displayNames(providers.filter((p) => p.provider === "claude").map((p) => p.email ?? p.label));
         let ci = 0;
         const badges = allBadges(panel);

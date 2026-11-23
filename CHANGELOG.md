@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.41.0
+- **Usage Limits reads as one dense table, priced and sorted by plan.** Each login is a single 19 px row (25-30 accounts fit without scrolling) under a column header: a price tag ($200 Max, $125 Team Premium, $25 Team Standard, colour by tier, full plan in its tooltip), rank and name, status, then aligned Session / Weekly / scoped-weekly columns with a mini bar each and the skip box. Rows run from the costliest plan down, then by claude-switch priority; the active login is tinted and ready logins show a green chip.
+- **Team seats are told apart.** The plan tier now reads `oauthAccount.seatTier` ("team_tier_1" premium, "team_standard"), from the claude-switch vault for every login, so a never-active account gets its price too; a bare "team" from the keychain no longer overwrites a known seat tier.
+
 ## 2.40.1
 - **A click reaches the session's tab, whatever the tab is called.** A session that never gets an AI title (common when its first prompt is a single word) keeps that first prompt as its Claude Code tab label while its row shows the newest prompt, so a click could end in "has no open tab or terminal in this window" although the tab was open, and several such tabs can share one label. When this window's Claude Code runs the session, the click now asks Claude Code to show it by its id, which finds the right tab. Sessions that run elsewhere keep the lookup by tab label and terminal.
 

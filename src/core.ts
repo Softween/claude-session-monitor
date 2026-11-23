@@ -1357,7 +1357,8 @@ export function upsertActiveAccount(
     email: acct.email,
     lastSeenTs: nowSec,
     tokenExpiresAt: acct.tokenExpiresAt ?? prev?.tokenExpiresAt,
-    tier: acct.tier ?? prev?.tier,
+    // A bare "team" (keychain only) never overwrites a known seat tier ("team_tier_1").
+    tier: acct.tier && !prev?.tier?.startsWith(`${acct.tier}_`) ? acct.tier : prev?.tier ?? acct.tier,
   };
   const rest = f.accounts.filter((a) => a.id !== acct.id);
   return { v: 1, accounts: [entry, ...rest].sort((a, b) => b.lastSeenTs - a.lastSeenTs), activeId: acct.id };

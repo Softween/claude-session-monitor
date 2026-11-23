@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import vm from "node:vm";
+import { planPrice } from "../src/view";
 import { allBadges, displayNames, headerChip, orderCards, renderSwitchActivity, renderSwitchBlock, headerGauges, type CardHeader, type SwitchPanel } from "../src/switchPanel";
 import { accountView, parseCedarEmber } from "../src/resets";
 
@@ -155,7 +156,9 @@ describe("Usage Limits webview", () => {
     expect(html.indexOf("bilal@glossgo</span>")).toBeLessThan(html.indexOf("bilal@softween</span>"));
     expect(html.indexOf("bilal@softween</span>")).toBeLessThan(html.indexOf(">Codex</span>"));
     expect(html).toContain("exhausted · 1h");
-    expect(html).toContain('</span> 100%</span> · <span class="hg"><span class="gl">Weekly</span><span class="gs">W</span> 60%');
+    expect(html).toContain('<span class="hg hot"><span class="gl">Session</span><span class="gs">S</span> 100%<i class="hgb"><b style="width:100%"></b></i></span><span class="hg"><span class="gl">Weekly</span><span class="gs">W</span> 60%');
+    expect(html).toContain('<span class="lhc">Session</span><span class="lhc">Weekly</span>'); // one column header for the table
+    expect(html).toContain('<span class="gnil"></span><span class="hg">'); // Codex has no Session: its Weekly stays in the Weekly column
     expect(html).toContain('aria-expanded="true"'); // the active card
     expect((html.match(/data-toggle=/g) ?? [])).toHaveLength(3);
     expect((html.match(/class="bar"/g) ?? []).length).toBe(2); // only the active card body
@@ -297,6 +300,29 @@ describe("Usage Limits webview", () => {
     expect(html.match(/aria-expanded="true"/g)).toHaveLength(1);
     expect(html.match(/class="cbody"/g)).toHaveLength(1);
     expect(html.match(/class="bar"/g)).toHaveLength(2);
+  });
+
+  it("plan price tags lead each row and the rows run from the costliest plan down, then by claude-switch rank", () => {
+    const h = mount();
+    const now = Date.now();
+    const panel: SwitchPanel = {
+      v: 1, ts: now / 1000, active: { email: "a@x.com" }, paused: false, nextHint: "hold",
+      accounts: [{ email: "a@x.com", rank: 1 }, { email: "b@x.com", rank: 2 }, { email: "c@x.com", rank: 3 }, { email: "d@x.com", rank: 4 }],
+    };
+    const g = [gauge("session", "Session (5h)", 10)];
+    const mk = (id: string, plan: string | null) => ({ id: `claude:${id}`, provider: "claude", label: `Claude · ${id}@x.com`, email: `${id}@x.com`, accountId: id, plan, active: id === "a", official: true, ts: now / 1000, note: null, gauges: g });
+    const raw = [mk("a", "$25 Team Standard"), mk("b", "$125 Team Premium"), mk("c", "$200 Max"), mk("d", "$125 Team Premium")];
+    const providers = orderCards(raw, panel, (p) => planPrice(p.plan)).map((p) => ({
+      ...p, hdr: { name: p.accountId, ...headerChip({ active: p.active, loginNeeded: false, gauges: g }), gauges: headerGauges(g) } as CardHeader,
+    }));
+    expect(providers.map((p) => p.accountId)).toEqual(["c", "b", "d", "a"]);
+    h.send({ type: "update", ts: now / 1000, official: true, accounts: [], eta: null, tokens: null, models: [], switchHtml: "", switchBadges: {}, panelFresh: true, ui: { expandedAccounts: {} }, useEmails: [], providers });
+    const html = h.root.innerHTML;
+    expect(html).toContain('<span class="ptag phi" title="$200 Max / month" data-testid="csm-account-plan">$200</span>');
+    expect(html).toContain('<span class="ptag pmid" title="$125 Team Premium / month" data-testid="csm-account-plan">$125</span>');
+    expect(html).toContain('<span class="ptag plo" title="$25 Team Standard / month" data-testid="csm-account-plan">$25</span>');
+    expect(html.indexOf("$200</span>")).toBeLessThan(html.indexOf("$125</span>"));
+    expect(html.lastIndexOf("$125</span>")).toBeLessThan(html.indexOf("$25</span>"));
   });
 
   it("account header lists every gauge with a percentage, omitting missing ones", () => {

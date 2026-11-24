@@ -17,7 +17,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, readQuotaEngine, displayNames, excludedEmails, excludedOf, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, renderSwitchActivity, headerGauges, switchInstalled, useTargets, type CardHeader } from "./switchPanel";
+import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, readQuotaEngine, displayNames, excludedEmails, excludedOf, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, poolSummary, readPanel, renderSwitchBlock, renderSwitchActivity, headerGauges, switchInstalled, useTargets, type CardHeader, type PoolSummary } from "./switchPanel";
 import { gaugeColumn } from "./compact";
 import { calibrate } from "./burn";
 import { BURN_WINDOWS, DEFAULT_BURN_WINDOW_MS, buildBurnPayload, burnShares, gaugeSamplesFromHistory, resolveScale, type BurnPayload } from "./burnPayload";
@@ -650,6 +650,7 @@ interface LimitsPayload {
   switchBadges?: Record<string, { rank?: number; loginNeeded?: string }>; // by account email
   showTokenStats?: boolean; // render the Tokens row + Models block (claudeSessionMonitor.showTokenStats)
   panelFresh?: boolean; // claude-switch owns switching: simplified cards, no Rotate
+  pool?: PoolSummary; // the table's "all accounts" row (fresh panel, 2+ Claude logins)
   ui?: { tab: LimitsTab; expandedAccounts: Record<string, boolean> }; // persisted in workspaceState
   useEmails?: string[]; // non-active accounts the panel can switch to
   usePending?: string; // email `claude-switch use` is switching to right now (until it exits or the 90 s UI timeout)
@@ -1179,6 +1180,9 @@ function limitsHtml(): string {
   .lhc { justify-content:flex-end; }
   .lhs, .skipnil { flex:none; width:22px; text-align:center; }
   .card.ccard.rdy .chip { color: var(--vscode-charts-green, #4caf50); }
+  .card.ccard.pool { border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); margin-top:2px; padding-top:2px; font-weight:600; }
+  .card.ccard.pool .chdr { cursor:default; }
+  .card.ccard.pool .chip.prdy { color: var(--vscode-charts-green, #4caf50); }
   @media (max-width: 440px) { .hgb { display:none; } .hg, .gnil, .lhc { width:38px; } }
   .chip { font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .chip.login { color: var(--vscode-charts-red, #f14c4c); font-weight:600; }
@@ -1419,6 +1423,18 @@ function collapsibleCard(card){
   }
   return out+'</div>';
 }
+// Last table row: the whole Claude pool. Plan cell = summed monthly price; each column = share of the pool's limit used.
+function poolRow(p){
+  const how = p.weighted ? 'each login weighted by its plan price' : 'each login counted equally (a plan price is unknown)';
+  const tip = p.ready+' of '+p.total+' Claude logins can take work now (Codex and skipped logins left out). Columns: share of the whole pool already used, '+how+'.';
+  return '<div class="card ccard pool" data-testid="csm-account-pool"><div class="chrow"><div class="chdr" title="'+esc(tip)+'">'
+    + '<span class="chev"></span>'
+    + '<span class="ptag plo" data-testid="csm-pool-price">'+(p.price?'$'+p.price:'Σ')+'</span>'
+    + '<span class="ctitle">all</span>'
+    + '<span class="chip'+(p.ready?' prdy':'')+'" data-testid="csm-pool-ready">'+p.ready+'/'+p.total+' ready</span>'
+    + '<span class="cgauges num" data-testid="csm-pool-gauges">'+gaugeCells(p, false)+'</span>'
+    + '</div><span class="skipnil"></span></div></div>';
+}
 // While a switch runs its button reads "Switching…" (also after a webview reload,
 // via the host's usePending) and every other Use button is disabled.
 function useButton(email){
@@ -1547,6 +1563,7 @@ function accountsHtml(){
   const table = last.panelFresh && cards.some(c=>c.hdr);
   if(table){ gcols = gaugeCols(cards); h += tableHead(); }
   for(const c of cards) h += (last.panelFresh && c.hdr) ? collapsibleCard(c) : providerCard(c);
+  if(table && last.pool) h += poolRow(last.pool);
   if(cards.some(c=>c.provider==='claude')){
     const multiAcct = !!(last.accounts && last.accounts.length > 1);
     if(last.showTokenStats){
@@ -3283,6 +3300,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         switchActivity: renderSwitchActivity(panel, Date.now()) ?? undefined, // panel is null without claude-switch
         switchBadges: allBadges(panel),
         panelFresh: fresh,
+        pool: fresh ? poolSummary(providers, planPrice) : undefined,
         showTokenStats: showTokenStats(),
         burnOn: claudeEnabled(),
         ui: { tab: isLimitsTab(savedTab) ? savedTab : "accounts", expandedAccounts: ctx.workspaceState.get<Record<string, boolean>>("csm.expandedAccounts", {}) },

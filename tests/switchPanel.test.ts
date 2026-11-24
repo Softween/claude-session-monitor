@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { accountBadges, displayNames, excludedEmails, excludedOf, headerChip, headerGauges, installedPanel, mergePanelAccounts, orderCards, panelAge, panelFresh, quotaEngineLine, readPanel, readQuotaEngine, renderSwitchActivity, renderSwitchBlock, switchInstalled, useTargets, worstGauge, type SwitchPanel } from "../src/switchPanel";
+import { accountBadges, displayNames, excludedEmails, excludedOf, headerChip, headerGauges, installedPanel, mergePanelAccounts, orderCards, panelAge, panelFresh, poolSummary, quotaEngineLine, readPanel, readQuotaEngine, renderSwitchActivity, renderSwitchBlock, switchInstalled, useTargets, worstGauge, type SwitchPanel } from "../src/switchPanel";
+
+import { planPrice } from "../src/view";
 
 const NOW = 1_792_200_000_000;
 const sec = NOW / 1000;
@@ -163,6 +165,34 @@ describe("card helpers", () => {
     expect(headerChip({ ...base, loginNeeded: true, gauges: [g("s", 100, 5000)] })).toEqual({ chip: "login" });
     expect(headerChip({ ...base, gauges: [g("s", 100, 5000), g("w", 100, 9000), g("f", 40, 99999)] })).toEqual({ chip: "exhausted", resetMs: 9000 });
     expect(headerChip({ ...base, gauges: [g("s", 99, 5000)] })).toEqual({ chip: "ready" });
+  });
+  it("pool row: plan-price weighted share per column, ready count, Codex and skipped logins left out", () => {
+    const card = (plan: string | null, active: boolean, gs: ReturnType<typeof g>[], extra: { provider?: string; excluded?: boolean; loginNeeded?: boolean } = {}) => ({
+      provider: extra.provider ?? "claude", plan,
+      hdr: { name: "x", ...headerChip({ active, loginNeeded: !!extra.loginNeeded, gauges: gs, excluded: extra.excluded }), gauges: headerGauges(gs) },
+    });
+    const cards = [
+      card("$200 Max", true, [g("Session (5h)", 40), g("Weekly (7d)", 90), g("Weekly · Fable", 10)]),
+      card("$200 Max", false, [g("Weekly (7d)", 100, 9000), g("Weekly · Fable", 30)]), // exhausted, no session reading
+      card("$25 Team Standard", false, [g("Session (5h)", 0), g("Weekly (7d)", 20)]), // no Fable gauge
+      card("$125 Team Premium", false, [g("Session (5h)", 80), g("Weekly (7d)", 0)], { loginNeeded: true }),
+      card("$200 Max", false, [g("Weekly (7d)", 0)], { excluded: true }), // skipped: out of the pool
+      card(null, false, [g("Weekly (7d)", 100)], { provider: "codex" }), // Codex: out of the pool
+    ];
+    expect(poolSummary(cards, planPrice)).toEqual({
+      ready: 2, total: 4, price: 550, weighted: true,
+      gauges: [
+        { label: "Session", short: "S", pct: 51.4, hot: false }, // (40*200 + 0*25 + 80*125) / 350: only logins with a session reading
+        { label: "Weekly", short: "W", pct: 70, hot: false }, // (90*200 + 100*200 + 20*25 + 0*125) / 550
+        { label: "Fable", short: "F", pct: 20, hot: false }, // (10*200 + 30*200) / 400
+      ],
+    });
+  });
+  it("pool row: equal weights when a plan price is unknown; none below two Claude logins", () => {
+    const card = (plan: string | null, pct: number) => ({ provider: "claude", plan, hdr: { name: "x", chip: "ready" as const, gauges: headerGauges([g("Weekly (7d)", pct)]) } });
+    expect(poolSummary([card("$200 Max", 100), card(null, 0)], planPrice)).toMatchObject({ weighted: false, price: 0, gauges: [{ label: "Weekly", pct: 50, hot: false }] });
+    expect(poolSummary([card("$200 Max", 95), card("$200 Max", 85)], planPrice)?.gauges[0]).toMatchObject({ pct: 90, hot: true });
+    expect(poolSummary([card("$200 Max", 50)], planPrice)).toBeUndefined();
   });
 });
 

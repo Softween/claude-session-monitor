@@ -231,6 +231,38 @@ export function headerChip(
   return { chip: "ready", ...ex };
 }
 
+/** The table's "all accounts" row: logins able to take work now, their summed plan price, and per column the share of the pool used. */
+export interface PoolSummary { ready: number; total: number; price: number; weighted: boolean; gauges: HeaderGauge[] }
+
+/**
+ * Pools the Claude rows (Codex and skipped logins stay out; undefined below two logins). Ready = a "ready" chip or an
+ * active login that is neither exhausted nor waiting on a login. A column averages the logins that report that gauge,
+ * each weighted by its plan price ($200 weighs 8x a $25 seat), or equally when any price is unknown.
+ */
+export function poolSummary<C extends { provider: string; plan?: string | null; hdr?: CardHeader }>(
+  cards: C[],
+  price: (plan: string | null | undefined) => number | null,
+): PoolSummary | undefined {
+  const pool = cards.filter((c): c is C & { hdr: CardHeader } => c.provider === "claude" && !!c.hdr && !c.hdr.excluded);
+  if (pool.length < 2) return undefined;
+  const prices = pool.map((c) => price(c.plan));
+  const weighted = prices.every((p): p is number => typeof p === "number" && p > 0);
+  const weight = (i: number): number => (weighted ? (prices[i] as number) : 1);
+  const ready = pool.filter(({ hdr: h }) => h.chip === "ready" || (h.chip === "active" && !h.exhausted && !h.loginNeeded)).length;
+  const labels: string[] = [];
+  for (const c of pool) for (const g of c.hdr.gauges ?? []) if (!labels.includes(g.label)) labels.push(g.label);
+  const gauges = labels.map((label): HeaderGauge => {
+    let used = 0, cap = 0;
+    pool.forEach((c, i) => {
+      const g = (c.hdr.gauges ?? []).find((x) => x.label === label);
+      if (g) { used += g.pct * weight(i); cap += weight(i); }
+    });
+    const pct = Math.round((used / cap) * 10) / 10;
+    return { label, short: label.charAt(0).toUpperCase(), pct, hot: pct >= 90 };
+  });
+  return { ready, total: pool.length, price: weighted ? prices.reduce((s: number, p) => s + (p as number), 0) : 0, weighted, gauges };
+}
+
 /** claude-switch's skip flag for an account its panel lists (absent on older CLIs = false); undefined when it does not list the email. */
 export function excludedOf(panel: SwitchPanel | null, email: string): boolean | undefined {
   const a = panel ? findAccount(panel, email) : undefined;

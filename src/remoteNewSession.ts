@@ -3,8 +3,12 @@
  * absolute path, `--session-id <new uuid>`) in a background VS Code terminal in
  * an allowed folder (remoteCwds.ts), registered like a resumed session so later
  * send / kill reach it, and its optional first message written into that
- * terminal only after the session has started. No vscode import: the terminal
- * and the clock come in through `NewSessionDeps`, so vitest can load it.
+ * terminal only after the session has started, with Enter pressed again until
+ * the transcript shows the message: claude drops an Enter that arrives while its
+ * startup hooks still run (2026-11-24 a phone message sat unsent in the input).
+ * remoteNewTab.ts opens the session in a Claude Code tab instead when it can.
+ * No vscode import: the terminal and the clock come in through `NewSessionDeps`,
+ * so vitest can load it.
  */
 import { randomUUID } from "crypto";
 import * as fs from "fs";
@@ -17,8 +21,12 @@ export const READY_TIMEOUT_MS = 35_000;
 /** Pause between the session start and the first message, so the prompt is drawn. */
 export const SETTLE_MS = 2_000;
 /** How long the first message gets to reach the transcript before the answer says "not in the transcript yet". */
-export const FIRST_MESSAGE_SEEN_MS = 15_000;
-const POLL_MS = 500;
+export const FIRST_MESSAGE_SEEN_MS = 20_000;
+/** Enter is pressed again when the transcript has not shown the message this long after the last press. */
+export const ENTER_RETRY_MS = 2_000;
+export const POLL_MS = 500;
+/** Most transcript bytes read after the baseline when looking for the first user turn. */
+const SEEN_READ_MAX = 1 << 20;
 
 /** The part of a vscode.Terminal this command uses. */
 export interface SessionTerminal {
@@ -72,6 +80,86 @@ function sizeOf(file: string | null): number {
   }
 }
 
+/** True when the transcript holds a user turn after byte `from` (its size before the first message). */
+export function userTurnAfter(file: string, from: number): boolean {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, "r");
+    const len = Math.min(fs.fstatSync(fd).size - from, SEEN_READ_MAX);
+    if (len <= 0) return false;
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, from);
+    return buf.toString("utf8").includes('"type":"user"');
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+export type EnterResult =
+  | { result: "delivered"; presses: number }
+  | { result: "unseen"; presses: number }
+  | { result: "stopped"; presses: number; reason: string };
+
+/**
+ * Presses Enter (`press` resolves undefined once pressed, else why it could not)
+ * until the transcript shows a user turn: again whenever 2 s pass without one,
+ * for at most 20 s. Enter on an empty prompt does nothing, so a press after the
+ * message went out is harmless. Without a transcript path it presses once.
+ */
+export async function enterUntilSeen(
+  press: () => Promise<string | undefined>,
+  transcriptPath: string | null,
+  d: { sleep: (ms: number) => Promise<void>; now?: () => number },
+): Promise<EnterResult> {
+  const now = d.now ?? Date.now;
+  const before = sizeOf(transcriptPath);
+  const started = now();
+  let presses = 0;
+  for (;;) {
+    const why = await press();
+    if (why !== undefined) return { result: "stopped", presses, reason: why };
+    presses++;
+    if (!transcriptPath) return { result: "unseen", presses };
+    const pressedAt = now();
+    while (now() - pressedAt < ENTER_RETRY_MS) {
+      await d.sleep(POLL_MS);
+      if (userTurnAfter(transcriptPath, before)) return { result: "delivered", presses };
+    }
+    if (now() - started >= FIRST_MESSAGE_SEEN_MS) return { result: "unseen", presses };
+  }
+}
+
+/** The answer after the first message: `opened` plus what became of the message (`done`: "written" or "typed"). */
+export function firstMessageOutcome(opened: string, r: EnterResult, done: string): CommandOutcome {
+  if (r.result === "delivered") return { ok: true, message: `${opened}; first message delivered` };
+  if (r.result === "unseen") return { ok: true, message: `${opened}; first message ${done}, not in the transcript yet` };
+  if (r.presses === 0) return { ok: false, message: `${opened}; first message not ${done}: ${r.reason}` };
+  return { ok: true, message: `${opened}; first message ${done}, not in the transcript yet (Enter stopped: ${r.reason})` };
+}
+
+/** Writes the first message with Enter, then Enter alone until the transcript shows it (enterUntilSeen). */
+function writeFirstMessage<T extends SessionTerminal>(
+  term: T,
+  line: string,
+  transcriptPath: string | null,
+  d: NewSessionDeps<T>,
+): Promise<EnterResult> {
+  let text = line + "\r";
+  const press = async (): Promise<string | undefined> => {
+    if (term.exitStatus !== undefined) return "claude exited";
+    try {
+      term.sendText(text, false);
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+    text = "\r";
+    return undefined;
+  };
+  return enterUntilSeen(press, transcriptPath, d);
+}
+
 async function waitForStart<T extends SessionTerminal>(sessionId: string, term: T, d: NewSessionDeps<T>): Promise<Started> {
   const now = d.now ?? Date.now;
   const file = path.join(d.monitorDir, `${sessionId}.json`);
@@ -85,33 +173,11 @@ async function waitForStart<T extends SessionTerminal>(sessionId: string, term: 
   return { ok: false, reason: `no session start within ${READY_TIMEOUT_MS / 1000} s (a question may be waiting in the terminal)` };
 }
 
-/** Writes the first message, then waits until the transcript grows; "written" when it does not within 15 s. */
-async function writeFirstMessage<T extends SessionTerminal>(
-  term: T,
-  line: string,
-  transcriptPath: string | null,
-  d: NewSessionDeps<T>,
-): Promise<"delivered" | "written" | Error> {
-  const now = d.now ?? Date.now;
-  const before = sizeOf(transcriptPath);
-  try {
-    term.sendText(line + "\r", false);
-  } catch (e) {
-    return e instanceof Error ? e : new Error(String(e));
-  }
-  const started = now();
-  while (transcriptPath && now() - started < FIRST_MESSAGE_SEEN_MS) {
-    if (sizeOf(transcriptPath) > before) return "delivered";
-    await d.sleep(POLL_MS);
-  }
-  return "written";
-}
-
 /**
- * Runs one remote `newSession`. Refused, with nothing opened, when the folder is
- * not exactly an allowed one, the first message breaks the send rules, or no
- * claude executable is known. A session that does not start within 35 s gets
- * its terminal closed. The answer names the new session id and the folder.
+ * Runs one remote `newSession` in a terminal. Refused, with nothing opened, when
+ * the folder is not exactly an allowed one, the first message breaks the send
+ * rules, or no claude executable is known. A session that does not start within
+ * 35 s gets its terminal closed. The answer names the new session id and the folder.
  */
 export async function startNewSession<T extends SessionTerminal>(cmd: FleetCommand, d: NewSessionDeps<T>): Promise<CommandOutcome> {
   const checked = checkNewSession(cmd, d.allowed());
@@ -132,6 +198,5 @@ export async function startNewSession<T extends SessionTerminal>(cmd: FleetComma
   const opened = `new session ${sessionId} started in ${folder}`;
   if (!checked.line) return { ok: true, message: opened };
   const first = await writeFirstMessage(term, checked.line, started.transcriptPath, d);
-  if (first instanceof Error) return { ok: false, message: `${opened}; first message not written: ${first.message}` };
-  return { ok: true, message: first === "delivered" ? `${opened}; first message delivered` : `${opened}; first message written, not in the transcript yet` };
+  return firstMessageOutcome(opened, first, "written");
 }

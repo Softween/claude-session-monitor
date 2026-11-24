@@ -45,6 +45,7 @@ import { parseParentPid, pickSessionTerminal, pickUniqueLabel, type TerminalCand
 import { ResumeRegistry, isClaudeCliCommand, isClaudeSessionCommand } from "./resumeRegistry";
 import { allowedCwds, mergeSeen, withoutPaths } from "./remoteCwds";
 import { startNewSession } from "./remoteNewSession";
+import { startNewTab, type NewTabDeps } from "./remoteNewTab";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import { OPEN_COMMAND, TabWaker, nodeProbes, ownSessions, readLiveSessions, readParentPids, summaryText } from "./wakeTabs";
 import { ContinuityServer, continuityDir, readText, storageDir, windowKey, writeTextAtomic } from "./continuity";
@@ -3631,6 +3632,72 @@ export function activate(ctx: vscode.ExtensionContext): void {
     return { ok: false, skip: nothingTyped(r.reason), reason: TYPED_REASON[r.reason] ?? r.reason, detail: r.detail };
   }
 
+  /**
+   * Why a remote newSession cannot open in a Claude Code tab of this window
+   * (remoteNewTab.ts) and runs in a terminal instead, or undefined. A tab starts
+   * in the window's workspace folder, so that must be the session's folder; a
+   * first message needs Enter pressed by keystroke, so the typing rules must
+   * let it through right now.
+   */
+  function newTabBlocker(cmd: FleetCommand): string | undefined {
+    if (!vscode.extensions.getExtension(CLAUDE_CODE_ID)) return "Claude Code is not installed";
+    const own = ownFolders();
+    if (own.length !== 1 || own[0] !== cmd.cwd) return "the folder is not this window's one workspace folder";
+    if (typeof cmd.text !== "string" || cmd.text === "") return undefined;
+    if (process.platform !== "darwin") return "keystrokes need macOS";
+    if (!remoteFlag("remote.typeFallback")) return "typing disabled (remote.typeFallback is off)";
+    const held = automationGate.blocker("remoteTyping");
+    if (held) return `typing disabled (${held})`;
+    if (resumeActive) return "a typing sweep is running";
+    if (!windowFocused()) return "this VS Code window is not focused";
+    return undefined;
+  }
+
+  /** remoteNewTab.ts's deps: Claude Code's open command, this host's Claude processes, Enter by keystroke into the new tab. */
+  function newTabDeps(stop: AbortSignal): NewTabDeps {
+    let tab: vscode.Tab | undefined;
+    const claudeTabs = (): vscode.Tab[] => vscode.window.tabGroups.all.flatMap((g) => g.tabs.filter(isClaudePanelTab));
+    const where = (): { gi: number; ti: number } | undefined => {
+      const groups = vscode.window.tabGroups.all;
+      for (let gi = 0; gi < groups.length; gi++) {
+        const ti = tab ? groups[gi].tabs.indexOf(tab) : -1;
+        if (ti >= 0) return { gi, ti };
+      }
+      return undefined;
+    };
+    return {
+      allowed: () => remoteCwds(true),
+      ownSessions: async () => {
+        const parents = await readParentPids();
+        return parents && ownSessions(readLiveSessions(), parents, process.pid);
+      },
+      open: async (prompt) => {
+        const before = new Set(claudeTabs());
+        // Claude Code's own new-tab request: an editor tab whatever the preferred location, the prompt only fills the input.
+        await vscode.commands.executeCommand(OPEN_COMMAND, undefined, prompt, undefined, undefined, undefined, { programmatic: "pin-to-panel" });
+        for (let i = 0; i < 10 && !tab; i++) {
+          tab = claudeTabs().find((t) => !before.has(t));
+          if (!tab) await sleep(300);
+        }
+      },
+      pressEnter: async () => {
+        const at = where();
+        if (!at) return tab ? "the new tab was closed" : "the new tab was not found";
+        if (!windowFocused()) return TYPED_REASON["not-frontmost"];
+        const signal = automationGate.signal("remoteTyping");
+        await focusTab(at.gi, at.ti);
+        const r = await typeIntoFocusedSession("", 0, () => !disposed && !resumeActive && !signal.aborted && !stop.aborted, {
+          activate: false,
+          tabActive: () => vscode.window.tabGroups.activeTabGroup.activeTab === tab,
+          label: "remote newSession tab",
+        });
+        return r.ok ? undefined : (TYPED_REASON[r.reason] ?? r.reason);
+      },
+      monitorDir: MONITOR_DIR,
+      sleep,
+    };
+  }
+
   /** Title candidates of every other listed session: a tab or terminal name they match too is ambiguous. */
   function rivalLabels(v: SessionView): string[] {
     return lastAllViews.filter((o) => o.sessionId !== v.sessionId).flatMap((o) => matchCandidates(o));
@@ -4395,8 +4462,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
         };
       case "switchAccount":
         return cmd.account ? remoteSwitch(cmd.account) : { ok: false, message: "account is required" };
-      case "newSession":
-        // A new claude in a background terminal of this window, registered like a resume.
+      case "newSession": {
+        // A new Claude Code tab in this window when it can (remoteNewTab.ts), else a new claude in a
+        // background terminal of this window, registered like a resume.
+        const tabBlocked = newTabBlocker(cmd);
+        if (tabBlocked === undefined) return startNewTab(cmd, newTabDeps(signal));
+        log(`remote newSession: terminal, not a tab: ${tabBlocked}`);
         return startNewSession(cmd, {
           allowed: () => remoteCwds(true),
           claudeBinary: () => claudeBinary ?? Promise.resolve(undefined),
@@ -4405,6 +4476,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           monitorDir: MONITOR_DIR,
           sleep,
         });
+      }
       case "answer": {
         // An AskUserQuestion answer from the phone, handed to the waiting PermissionRequest hook (answers.ts).
         return submitAnswer(cmd, { nowSec: Date.now() / 1000, askPending: !!find()?.askPending });

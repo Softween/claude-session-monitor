@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.44.0
+- **A phone's new session opens as a Claude Code tab.** A remote `newSession` in this window's workspace folder now opens a Claude Code editor tab with the first message in its input and presses Enter there, instead of starting `claude` in a background terminal; the answer still names the new session id (`new session <id> started in <folder> in a Claude Code tab`). Other folders, or a first message while this window is not focused, still use the terminal, and the log line says why.
+- **The first message is sent, not left in the input.** claude drops an Enter that arrives while its startup hooks still run, so a first message written 2 s after the session start could sit unsent in the prompt. Enter is now pressed again every 2 s, for up to 20 s, until the transcript shows the message, in the terminal and in the tab.
+
 ## 2.43.3
 - **Sessions stay listed after Developer: Reload Window.** A reload ends every Claude Code tab's process, and Claude Code starts it again only when the tab is shown, so each session's status record said `ended` and the list hid it until its tab was opened by hand. A session whose Claude Code tab is still open in the window now shows as your turn, without a process until the tab is shown; clicking its row opens the tab, which starts it.
 

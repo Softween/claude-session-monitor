@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import vm from "node:vm";
 import { planPrice } from "../src/view";
-import { allBadges, displayNames, headerChip, orderCards, renderSwitchActivity, renderSwitchBlock, headerGauges, type CardHeader, type SwitchPanel } from "../src/switchPanel";
+import { allBadges, displayNames, headerChip, orderCards, poolSummary, renderSwitchActivity, renderSwitchBlock, headerGauges, type CardHeader, type SwitchPanel } from "../src/switchPanel";
 import { accountView, parseCedarEmber } from "../src/resets";
 
 function webviewScript(): string {
@@ -323,6 +323,33 @@ describe("Usage Limits webview", () => {
     expect(html).toContain('<span class="ptag plo" title="$25 Team Standard / month" data-testid="csm-account-plan">$25</span>');
     expect(html.indexOf("$200</span>")).toBeLessThan(html.indexOf("$125</span>"));
     expect(html.lastIndexOf("$125</span>")).toBeLessThan(html.indexOf("$25</span>"));
+  });
+
+  it("closes the account table with an 'all' row: summed price, ready count and the pool's share per column", () => {
+    const now = Date.now();
+    const mk = (id: string, plan: string, active: boolean, g: ReturnType<typeof gauge>[]) => ({
+      id: `claude:${id}`, provider: "claude", label: `Claude · ${id}@x.com`, email: `${id}@x.com`, accountId: id, plan, active, official: true, ts: now / 1000, note: null, gauges: g,
+      hdr: { name: id, ...headerChip({ active, loginNeeded: false, gauges: g }), gauges: headerGauges(g) } as CardHeader,
+    });
+    const providers = [
+      mk("a", "$200 Max", true, [gauge("session", "Session (5h)", 40), gauge("weekly", "Weekly (7d)", 95)]),
+      mk("b", "$200 Max", false, [gauge("weekly", "Weekly (7d)", 100)]),
+      mk("c", "$25 Team Standard", false, [gauge("session", "Session (5h)", 0), gauge("weekly", "Weekly (7d)", 0)]),
+    ];
+    const base = { type: "update", ts: now / 1000, official: true, accounts: [], eta: null, tokens: null, models: [], switchHtml: "", switchBadges: {}, panelFresh: true, ui: { expandedAccounts: {} }, useEmails: [], providers };
+    const h = mount();
+    h.send({ ...base, pool: poolSummary(providers, planPrice) });
+    const html = h.root.innerHTML;
+    const pool = html.slice(html.indexOf('data-testid="csm-account-pool"'));
+    expect(html.lastIndexOf('data-testid="csm-account-row"')).toBeLessThan(html.indexOf('data-testid="csm-account-pool"'));
+    expect(pool).toContain('data-testid="csm-pool-price">$425</span>');
+    expect(pool).toContain('data-testid="csm-pool-ready">2/3 ready</span>');
+    expect(pool).toContain('title="2 of 3 Claude logins can take work now (Codex and skipped logins left out). Columns: share of the whole pool already used, each login weighted by its plan price."');
+    expect(pool).toContain('<span class="hg"><span class="gl">Session</span><span class="gs">S</span> 36%'); // (40*200 + 0*25) / 225
+    expect(pool).toContain('<span class="hg hot"><span class="gl">Weekly</span><span class="gs">W</span> 92%'); // (95*200 + 100*200 + 0*25) / 425
+    const off = mount();
+    off.send(base);
+    expect(off.root.innerHTML).not.toContain("csm-account-pool");
   });
 
   it("account header lists every gauge with a percentage, omitting missing ones", () => {

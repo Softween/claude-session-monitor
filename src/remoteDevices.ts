@@ -9,9 +9,11 @@
  * that got the command shows a notification naming it, one per device at a
  * time; only its Review… button opens the modal: Deny (the default button),
  * Allow, or closed (nothing decided). The command is answered at once; after
- * Allow the phone sends it again. On the first run, without the file, the
- * devices the relay paired before DEVICE_MIGRATION_CUTOFF are allowed, and
- * remote/devices-first-run.json records that this happened: from then on a
+ * Allow the phone sends it again. On the first run, without the file, the list
+ * earlier versions kept in the monitor folder itself (remote-devices.json) is
+ * taken over whole; without that one, the devices the relay paired before
+ * DEVICE_MIGRATION_CUTOFF are allowed. remote/devices-first-run.json records
+ * that the first run happened: from then on a
  * missing file refuses every command until it is back (removing both files
  * starts over). An entry also keeps the key the device signs its commands with
  * (`publicKey`, remoteSigned.ts): Allow pins the key the relay lists for the
@@ -87,6 +89,7 @@ export interface DeviceFs {
 export interface DeviceGateDeps {
   file: string;
   marker: string; // records that the first run happened: under remote/, which the monitor folder cleanups never look into
+  legacy?: string; // the list as versions before this one kept it, in the monitor folder itself: taken over on the first run
   fs: DeviceFs;
   now(): number; // epoch ms
   /** Asks the owner about the device; `sameName` holds the ids of the allowed devices that have its name. */
@@ -98,7 +101,7 @@ export interface DeviceGateDeps {
 
 /** What the bridge asks before a command runs: a DeviceGate, or a stand-in in tests. */
 export interface DeviceCheck {
-  /** The first run: allows the devices the relay paired before DEVICE_MIGRATION_CUTOFF while the file does not exist yet. */
+  /** The first run, while the file does not exist yet: takes over the earlier versions' list, else allows the devices the relay paired before DEVICE_MIGRATION_CUTOFF. */
   migrate(lookup: PairedLookup): Promise<void>;
   /**
    * null when the device may run commands, else the answer the relay gets. With `ask` false (a command
@@ -236,7 +239,7 @@ export class DeviceGate implements DeviceCheck {
   private async firstRun(lookup: PairedLookup): Promise<void> {
     const loaded = this.load();
     if (loaded.kind === "ok") this.markFirstRun(); // a list an earlier version wrote counts as the first run
-    if (loaded.kind !== "missing") return;
+    if (loaded.kind !== "missing" || this.takeOver()) return;
     let paired: PairedDevice[];
     try {
       paired = pairedDevices(await lookup());
@@ -262,6 +265,37 @@ export class DeviceGate implements DeviceCheck {
     } catch (e) {
       this.deps.log(`remote: device list not written (${errText(e)})`);
     }
+  }
+
+  /**
+   * The first run on the list an earlier version kept in the monitor folder itself: copied here whole, its
+   * decisions included, and the first run recorded; false when there is no readable version 1 list to take.
+   */
+  private takeOver(): boolean {
+    const from = this.deps.legacy;
+    let store: DeviceStore | null;
+    try {
+      const text = from === undefined ? undefined : this.deps.fs.read(from);
+      if (text === undefined) return false;
+      store = parseStore(text);
+    } catch (e) {
+      this.deps.log(`remote: ${from} not read (${errText(e)}); the first run asks the relay`);
+      return false;
+    }
+    if (!store) {
+      this.deps.log(`remote: ${from} is not a version 1 device list; the first run asks the relay`);
+      return false;
+    }
+    try {
+      // Only when new: the window that created the file first keeps its list. The old file stays for the windows still on an earlier version.
+      if (this.deps.fs.write(this.deps.file, serialize(store), true)) {
+        this.deps.log(`remote: first run, device list taken over from ${from} (${Object.keys(store.devices).length} device(s))`);
+      }
+      this.markFirstRun();
+    } catch (e) {
+      this.deps.log(`remote: device list not written (${errText(e)})`);
+    }
+    return true;
   }
 
   /** Whether the first run is recorded; a marker that cannot be read counts as recorded, so nothing starts over by mistake. */
@@ -525,11 +559,12 @@ export const nodeDeviceFs: DeviceFs = {
 
 /**
  * Where the device list and its first-run record live: in the monitor folder's remote/ subfolder, next to the
- * seen command ids and the nonces, which the cleanups of the folder's top-level files never look into.
+ * seen command ids and the nonces, which the cleanups of the folder's top-level files never look into; and where
+ * versions before this one kept the list, at the top of the monitor folder.
  */
-export function devicePaths(monitorDir: string): { file: string; marker: string } {
+export function devicePaths(monitorDir: string): { file: string; marker: string; legacy: string } {
   const dir = path.join(monitorDir, "remote");
-  return { file: path.join(dir, "devices.json"), marker: path.join(dir, "devices-first-run.json") };
+  return { file: path.join(dir, "devices.json"), marker: path.join(dir, "devices-first-run.json"), legacy: path.join(monitorDir, "remote-devices.json") };
 }
 
 /** The gate the bridge uses: the shared list under ~/.claude/session-monitor/remote, the clock and the modal. */

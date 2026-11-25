@@ -325,6 +325,26 @@ function mkCtx(state = new Map<string, unknown>()): any {
   };
 }
 
+/** A resolved webview view as VS Code passes it: visible, with a visibility event (viewPost.ts), around `webview`. */
+function webviewView(webview: Record<string, unknown>): any {
+  const view = {
+    visible: true,
+    listeners: [] as Array<() => void>,
+    onDidChangeVisibility: (listener: () => void) => {
+      view.listeners.push(listener);
+      return { dispose() {} };
+    },
+    webview,
+  };
+  return view;
+}
+
+/** Hides or shows a view from webviewView() the way VS Code does: `visible` changes, then the event fires. */
+function setVisible(view: any, visible: boolean): void {
+  view.visible = visible;
+  for (const listener of view.listeners) listener();
+}
+
 function disposeCtx(ctx: any): void {
   for (const d of ctx?.subscriptions ?? []) {
     try {
@@ -835,6 +855,7 @@ describe("a failing refresh stage or feature start does not stop the others", ()
   const rowIds = (payload: any): string[] => payload.groups.flatMap((g: any) => g.rows.map((r: any) => r.id));
   const refresh = () => rec.commands.get("claudeSessionMonitor.refresh")!();
   let samples = 0; // `ps -axo` runs: the resource sampler, the last stage of a refresh
+  let hook: Record<string, unknown> = {}; // the session's hook record
 
   beforeEach(() => {
     rec.execFileImpl = (args) => {
@@ -856,36 +877,48 @@ describe("a failing refresh stage or feature start does not stop the others", ()
       { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "Done." }], stop_reason: "end_turn" }, timestamp: iso(now - 30) },
     ];
     fs.writeFileSync(tx, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
-    fs.writeFileSync(`${MON}/${SID}.json`, JSON.stringify({ session_id: SID, provider: "claude", state: "idle", ts: now - 35, cwd: "/repo", transcript_path: tx, pid: process.pid }));
+    hook = { session_id: SID, provider: "claude", state: "idle", ts: now - 35, cwd: "/repo", transcript_path: tx, pid: process.pid };
+    fs.writeFileSync(`${MON}/${SID}.json`, JSON.stringify(hook));
   });
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
   // Activates with a workspace state (so the limits payload is built) and resolves both views;
-  // setting broken.sessions / broken.limits makes that view's postMessage throw.
-  function activateWithViews(): { sessions: any[]; limits: any[]; broken: { sessions: boolean; limits: boolean } } {
+  // setting broken.sessions / broken.limits makes that view's postMessage throw. A view is sent
+  // a payload only when it changed: change() gives the next refresh a new one for each view.
+  function activateWithViews() {
     const ctx = mkCtx();
-    ctx.workspaceState = { get: (_k: string, def?: unknown) => def, update: () => Promise.resolve() };
+    const workspace = new Map<string, unknown>();
+    ctx.workspaceState = { get: (k: string, def?: unknown) => (workspace.has(k) ? workspace.get(k) : def), update: () => Promise.resolve() };
     lastCtx = ctx;
     ext.activate(ctx);
     const sessions: any[] = [];
     const limits: any[] = [];
     const broken = { sessions: false, limits: false };
-    const resolve = (id: string, post: (m: any) => void) =>
-      rec.webviews.find((w) => w.id === id)!.p.resolveWebviewView({
-        webview: { options: {}, html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: post },
-      });
-    resolve("claudeSessionMonitor.view", (m) => {
-      if (broken.sessions) throw new Error("sessions view gone");
-      sessions.push(m);
-    });
-    resolve("claudeSessionMonitor.limits", (m) => {
-      if (m?.type === "burn") return;
-      if (broken.limits) throw new Error("limits view gone");
-      limits.push(m);
-    });
-    return { sessions, limits, broken };
+    const resolve = (id: string, post: (m: any) => void) => {
+      const view = webviewView({ options: {}, html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: post });
+      rec.webviews.find((w) => w.id === id)!.p.resolveWebviewView(view);
+      return view;
+    };
+    const webviews = {
+      sessions: resolve("claudeSessionMonitor.view", (m) => {
+        if (broken.sessions) throw new Error("sessions view gone");
+        sessions.push(m);
+      }),
+      limits: resolve("claudeSessionMonitor.limits", (m) => {
+        if (m?.type === "burn") return;
+        if (broken.limits) throw new Error("limits view gone");
+        limits.push(m);
+      }),
+    };
+    let changes = 0;
+    const change = (): void => {
+      changes++;
+      workspace.set("csm.expandedAccounts", { [`card-${changes}`]: true }); // the limits payload carries it back (ui)
+      fs.writeFileSync(`${MON}/${SID}.json`, JSON.stringify({ ...hook, prompt: `prompt ${changes}` })); // the session row's title
+    };
+    return { sessions, limits, broken, webviews, change };
   }
 
   it("a throwing continuity stage still lets the sessions payload, the tab waker and the sampler run, and is logged once", () => {
@@ -905,11 +938,13 @@ describe("a failing refresh stage or feature start does not stop the others", ()
   it("a throwing limits payload is logged once while the sessions payload and the later stages still run", () => {
     const cont = vi.spyOn(ContinuityServer.prototype, "observe");
     const wake = vi.spyOn(TabWaker.prototype, "observe");
-    const { sessions, limits, broken } = activateWithViews();
+    const { sessions, limits, broken, change } = activateWithViews();
     expect(limits.length).toBeGreaterThan(0);
     broken.limits = true;
     const before = [sessions.length, cont.mock.calls.length, wake.mock.calls.length];
+    change();
     refresh();
+    change();
     refresh();
     expect([sessions.length, cont.mock.calls.length, wake.mock.calls.length]).toEqual(before.map((n) => n + 2));
     expect(logged("limits view gone")).toBe(1);
@@ -918,18 +953,40 @@ describe("a failing refresh stage or feature start does not stop the others", ()
   it("a throwing sessions push is logged once while the limits payload and the later stages still run", () => {
     const cont = vi.spyOn(ContinuityServer.prototype, "observe");
     const wake = vi.spyOn(TabWaker.prototype, "observe");
-    const { sessions, limits, broken } = activateWithViews();
+    const { sessions, limits, broken, change } = activateWithViews();
     broken.sessions = true;
     const before = [limits.length, cont.mock.calls.length, wake.mock.calls.length];
+    change();
     expect(() => refresh()).not.toThrow();
+    change();
     refresh();
     expect([limits.length, cont.mock.calls.length, wake.mock.calls.length]).toEqual(before.map((n) => n + 2));
     expect(logged("sessions view gone")).toBe(1);
-    broken.sessions = false; // the view is back: the next refresh delivers the sessions payload again
+    broken.sessions = false; // the view is back: the next refresh delivers the payload it could not post
     const shown = sessions.length;
     refresh();
     expect(sessions.length).toBe(shown + 1);
     expect(rowIds(sessions[sessions.length - 1])).toContain(`claude:${SID}`);
+  });
+
+  it("a view is sent a payload only when it changed and nothing while hidden; shown again, it gets the latest at once", () => {
+    vi.useFakeTimers(); // a still clock: the row ages do not move between refreshes
+    const { sessions, limits, webviews, change } = activateWithViews();
+    const posts = () => [sessions.length, limits.length];
+    expect(posts()).toEqual([1, 1]); // resolving a view posts what the first refresh built
+    refresh();
+    refresh();
+    expect(posts()).toEqual([1, 1]);
+    change();
+    refresh();
+    expect(posts()).toEqual([2, 2]);
+    setVisible(webviews.sessions, false);
+    change();
+    refresh();
+    expect(posts()).toEqual([2, 3]); // the hidden view was sent nothing
+    setVisible(webviews.sessions, true);
+    expect(posts()).toEqual([3, 3]); // shown again: the latest payload, without waiting for a refresh
+    expect(sessions[2].groups.flatMap((g: any) => g.rows.map((r: any) => r.title))).toContain("prompt 2");
   });
 
   it("a feature that throws at activation leaves the others registered and the first refresh running", () => {
@@ -1099,9 +1156,9 @@ describe("active login and Use this account", () => {
     const posted: any[] = [];
     const burnPosted: any[] = []; // Burn tab rankings, kept apart so posted[posted.length - 1] stays the limits payload
     let onMessage: (m: any) => void = () => undefined;
-    rec.webviews.find((w) => w.id === "claudeSessionMonitor.limits")!.p.resolveWebviewView({
-      webview: { options: {}, html: "", onDidReceiveMessage: (fn: (m: any) => void) => { onMessage = fn; }, postMessage: (m: any) => { (m?.type === "burn" ? burnPosted : posted).push(m); } },
-    });
+    rec.webviews.find((w) => w.id === "claudeSessionMonitor.limits")!.p.resolveWebviewView(
+      webviewView({ options: {}, html: "", onDidReceiveMessage: (fn: (m: any) => void) => { onMessage = fn; }, postMessage: (m: any) => { (m?.type === "burn" ? burnPosted : posted).push(m); } }),
+    );
     return { posted, burnPosted, send: (m) => onMessage(m) };
   }
   const card = (payload: any, id: string) => payload.providers.find((p: any) => p.accountId === id);
@@ -1986,9 +2043,9 @@ describe("a session's tab: shown by its index, typed into only when it is the on
     lastCtx = mkCtx();
     ext.activate(lastCtx);
     const posted: any[] = [];
-    rec.webviews.find((w) => w.id === "claudeSessionMonitor.view")!.p.resolveWebviewView({
-      webview: { options: {}, html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: (m: any) => { posted.push(m); } },
-    });
+    rec.webviews.find((w) => w.id === "claudeSessionMonitor.view")!.p.resolveWebviewView(
+      webviewView({ options: {}, html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: (m: any) => { posted.push(m); } }),
+    );
     await vi.advanceTimersByTimeAsync(2_000);
     const e = fakeEditor([{ viewColumn: 1, labels: ["notes.md", NOTES_TAB] }]);
     const ui = recordMessages();
@@ -2053,9 +2110,9 @@ describe("closingStatusMarkers setting", () => {
     lastCtx = mkCtx();
     ext.activate(lastCtx);
     const posted: any[] = [];
-    rec.webviews.find((w) => w.id === "claudeSessionMonitor.view")!.p.resolveWebviewView({
-      webview: { options: {}, html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: (m: any) => { posted.push(m); } },
-    });
+    rec.webviews.find((w) => w.id === "claudeSessionMonitor.view")!.p.resolveWebviewView(
+      webviewView({ options: {}, html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: (m: any) => { posted.push(m); } }),
+    );
     const done = posted[posted.length - 1].groups.find((g: { key: string }) => g.key === "done");
     return done?.rows.find((r: { id: string }) => r.id === "claude:s-closing");
   }
@@ -2101,9 +2158,9 @@ describe("closingStatusMarkers setting", () => {
     lastCtx = mkCtx();
     ext.activate(lastCtx);
     const posted: any[] = [];
-    rec.webviews.find((w) => w.id === "claudeSessionMonitor.view")!.p.resolveWebviewView({
-      webview: { options: {}, html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: (m: any) => { posted.push(m); } },
-    });
+    rec.webviews.find((w) => w.id === "claudeSessionMonitor.view")!.p.resolveWebviewView(
+      webviewView({ options: {}, html: "", onDidReceiveMessage: () => ({ dispose() {} }), postMessage: (m: any) => { posted.push(m); } }),
+    );
     return posted[posted.length - 1];
   }
 
@@ -2319,9 +2376,9 @@ describe("observer mode in an Extension Development Host", () => {
     ext.activate(ctx);
     const posted: any[] = [];
     let onMessage: (m: any) => void = () => undefined;
-    rec.webviews.find((w) => w.id === "claudeSessionMonitor.limits")!.p.resolveWebviewView({
-      webview: { options: {}, html: "", onDidReceiveMessage: (fn: (m: any) => void) => { onMessage = fn; }, postMessage: (m: any) => { if (m?.type !== "burn") posted.push(m); } },
-    });
+    rec.webviews.find((w) => w.id === "claudeSessionMonitor.limits")!.p.resolveWebviewView(
+      webviewView({ options: {}, html: "", onDidReceiveMessage: (fn: (m: any) => void) => { onMessage = fn; }, postMessage: (m: any) => { if (m?.type !== "burn") posted.push(m); } }),
+    );
     return { posted, send: (m) => onMessage(m) };
   }
 

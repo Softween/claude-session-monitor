@@ -79,6 +79,7 @@ export interface TxInfo {
   effort?: string; // reasoning effort of the newest real assistant line (top-level `effort`)
   closing?: ClosingStatus; // closing status line of the newest end_turn text
   askPending?: boolean; // the newest tool_use is AskUserQuestion and no tool_result answered it yet
+  toolRefs?: string[]; // paths and commands of the newest tool calls, oldest first (projectOf)
 }
 
 export const BUCKET_ORDER: Record<Bucket, number> = {
@@ -235,20 +236,30 @@ export function writeGlobalEffort(effort: string, file = SETTINGS_FILE, ops?: Re
 // Transcript tail parsing
 // ---------------------------------------------------------------------------
 
-function readTail(file: string, maxBytes: number): { text: string; partialFirst: boolean } {
+interface Bytes {
+  buf: Buffer;
+  start: number; // the file offset of buf[0]
+  ino: number;
+}
+
+/** The bytes from `startOf(size)` to the end of `file`, in one read; undefined when `startOf` gives undefined. */
+function readBytes(file: string, startOf: (size: number) => number | undefined): Bytes | undefined {
   const fd = fs.openSync(file, "r");
   try {
     const stat = fs.fstatSync(fd);
-    const size = stat.size;
-    const start = Math.max(0, size - maxBytes);
-    const len = size - start;
-    if (len <= 0) return { text: "", partialFirst: false };
-    const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, start);
-    return { text: buf.toString("utf8"), partialFirst: start > 0 };
+    const start = startOf(stat.size);
+    if (start === undefined) return undefined;
+    const buf = Buffer.alloc(stat.size - start);
+    const n = buf.length ? fs.readSync(fd, buf, 0, buf.length, start) : 0;
+    return { buf: buf.subarray(0, n), start, ino: stat.ino };
   } finally {
     fs.closeSync(fd);
   }
+}
+
+function readTail(file: string, maxBytes: number): { text: string; partialFirst: boolean } {
+  const { buf, start } = readBytes(file, (size) => Math.max(0, size - maxBytes))!;
+  return { text: buf.toString("utf8"), partialFirst: start > 0 };
 }
 
 function toEpochSeconds(iso: unknown): number {
@@ -359,30 +370,32 @@ function classifyConvLine(obj: any): {
   return { kind: "user_text", ctype: "user" };
 }
 
-/** Parse a single tail window of `maxBytes`. */
-function parseWindow(file: string, stat: fs.Stats, maxBytes: number): TxInfo {
-  const info: TxInfo = {
-    convTs: 0,
-    convKind: "none",
-    activityTs: 0,
-    mtimeMs: stat.mtimeMs,
-    sizeBytes: stat.size,
-  };
+const MAX_TOOL_REFS = 40;
+const MAX_REF_CHARS = 300;
 
-  let text = "";
-  let partialFirst = false;
-  try {
-    const r = readTail(file, maxBytes);
-    text = r.text;
-    partialFirst = r.partialFirst;
-  } catch {
-    return info;
-  }
+/** The paths and the command a tool call names, for project tagging ("" when it names none). */
+function toolRef(input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const o = input as Record<string, unknown>;
+  return ["file_path", "notebook_path", "path", "cwd", "command"]
+    .map((k) => (typeof o[k] === "string" ? (o[k] as string).slice(0, MAX_REF_CHARS) : ""))
+    .filter(Boolean)
+    .join(" ");
+}
 
-  const lines = text.split("\n");
-  if (partialFirst && lines.length) lines.shift(); // drop incomplete leading line
-  let lastUse: { id: unknown; name: unknown; answered: boolean } | undefined; // newest tool_use block
+/** The newest tool_use block of a transcript, and whether a tool_result answered it (askPending). */
+interface LastUse {
+  id: unknown;
+  name: unknown;
+  answered: boolean;
+}
 
+/**
+ * Folds transcript lines, oldest first, into `info` (the caller's own object)
+ * and returns the newest tool_use block. Folding the newest line a second time
+ * right after the first changes nothing (parseAppended relies on it).
+ */
+function foldLines(info: TxInfo, lines: string[], lastUse: LastUse | undefined): LastUse | undefined {
   for (const ln of lines) {
     const s = ln.trim();
     if (!s) continue;
@@ -395,9 +408,15 @@ function parseWindow(file: string, stat: fs.Stats, maxBytes: number): TxInfo {
     const type = obj.type;
     const blocks = Array.isArray(obj.message?.content) ? obj.message.content : [];
     if (type === "assistant") {
-      for (const b of blocks) if (b?.type === "tool_use") lastUse = { id: b.id, name: b.name, answered: false };
+      for (const b of blocks) {
+        if (b?.type !== "tool_use") continue;
+        lastUse = { id: b.id, name: b.name, answered: false };
+        const ref = toolRef(b.input);
+        if (ref) info.toolRefs = [...(info.toolRefs ?? []), ref].slice(-MAX_TOOL_REFS);
+      }
     } else if (type === "user" && lastUse && !lastUse.answered) {
-      lastUse.answered = blocks.some((b: any) => b?.type === "tool_result" && b.tool_use_id === lastUse!.id);
+      const id = lastUse.id;
+      lastUse = { ...lastUse, answered: blocks.some((b: any) => b?.type === "tool_result" && b.tool_use_id === id) };
     }
 
     if (type === "ai-title" && typeof obj.aiTitle === "string" && obj.aiTitle.trim()) {
@@ -449,7 +468,72 @@ function parseWindow(file: string, stat: fs.Stats, maxBytes: number): TxInfo {
   }
 
   if (lastUse?.name === "AskUserQuestion" && !lastUse.answered) info.askPending = true;
-  return info;
+  else delete info.askPending;
+  return lastUse;
+}
+
+const MARK_BYTES = 64; // the bytes before a parse's end, compared on the next read to notice a rewrite
+
+/** Where a parse stopped, so the next parse of the file reads only what was appended since (parseAppended). */
+interface Tail {
+  end: number; // byte offset just past the last complete line read
+  ino: number; // another file under the same path is read again from its tail
+  mark: string; // the MARK_BYTES before `end` (latin1): other bytes there mean the file was rewritten
+  lastUse?: LastUse;
+}
+
+/** The Tail of each TxInfo parseTranscriptTail returned, for as long as the caller keeps that TxInfo (txCache). */
+const tails = new WeakMap<TxInfo, Tail>();
+
+interface Parsed {
+  info: TxInfo;
+  tail?: Tail;
+}
+
+/** The next read starts just past the last newline of `bytes`, or at the file start; undefined when neither is known. */
+function tailOf(bytes: Bytes, lastUse: LastUse | undefined): Tail | undefined {
+  const cut = bytes.buf.lastIndexOf(0x0a) + 1; // 0: no newline
+  if (cut === 0 && bytes.start > 0) return undefined; // a window inside one long line
+  return { end: bytes.start + cut, ino: bytes.ino, mark: bytes.buf.toString("latin1", Math.max(0, cut - MARK_BYTES), cut), lastUse };
+}
+
+/** Parse a single tail window of `maxBytes`. */
+function parseWindow(file: string, stat: fs.Stats, maxBytes: number): Parsed {
+  const info: TxInfo = {
+    convTs: 0,
+    convKind: "none",
+    activityTs: 0,
+    mtimeMs: stat.mtimeMs,
+    sizeBytes: stat.size,
+  };
+  let bytes: Bytes;
+  try {
+    bytes = readBytes(file, (size) => Math.max(0, size - maxBytes))!;
+  } catch {
+    return { info };
+  }
+  const lines = bytes.buf.toString("utf8").split("\n");
+  if (bytes.start > 0 && lines.length) lines.shift(); // drop incomplete leading line
+  return { info, tail: tailOf(bytes, foldLines(info, lines, undefined)) };
+}
+
+/**
+ * `prev` with the lines appended since `tail` folded in, reading only those
+ * bytes and the mark before them. A partial last line stays after the new
+ * end, so the next parse reads it again. undefined: read the tail again, since
+ * the file shrank, is another file, was rewritten or grew by more than a window.
+ */
+function parseAppended(file: string, stat: fs.Stats, prev: TxInfo, tail: Tail): Parsed | undefined {
+  let bytes: Bytes | undefined;
+  try {
+    bytes = readBytes(file, (size) => (size < tail.end || size - tail.end > MAX_TAIL ? undefined : tail.end - tail.mark.length));
+  } catch {
+    return undefined;
+  }
+  if (!bytes || bytes.ino !== tail.ino || bytes.buf.toString("latin1", 0, tail.mark.length) !== tail.mark) return undefined;
+  const info: TxInfo = { ...prev, mtimeMs: stat.mtimeMs, sizeBytes: stat.size };
+  const lastUse = foldLines(info, bytes.buf.toString("utf8", tail.mark.length).split("\n"), tail.lastUse);
+  return { info, tail: tailOf(bytes, lastUse) };
 }
 
 const HEAD_SCAN_BYTES = 256 * 1024;
@@ -500,8 +584,10 @@ function readHeadTitle(file: string): string | undefined {
 
 /**
  * Parse the tail of a transcript file. `prev` lets the caller skip re-parsing
- * unchanged files (cache by mtime + size). If a single line larger than the
- * tail window hides the newest conversational line, the window is grown once.
+ * unchanged files (cache by mtime + size); when `prev` came from this function,
+ * only the lines appended since are read (parseAppended). If a single line
+ * larger than the tail window hides the newest conversational line, the window
+ * is grown once.
  */
 export function parseTranscriptTail(file: string, prev?: TxInfo): TxInfo {
   let stat: fs.Stats;
@@ -514,18 +600,24 @@ export function parseTranscriptTail(file: string, prev?: TxInfo): TxInfo {
     return prev; // unchanged
   }
 
-  let info = parseWindow(file, stat, MAX_TAIL);
-  if (info.convKind === "none" && stat.size > MAX_TAIL) {
-    // The newest conversational line was probably bigger than the window.
-    info = parseWindow(file, stat, Math.min(stat.size, MAX_TAIL_GROW));
+  const tail = prev ? tails.get(prev) : undefined;
+  let parsed = prev && tail ? parseAppended(file, stat, prev, tail) : undefined;
+  if (!parsed || (parsed.info.convKind === "none" && stat.size > MAX_TAIL)) {
+    parsed = parseWindow(file, stat, MAX_TAIL);
+    if (parsed.info.convKind === "none" && stat.size > MAX_TAIL) {
+      // The newest conversational line was probably bigger than the window.
+      parsed = parseWindow(file, stat, Math.min(stat.size, MAX_TAIL_GROW));
+    }
+    const info = parsed.info;
+    if (!info.title) {
+      // The tail window missed the (early) ai-title line. Carry the previously
+      // known title forward, else pay for one cheap head read to recover it.
+      if (prev?.title) info.title = prev.title;
+      else if (stat.size > MAX_TAIL) info.title = readHeadTitle(file);
+    }
   }
-  if (!info.title) {
-    // The tail window missed the (early) ai-title line. Carry the previously
-    // known title forward, else pay for one cheap head read to recover it.
-    if (prev?.title) info.title = prev.title;
-    else if (stat.size > MAX_TAIL) info.title = readHeadTitle(file);
-  }
-  return info;
+  if (parsed.tail) tails.set(parsed.info, parsed.tail);
+  return parsed.info;
 }
 
 /** The newest assistant entry of a transcript (lastAssistantStop). */
@@ -755,6 +847,8 @@ function resolve(
     closingTiming,
     model,
     effort,
+    toolRefs: tx?.toolRefs,
+    lastPrompt: cleanTitle(hook?.prompt) || cleanTitle(tx?.lastPrompt),
     matchLabels,
     ...(aiTitle ? { aiTitle: true } : {}),
     ...(tx?.askPending ? { askPending: true } : {}),
@@ -882,6 +976,7 @@ export interface CollectOpts {
   phantomGraceSec?: number; // default 600
   pidAlive?: (pid?: number) => boolean | undefined; // injectable for tests
   resumePids?: Map<string, number>; // session id -> pid of the live terminal this window resumed it in
+  hasOpenTab?: (labels: string[]) => boolean; // a Claude Code tab with one of these titles is open in this window
   onError?: (sessionId: string, error: unknown) => void; // a candidate that throws is dropped and reported here; the others still show
 }
 
@@ -953,6 +1048,9 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
     if (!candidates.has(rt.sessionId) || !candidates.get(rt.sessionId))
       candidates.set(rt.sessionId, rt.path);
   }
+  // The cache keeps only the transcripts named now: one whose hook record went or that left the recent scan is forgotten.
+  const named = new Set(candidates.values());
+  for (const txPath of txCache.keys()) if (!named.has(txPath)) txCache.delete(txPath);
 
   const views: SessionView[] = [];
   for (const [sid, txPath] of candidates) {
@@ -987,7 +1085,12 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
         hook && hook.pid === undefined && resumedPid
           ? { ...hook, pid: resumedPid, state: hook.state === "ended" ? "idle" : hook.state }
           : hook;
-      const view = resolve(sid, status, tx, { now, txPath, effort, closingMarkers: opts.closingMarkers });
+      const resolveOpts = { now, txPath, effort, closingMarkers: opts.closingMarkers };
+      let view = resolve(sid, status, tx, resolveOpts);
+      // A window reload ends every tab's process (SessionEnd) and Claude Code starts it again only
+      // when the tab is shown: while its tab is open the session is the user's turn, not closed.
+      if (status && view.bucket === "ended" && status.state === "ended" && opts.hasOpenTab?.(view.matchLabels))
+        view = resolve(sid, { ...status, state: "idle" }, tx, resolveOpts);
       views.push(view);
     } catch (error) {
       opts.onError?.(sid, error); // a malformed record or transcript drops only its own session
@@ -1281,7 +1384,8 @@ export function upsertActiveAccount(
     email: acct.email,
     lastSeenTs: nowSec,
     tokenExpiresAt: acct.tokenExpiresAt ?? prev?.tokenExpiresAt,
-    tier: acct.tier ?? prev?.tier,
+    // A bare "team" (keychain only) never overwrites a known seat tier ("team_tier_1").
+    tier: acct.tier && !prev?.tier?.startsWith(`${acct.tier}_`) ? acct.tier : prev?.tier ?? acct.tier,
   };
   const rest = f.accounts.filter((a) => a.id !== acct.id);
   return { v: 1, accounts: [entry, ...rest].sort((a, b) => b.lastSeenTs - a.lastSeenTs), activeId: acct.id };

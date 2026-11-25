@@ -69,6 +69,12 @@ export interface SessionView {
   matchLabels: string[];
   /** The newest transcript tool_use is AskUserQuestion and no tool_result answered it yet. */
   askPending?: boolean;
+  /** Paths and commands of the newest tool calls, oldest first (project tagging). */
+  toolRefs?: string[];
+  /** The newest prompt text (project tagging fallback). */
+  lastPrompt?: string;
+  /** Project tag from the claudeSessionMonitor.projects rules (set by the extension). */
+  project?: string;
   /** notification_type of the hook's Notification event while that event is the session's newest signal. */
   notifType?: string;
 }

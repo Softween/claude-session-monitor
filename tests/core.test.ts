@@ -1619,7 +1619,7 @@ describe("a remote new session before its first prompt", () => {
       resumePids: new Map([[sid, 4242]]),
     });
 
-  it("is listed from its hook record; a status-line payload with its id is no record", () => {
+  it("is listed from its hook record; a status-line payload with its id is no record", async () => {
     const dir = path.join(tmp, "monitor");
     fs.mkdirSync(dir);
     fs.writeFileSync(path.join(dir, `${sid}.json`), JSON.stringify(record()));
@@ -1629,7 +1629,7 @@ describe("a remote new session before its first prompt", () => {
       JSON.stringify({ session_id: sid, transcript_path: record().transcript_path, cwd: "/Users/x/REPOS", model: { id: "claude-opus-5-5" } }),
     );
     fs.writeFileSync(path.join(dir, "tabs-debug.json"), JSON.stringify({ session_id: "other-session" }));
-    const hooks = readHookStatuses(dir);
+    const hooks = await readHookStatuses(dir);
     expect([...hooks.keys()]).toEqual([sid]);
     expect(hooks.get(sid)).toMatchObject({ state: "idle", ts: NOW_S - 30, pid: 4242 });
     const views = collect(hooks, true);

@@ -8,8 +8,8 @@ import {
   featureStatuses,
   healthFile,
   parseHealth,
+  BusyClock,
   removeHealth,
-  timed,
   writeHealth,
   type HealthDeps,
 } from "../src/health";
@@ -33,23 +33,15 @@ describe("DurationRing", () => {
     expect(ring.p95()).toBe(3); // the 500 ms refresh fell out
   });
 
-  it("timed() adds the duration of a call, a throwing one too", () => {
-    const ring = new DurationRing(10);
+  it("BusyClock counts the time between awaits, not the time a wait takes", async () => {
     let t = 100;
-    const clock = (): number => t;
-    timed(ring, () => (t += 7), clock);
-    expect(() =>
-      timed(
-        ring,
-        () => {
-          t += 3;
-          throw new Error("refresh broke");
-        },
-        clock,
-      ),
-    ).toThrow("refresh broke");
-    expect(ring.count).toBe(2);
-    expect(ring.p95()).toBe(7);
+    const clock = new BusyClock(() => t);
+    t += 5; // a slice before the first await
+    await clock.wait(new Promise<void>((resolve) => setTimeout(() => ((t += 50), resolve()), 0))); // reading, off the main thread
+    t += 3; // the slice after it
+    await expect(clock.wait(Promise.reject(new Error("read failed")))).rejects.toThrow("read failed");
+    t += 2;
+    expect(clock.total()).toBe(10);
   });
 });
 

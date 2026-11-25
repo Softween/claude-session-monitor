@@ -94,29 +94,57 @@ export const BUCKET_ORDER: Record<Bucket, number> = {
 // Hook status files
 // ---------------------------------------------------------------------------
 
-export function readHookStatuses(dir = MONITOR_DIR): Map<string, HookStatus> {
+/** What readHookStatuses read from each file, by file name, with the stat it read it at. */
+export type HookCache = Map<string, { mtimeMs: number; size: number; ino: number; record?: HookStatus }>;
+
+/** The hook record in file `f` of the monitor dir, else undefined. */
+function hookRecordOf(f: string, raw: string): HookStatus | undefined {
+  try {
+    const obj = JSON.parse(raw) as HookStatus;
+    const transcript = typeof obj?.transcript_path === "string" ? obj.transcript_path : "";
+    const belongsToCodex = obj?.provider === "codex" || /[/\\]\.codex[/\\]/.test(transcript);
+    // hook.py names a record `<session_id>.json`. Other files here may carry a
+    // session id too (statusline.sh's statusline-last-raw.json) but are no record.
+    if (obj && obj.session_id && f === `${obj.session_id}.json` && !belongsToCodex) return { ...obj, provider: "claude" };
+  } catch {
+    // ignore unreadable/partial files
+  }
+  return undefined;
+}
+
+/**
+ * The hook records in `dir`, read with fs.promises. The monitor's own state
+ * files (token stores, usage snapshots, accounts) are never read, and a file
+ * whose mtime, size and inode match its `cache` entry is not read again.
+ */
+export async function readHookStatuses(dir = MONITOR_DIR, cache: HookCache = new Map()): Promise<Map<string, HookStatus>> {
   const map = new Map<string, HookStatus>();
   let files: string[];
   try {
-    files = fs.readdirSync(dir);
+    files = await fs.promises.readdir(dir);
   } catch {
     return map;
   }
-  for (const f of files) {
-    if (!f.endsWith(".json")) continue;
-    try {
-      const raw = fs.readFileSync(path.join(dir, f), "utf8");
-      const obj = JSON.parse(raw) as HookStatus;
-      const transcript = typeof obj?.transcript_path === "string" ? obj.transcript_path : "";
-      const belongsToCodex = obj?.provider === "codex" || /[/\\]\.codex[/\\]/.test(transcript);
-      // hook.py names a record `<session_id>.json`. Other files here may carry a
-      // session id too (statusline.sh's statusline-last-raw.json) but are no record.
-      if (obj && obj.session_id && f === `${obj.session_id}.json` && !belongsToCodex) {
-        map.set(obj.session_id, { ...obj, provider: "claude" });
+  const names = files.filter((f) => f.endsWith(".json") && !isMonitorInfrastructureFile(f));
+  const listed = new Set(names);
+  for (const f of cache.keys()) if (!listed.has(f)) cache.delete(f);
+  await Promise.all(
+    names.map(async (f) => {
+      const file = path.join(dir, f);
+      try {
+        const st = await fs.promises.stat(file);
+        const hit = cache.get(f);
+        if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size && hit.ino === st.ino) return;
+        const record = hookRecordOf(f, await fs.promises.readFile(file, "utf8"));
+        cache.set(f, { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino, record });
+      } catch {
+        cache.delete(f); // gone or unreadable: read it again next time
       }
-    } catch {
-      // ignore unreadable/partial files
-    }
+    }),
+  );
+  for (const f of names) {
+    const record = cache.get(f)?.record;
+    if (record) map.set(record.session_id, record);
   }
   return map;
 }
@@ -133,9 +161,18 @@ const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 
 /** Read the effort keys from ~/.claude/settings.json ({} when missing or broken). */
 export function readEffortSettings(file = SETTINGS_FILE): EffortSettings {
+  try {
+    return parseEffortSettings(fs.readFileSync(file, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+/** The effort keys in the text of a settings.json ({} when it is empty or broken). */
+export function parseEffortSettings(text: string): EffortSettings {
   const str = (x: unknown): string | undefined => (typeof x === "string" && x.trim() ? x.trim() : undefined);
   try {
-    const v = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown> | null;
+    const v = JSON.parse(text) as Record<string, unknown> | null;
     const env = v?.env as Record<string, unknown> | undefined;
     const models: NonNullable<EffortSettings["models"]> = {};
     const ms = v?.modelSettings;
@@ -587,15 +624,17 @@ function readHeadTitle(file: string): string | undefined {
  * unchanged files (cache by mtime + size); when `prev` came from this function,
  * only the lines appended since are read (parseAppended). If a single line
  * larger than the tail window hides the newest conversational line, the window
- * is grown once.
+ * is grown once. `known` is the file's stat when the caller has it already
+ * (null: the file is missing).
  */
-export function parseTranscriptTail(file: string, prev?: TxInfo): TxInfo {
-  let stat: fs.Stats;
+export function parseTranscriptTail(file: string, prev?: TxInfo, known?: fs.Stats | null): TxInfo {
+  let stat: fs.Stats | null;
   try {
-    stat = fs.statSync(file);
+    stat = known === undefined ? fs.statSync(file) : known;
   } catch {
-    return prev ?? { convTs: 0, convKind: "none", activityTs: 0, mtimeMs: 0, sizeBytes: 0 };
+    stat = null;
   }
+  if (!stat) return prev ?? { convTs: 0, convKind: "none", activityTs: 0, mtimeMs: 0, sizeBytes: 0 };
   if (prev && prev.mtimeMs === stat.mtimeMs && prev.sizeBytes === stat.size) {
     return prev; // unchanged
   }
@@ -910,20 +949,21 @@ export function encodeProjectDir(cwd: string): string {
 }
 
 /**
- * Scan ~/.claude/projects for transcripts modified within `maxAgeMs`.
- * Skips claude-mem/observer dirs. Stat-only; cheap at ~30s cadence.
+ * Scan ~/.claude/projects for transcripts modified within `maxAgeMs`, with
+ * fs.promises, one project dir at a time. Skips claude-mem/observer dirs.
+ * Stat-only; cheap at ~30s cadence.
  */
-export function findRecentTranscripts(
+export async function findRecentTranscripts(
   maxAgeMs: number,
   limit: number,
   now: number,
   onlyCwd?: string,
   projectsRoot = PROJECTS_DIR,
-): RecentTranscript[] {
+): Promise<RecentTranscript[]> {
   const out: RecentTranscript[] = [];
   let dirs: fs.Dirent[];
   try {
-    dirs = fs.readdirSync(projectsRoot, { withFileTypes: true });
+    dirs = await fs.promises.readdir(projectsRoot, { withFileTypes: true });
   } catch {
     return out;
   }
@@ -936,20 +976,16 @@ export function findRecentTranscripts(
     const dirPath = path.join(projectsRoot, d.name);
     let files: string[];
     try {
-      files = fs.readdirSync(dirPath);
+      files = await fs.promises.readdir(dirPath);
     } catch {
       continue;
     }
-    for (const f of files) {
-      if (!f.endsWith(".jsonl")) continue;
-      const full = path.join(dirPath, f);
-      try {
-        const st = fs.statSync(full);
-        if (st.mtimeMs / 1000 >= cutoff) {
-          out.push({ sessionId: f.replace(/\.jsonl$/, ""), path: full, mtimeMs: st.mtimeMs });
-        }
-      } catch {
-        // ignore
+    const stats = await Promise.all(
+      files.filter((f) => f.endsWith(".jsonl")).map(async (f) => ({ f, st: await fs.promises.stat(path.join(dirPath, f)).catch(() => null) })),
+    );
+    for (const { f, st } of stats) {
+      if (st && st.mtimeMs / 1000 >= cutoff) {
+        out.push({ sessionId: f.replace(/\.jsonl$/, ""), path: path.join(dirPath, f), mtimeMs: st.mtimeMs });
       }
     }
   }
@@ -969,7 +1005,9 @@ export interface CollectOpts {
   maxAgeSec?: number;
   allowedEntrypoints?: string[]; // default DEFAULT_ENTRYPOINTS; [] = allow all
   workspaceCwd?: string; // when set, only sessions under this cwd
-  hookStatuses?: Map<string, HookStatus>; // injectable for tests; default readHookStatuses()
+  hookStatuses: Map<string, HookStatus>; // readHookStatuses()
+  readTx?: (txPath: string, prev?: TxInfo) => TxInfo; // default parseTranscriptTail
+  exists?: (p: string) => boolean; // default fs.existsSync
   showEnded?: boolean; // default false: closed/ended sessions are hidden entirely
   effortSettings?: EffortSettings; // injectable for tests; default readEffortSettings()
   closingMarkers?: boolean; // default false: no closing status line (claudeSessionMonitor.closingStatusMarkers)
@@ -1035,19 +1073,27 @@ function entrypointAllowed(ep: string | undefined, allowed: string[]): boolean {
   return allowed.includes(ep);
 }
 
-export function collectSessions(opts: CollectOpts): SessionView[] {
-  const now = opts.now;
-  const hooks = opts.hookStatuses ?? readHookStatuses();
-  const txCache = opts.txCache ?? new Map<string, TxInfo>();
-  const allowed = opts.allowedEntrypoints ?? DEFAULT_ENTRYPOINTS;
-  const effort = opts.effortSettings ?? readEffortSettings();
-
+/** Each session to show, with the transcript its hook record names, else the one the recent scan found. */
+export function sessionCandidates(hooks: Map<string, HookStatus>, extra: RecentTranscript[] = []): Map<string, string | undefined> {
   const candidates = new Map<string, string | undefined>();
   for (const [sid, h] of hooks) candidates.set(sid, h.transcript_path);
-  for (const rt of opts.extraTranscripts ?? []) {
+  for (const rt of extra) {
     if (!candidates.has(rt.sessionId) || !candidates.get(rt.sessionId))
       candidates.set(rt.sessionId, rt.path);
   }
+  return candidates;
+}
+
+export function collectSessions(opts: CollectOpts): SessionView[] {
+  const now = opts.now;
+  const hooks = opts.hookStatuses;
+  const txCache = opts.txCache ?? new Map<string, TxInfo>();
+  const allowed = opts.allowedEntrypoints ?? DEFAULT_ENTRYPOINTS;
+  const effort = opts.effortSettings ?? readEffortSettings();
+  const readTx = opts.readTx ?? parseTranscriptTail;
+  const exists = opts.exists ?? ((p: string) => fs.existsSync(p));
+
+  const candidates = sessionCandidates(hooks, opts.extraTranscripts);
   // The cache keeps only the transcripts named now: one whose hook record went or that left the recent scan is forgotten.
   const named = new Set(candidates.values());
   for (const txPath of txCache.keys()) if (!named.has(txPath)) txCache.delete(txPath);
@@ -1058,18 +1104,18 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
       let tx: TxInfo | undefined;
       if (txPath) {
         const prev = txCache.get(txPath);
-        tx = parseTranscriptTail(txPath, prev);
+        tx = readTx(txPath, prev);
         txCache.set(txPath, tx);
       }
       const hook = hooks.get(sid);
-      const hasTranscript = !!(txPath && fs.existsSync(txPath));
+      const hasTranscript = !!(txPath && exists(txPath));
       // A session this window started in a terminal (a remote new session waiting for
       // its first prompt) is no probe and no phantom while that terminal's process runs.
       const resumedPid = opts.resumePids?.get(sid);
       const ownRunning = resumedPid !== undefined && (opts.pidAlive ?? pidAlive)(resumedPid) === true;
 
       // Drop phantom hook records (account-switch tab bursts that never got a transcript).
-      if (hook && !hasTranscript && !ownRunning && isPhantom(hook, now, { graceSec: opts.phantomGraceSec, alive: opts.pidAlive }))
+      if (hook && !hasTranscript && !ownRunning && isPhantom(hook, now, { graceSec: opts.phantomGraceSec, alive: opts.pidAlive, exists }))
         continue;
       // Hold back a just-started session without a transcript (see isUnsettledStart).
       if (hook && !hasTranscript && !ownRunning && isUnsettledStart(hook, now, { alive: opts.pidAlive })) continue;
@@ -1241,7 +1287,18 @@ export function readLimits(file = LIMITS_FILE): RawLimits | undefined {
   }
 }
 
+let historyMemo: { file: string; mtimeMs: number; size: number; points: RawLimits[] } | undefined;
+
+/** The newest `maxPoints` points of the history's last 256 KB, parsed again only when its mtime or size changed. */
 export function readLimitsHistory(maxPoints = 240, file = LIMITS_HISTORY): RawLimits[] {
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(file);
+  } catch {
+    return [];
+  }
+  const memo = historyMemo;
+  if (memo && memo.file === file && memo.mtimeMs === st.mtimeMs && memo.size === st.size) return memo.points.slice(-maxPoints);
   let text = "";
   let partialFirst = false;
   try {
@@ -1263,6 +1320,7 @@ export function readLimitsHistory(maxPoints = 240, file = LIMITS_HISTORY): RawLi
       // ignore
     }
   }
+  historyMemo = { file, mtimeMs: st.mtimeMs, size: st.size, points: out };
   return out.slice(-maxPoints);
 }
 

@@ -38,7 +38,7 @@ export interface FeatureStages {
 
 /** The stage names extension.ts gives the stage guard, by feature. */
 export const FEATURES: Readonly<Record<string, FeatureStages>> = {
-  sessions: { stages: ["first refresh", "collect", "session drops", "sessions", "stuck check", "transitions", "sampling"] },
+  sessions: { stages: ["refresh", "collect", "session drops", "sessions", "stuck check", "transitions", "sampling"] },
   limits: { stages: ["limits"] },
   remote: { start: "remote bridge start", stages: ["remote bridge"] },
   autoResume: { stages: ["auto-resume"] },

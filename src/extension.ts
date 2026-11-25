@@ -3356,6 +3356,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       } catch {
         /* ignore */
       }
+      if (disposed) return; // the window closed during an await: no file write or network call after it
       lastRecentScan = now;
     }
 
@@ -3374,6 +3375,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       lastTokenScan = now;
       try {
         const tx7 = await clock.wait(findRecentTranscripts(7 * 86400 * 1000, 400, now));
+        if (disposed) return;
         tokenUsage = scanTokenUsage(tx7, now, { persist: allowed("sharedFiles") }); // observer mode reads the shared token-count cache, never writes it
       } catch {
         /* ignore */
@@ -4720,7 +4722,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     void overseer.tick().catch((e: unknown) => stages.fail("overseer", e));
   };
   // The first write waits for the first refresh, so the health file and errors.json carry what it found.
-  void stages.safe("first refresh", refresh)?.then(() => {
+  void refresh().then(() => {
     if (!disposed) observe();
   });
   const observeTimer = setInterval(observe, HEALTH_EVERY_MS);

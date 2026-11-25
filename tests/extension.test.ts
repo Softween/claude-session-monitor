@@ -2694,8 +2694,15 @@ describe("a window that closes during a refresh", () => {
     vi.restoreAllMocks();
   });
 
-  it("stops the refresh at its next await: no session collection and no file write after it", async () => {
+  it("stops the refresh at its next await: no session collection and no shared-file write after it", async () => {
     const collect = vi.spyOn(SessionCollector.prototype, "collect");
+    // A hook record older than 12 h: the refresh's monitor-dir cleanup, after the transcript scan, would delete it.
+    const MON = `${HOME}/.claude/session-monitor`;
+    const stale = `${MON}/e7ec778d-bd90-48a0-8fad-0dbd854ddb1e.json`;
+    fs.mkdirSync(MON, { recursive: true });
+    fs.writeFileSync(stale, JSON.stringify({ session_id: "e7ec778d-bd90-48a0-8fad-0dbd854ddb1e", state: "ended", ts: 0 }));
+    const old = new Date(Date.now() - 13 * 3600 * 1000);
+    fs.utimesSync(stale, old, old);
     lastCtx = mkCtx();
     ext.activate(lastCtx); // the first refresh starts and waits on its transcript scan
     disposeCtx(lastCtx);
@@ -2703,6 +2710,8 @@ describe("a window that closes during a refresh", () => {
     watchRec.writes.length = 0;
     await settleAsync(10);
     expect(collect).not.toHaveBeenCalled();
-    expect(watchRec.writes).toEqual([]);
+    expect(fs.existsSync(stale)).toBe(true);
+    // The debug log is left out: activation's own async work may still append a line to it.
+    expect(watchRec.writes.filter((w) => !w.endsWith("/csm-debug.log"))).toEqual([]);
   });
 });

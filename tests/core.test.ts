@@ -121,6 +121,22 @@ describe("humanizeAge", () => {
 
 // --- parseTranscriptTail ----------------------------------------------------
 
+describe("toolRefs (project tagging)", () => {
+  it("keeps the paths and commands of tool calls, oldest first", () => {
+    const use = (id: string, sec: number, input: Record<string, unknown>) => ({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", id, name: "Bash", input }] },
+      timestamp: iso(sec),
+    });
+    const tx = writeTranscript("refs.jsonl", [
+      use("a", NOW - 30, { file_path: "/r/glossgo/glossgo-fund/a.ts", content: "ignored body" }),
+      use("b", NOW - 20, { command: "cd /r/external/askdalam && ls" }),
+      use("c", NOW - 10, { questions: [] }),
+    ]);
+    expect(parseTranscriptTail(tx).toolRefs).toEqual(["/r/glossgo/glossgo-fund/a.ts", "cd /r/external/askdalam && ls"]);
+  });
+});
+
 describe("pending AskUserQuestion (askPending) and the notification type (notifType)", () => {
   const ask = (id: string, sec: number, name = "AskUserQuestion") => ({
     type: "assistant",
@@ -980,6 +996,20 @@ describe("resolve / collectSessions branch coverage", () => {
     // A pid of the hook's own wins over the terminal's.
     expect(collect([{ ...ended, state: "idle", pid: 777 }], { resumePids }).find((x) => x.sessionId === "rs")?.pid).toBe(777);
   });
+
+  it("an ended session whose Claude Code tab is still open (a window reload) shows as your turn", () => {
+    const p = writeTranscript("rl.jsonl", [
+      { type: "ai-title", aiTitle: "GetFund v8 ana sayfa", timestamp: iso(NOW - 90) },
+      { type: "assistant", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "bitti" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 80) },
+    ]);
+    const ended: HookStatus = { session_id: "rl", state: "ended", ts: NOW - 60, cwd: "/repo", transcript_path: p };
+    const tabOpen = (labels: string[]) => labels.includes("GetFund v8 ana sayfa");
+    expect(collect([ended]).find((x) => x.sessionId === "rl")).toBeUndefined(); // no tab check: hidden as before
+    expect(collect([ended], { hasOpenTab: () => false }).find((x) => x.sessionId === "rl")).toBeUndefined(); // tab closed
+    const v = collect([ended], { hasOpenTab: tabOpen }).find((x) => x.sessionId === "rl");
+    expect(v).toMatchObject({ bucket: "attention", sub: "your turn", title: "GetFund v8 ana sayfa" });
+    expect(v?.pid).toBeUndefined(); // no process until the tab is shown
+  });
 });
 
 describe("parseClosingStatus", () => {
@@ -1428,6 +1458,16 @@ describe("account registry", () => {
     expect(readAccountsFile(file)).toEqual({ v: 1, accounts: [], activeId: undefined });
     fs.writeFileSync(file, JSON.stringify({ accounts: [{ id: 5 }, { id: "ok", email: "x@y.z", lastSeenTs: 2 }] }));
     expect(readAccountsFile(file).accounts).toEqual([{ id: "ok", email: "x@y.z", lastSeenTs: 2 }]);
+  });
+
+  it("upsertActiveAccount keeps a known Team seat tier when the keychain only says team", () => {
+    let f: AccountsFile = { v: 1, accounts: [{ id: "t", email: "t@x.com", lastSeenTs: 1, tier: "team_tier_1" }] };
+    f = upsertActiveAccount(f, { id: "t", email: "t@x.com", tier: "team" }, 2);
+    expect(f.accounts[0].tier).toBe("team_tier_1");
+    f = upsertActiveAccount(f, { id: "t", email: "t@x.com", tier: "default_claude_max_20x" }, 3);
+    expect(f.accounts[0].tier).toBe("default_claude_max_20x");
+    f = upsertActiveAccount({ v: 1, accounts: [] }, { id: "n", email: "n@x.com", tier: "team" }, 4);
+    expect(f.accounts[0].tier).toBe("team");
   });
 
   it("upsertActiveAccount switches the active id, keeps history, and preserves expiry", () => {

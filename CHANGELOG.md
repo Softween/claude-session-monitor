@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.45.0
+- **An "all" row closes the account table.** Under the last login it shows how many Claude logins can take work now (`8/11 ready`), their summed monthly plan price, and for every column (Session, Weekly, Fable, …) the share of the whole pool already used. Each login weighs by its plan price, so a $200 login counts eight times a $25 seat; when any plan price is unknown every login counts equally. Codex and skipped logins stay out, and a column averages only the logins that report that gauge.
+
+## 2.44.0
+- **A phone's new session opens as a Claude Code tab.** A remote `newSession` in this window's workspace folder now opens a Claude Code editor tab with the first message in its input and presses Enter there, instead of starting `claude` in a background terminal; the answer still names the new session id (`new session <id> started in <folder> in a Claude Code tab`). Other folders, or a first message while this window is not focused, still use the terminal, and the log line says why.
+- **The first message is sent, not left in the input.** claude drops an Enter that arrives while its startup hooks still run, so a first message written 2 s after the session start could sit unsent in the prompt. Enter is now pressed again every 2 s, for up to 20 s, until the transcript shows the message, in the terminal and in the tab.
+
+## 2.43.3
+- **Sessions stay listed after Developer: Reload Window.** A reload ends every Claude Code tab's process, and Claude Code starts it again only when the tab is shown, so each session's status record said `ended` and the list hid it until its tab was opened by hand. A session whose Claude Code tab is still open in the window now shows as your turn, without a process until the tab is shown; clicking its row opens the tab, which starts it.
+
+## 2.43.2
+- **The project strip always shows `other`.** The chip for sessions no project pattern matches appeared only while at least one such session existed, so with every open session tagged it was missing while a named project with no sessions still showed `0`. It now shows with its count, `0` included, like the named projects.
+
+## 2.43.1
+- **A click opens a session that runs behind a process wrapper.** With `claudeCode.claudeProcessWrapper` set (for example `prompt-split`), each tab's `claude` process is a child of the wrapper, not of the extension host, so no session counted as this window's own: a click fell back to the tab label, and a session without an AI title (its row reads "session 1a2b3c4d") ended in "has no open tab or terminal in this window" although its tab was open. Tab waking after a restart missed the same sessions. A session now counts as this window's when the extension host is its parent or sits at most three wrapper processes above it.
+
+## 2.43.0
+- **Usage Limits shows the quota engine's level.** Under the claude-switch lines a new line reads `~/.claude/state/quota-engine/state.json` (written by `~/.claude/bin/quota_engine.py` every 15 minutes): the level (tight -1, normal 0, spare +1, plenty +2), how many times today's pace the account pool carries for 7 days without a stop, and what the level does (main model Opus, effort as set, effort +1, effort +1 with Fable on). Spare and plenty read green, tight orange; the line hides when the file is missing or over an hour old, the same age the engine's consumers accept.
+
+## 2.42.0
+- **Sessions are tagged and filtered by project.** A new setting, `claudeSessionMonitor.projects`, lists projects with case-insensitive patterns. Each session gets the first project whose pattern matches its cwd, else its title (when it names one project), else the paths and commands of its last 40 tool calls (most hits wins), else its last prompt. The row shows the tag in its project color where the folder name was, and a strip under the provider filter ("All projects · getfund 12 · glossgo 9 · other 6") shows one project at a time. With no rules set, nothing changes.
+
+## 2.41.1
+- **An offline Mac is said so in Usage Limits.** When claude-switch logged a network failure in the last 15 minutes and no usage reading arrived after it, the block at the top shows a yellow line, "offline: usage API unreachable (last try HH:MM) · last reading N min ago". Before, a Refresh click during an outage changed nothing visible and the stale "N m ago" ages read as a broken button. The line goes away with the first reading after the failure.
+
+## 2.41.0
+- **Usage Limits reads as one dense table, priced and sorted by plan.** Each login is a single 19 px row (25-30 accounts fit without scrolling) under a column header: a price tag ($200 Max, $125 Team Premium, $25 Team Standard, colour by tier, full plan in its tooltip), rank and name, status, then aligned Session / Weekly / scoped-weekly columns with a mini bar each and the skip box. Rows run from the costliest plan down, then by claude-switch priority; the active login is tinted and ready logins show a green chip.
+- **Team seats are told apart.** The plan tier now reads `oauthAccount.seatTier` ("team_tier_1" premium, "team_standard"), from the claude-switch vault for every login, so a never-active account gets its price too; a bare "team" from the keychain no longer overwrites a known seat tier.
+
 ## 2.40.1
 - **A click reaches the session's tab, whatever the tab is called.** A session that never gets an AI title (common when its first prompt is a single word) keeps that first prompt as its Claude Code tab label while its row shows the newest prompt, so a click could end in "has no open tab or terminal in this window" although the tab was open, and several such tabs can share one label. When this window's Claude Code runs the session, the click now asks Claude Code to show it by its id, which finds the right tab. Sessions that run elsewhere keep the lookup by tab label and terminal.
 

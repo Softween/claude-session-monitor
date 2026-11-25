@@ -148,12 +148,15 @@ export interface AccountView {
 
 /**
  * Human plan label from the Claude Code keychain payload (`rateLimitTier`, e.g.
- * "default_claude_max_20x", falling back to `subscriptionType`). Prices are the
- * public monthly list prices; unknown tiers surface as-is rather than guessed.
+ * "default_claude_max_20x", falling back to `subscriptionType`) or a Team seat
+ * tier ("team_tier_1" premium, "team_standard"). Prices are the public monthly
+ * list prices (Team seats billed monthly); unknown tiers surface as-is rather than guessed.
  */
 export function claudePlanLabel(tier: string | null | undefined, subscription?: string | null): string | null {
   const t = (tier ?? "").toLowerCase();
-  if (t === "team") return "Team";
+  if (t === "team_tier_1") return "$125 Team Premium";
+  if (t === "team_standard") return "$25 Team Standard";
+  if (t === "team" || t.startsWith("team_")) return "Team";
   if (t === "enterprise") return "Enterprise";
   if (t.includes("max_20x")) return "$200 Max";
   if (t.includes("max_5x")) return "$100 Max";
@@ -166,14 +169,22 @@ export function claudePlanLabel(tier: string | null | undefined, subscription?: 
   return null;
 }
 
+/** Monthly price in a plan label ("$200 Max" -> 200), null when it names none. */
+export function planPrice(label: string | null | undefined): number | null {
+  const m = /\$\s*(\d+(?:\.\d+)?)/.exec(label ?? "");
+  return m ? Number(m[1]) : null;
+}
+
 /**
  * The plan-identifying tier from the keychain payload. Team and Enterprise seats
  * carry a Max-style `rateLimitTier` (e.g. "default_claude_max_5x"), so for them
- * `subscriptionType` names the plan; otherwise `rateLimitTier`, falling back to
+ * the seat tier (`oauthAccount.seatTier`, e.g. "team_tier_1") names the plan when
+ * known, else `subscriptionType`; otherwise `rateLimitTier`, falling back to
  * `subscriptionType`.
  */
-export function claudePlanTier(rateLimitTier: unknown, subscriptionType: unknown): string | undefined {
+export function claudePlanTier(rateLimitTier: unknown, subscriptionType: unknown, seatTier?: unknown): string | undefined {
   const sub = typeof subscriptionType === "string" ? subscriptionType : "";
+  if (/^team$/i.test(sub) && typeof seatTier === "string" && /^team_[a-z0-9_]+$/i.test(seatTier)) return seatTier.toLowerCase();
   if (/^(team|enterprise)$/i.test(sub)) return sub;
   if (typeof rateLimitTier === "string" && rateLimitTier) return rateLimitTier;
   return sub || undefined;

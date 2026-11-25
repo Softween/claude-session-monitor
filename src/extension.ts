@@ -17,7 +17,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, displayNames, excludedEmails, excludedOf, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, readPanel, renderSwitchBlock, renderSwitchActivity, headerGauges, switchInstalled, useTargets, type CardHeader } from "./switchPanel";
+import { SWITCH_CLI, SWITCH_PANEL_FILE, SWITCH_STATE_DIR, allBadges, readQuotaEngine, displayNames, excludedEmails, excludedOf, headerChip, installedPanel, mergePanelAccounts, orderCards, panelFresh, poolSummary, readPanel, renderSwitchBlock, renderSwitchActivity, headerGauges, switchInstalled, useTargets, type CardHeader, type PoolSummary } from "./switchPanel";
 import { gaugeColumn } from "./compact";
 import { calibrate } from "./burn";
 import { BURN_WINDOWS, DEFAULT_BURN_WINDOW_MS, buildBurnPayload, burnShares, gaugeSamplesFromHistory, resolveScale, type BurnPayload } from "./burnPayload";
@@ -46,10 +46,12 @@ import { parseParentPid, pickSessionTerminal, pickUniqueLabel, type TerminalCand
 import { ResumeRegistry, isClaudeCliCommand, isClaudeSessionCommand } from "./resumeRegistry";
 import { allowedCwds, mergeSeen, withoutPaths } from "./remoteCwds";
 import { startNewSession } from "./remoteNewSession";
+import { startNewTab, type NewTabDeps } from "./remoteNewTab";
 import { buildSeedBlob, decidePassiveSource, keeperWaiting, readCliVault, shouldSeed, writeCliVault } from "./cliVault";
 import { OPEN_COMMAND, TabWaker, nodeProbes, ownSessions, readLiveSessions, readParentPids, summaryText } from "./wakeTabs";
 import { ContinuityServer, continuityDir, readText, storageDir, windowKey, writeTextAtomic } from "./continuity";
 import { focusGroupBySlot, revealTabByIndex, type TabFocusDeps } from "./tabFocus";
+import { OTHER_PROJECT, projectOf, readProjectRules } from "./projects";
 import { OVERRIDES_KEY, limitedToResume, readOverrides, rowAutoResume, settledOverrides, sweepQueue, withOverride } from "./autoResume";
 import { submitAnswer } from "./answers";
 import { nothingTyped, typeIntoPrompt, type TypeResult } from "./keystrokeTyping";
@@ -185,10 +187,12 @@ import {
   nextUsageBackoffSec,
   accountPillLabels,
   claudePlanLabel,
+  planPrice,
   claudePlanTier,
   codexPlanLabel,
   filterHistoryForAccount,
   topSessionRows,
+  labelsMatchStrict,
   type AccountView,
   type SessionTokenRow,
   type BurnEta,
@@ -289,6 +293,8 @@ interface SessionRow {
   effort: string; // reasoning effort ("" when unknown)
   lastMs: number; // last activity epoch ms — age ticks client-side
   dir: string;
+  project: string; // project tag ("" when no project rules are set or none matched)
+  projectIdx: number; // the tag's color slot (-1: none)
   cpu: number | null;
   rssMb: number | null;
   cpuHog: boolean;
@@ -313,8 +319,16 @@ interface SessionsPayload {
   filter: string; // active list filter label, "" when none
   providerCounts: ProviderCounts;
   providerFilter: AgentProvider | "all";
+  projects: ProjectStrip | null; // null when no project rules are set
   health: ProviderHealth[];
   emptyMessage: string;
+}
+
+/** The project filter strip: rule names in order, sessions per project (and "other"), the active filter. */
+interface ProjectStrip {
+  names: string[];
+  counts: Record<string, number>;
+  filter: string; // "all", a rule name or "other"
 }
 
 class SessionsView implements vscode.WebviewViewProvider {
@@ -360,6 +374,9 @@ function sessionsHtml(): string {
     padding:2px 8px; font:inherit; font-size:11px; cursor:pointer; }
   .pfilter:hover { color:var(--vscode-foreground); }
   .pfilter.active { color:var(--vscode-foreground); background:var(--vscode-badge-background, rgba(127,127,127,.25)); }
+  .projrow { flex-wrap:wrap; padding-top:0; }
+  .pfilter.proj.active, .ptag { color:var(--pc, var(--vscode-foreground)); }
+  .ptag { font-weight:600; }
   .totals { margin-left:auto; font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .health { padding:2px 12px 6px; color:var(--vscode-descriptionForeground); font-size:10px; line-height:1.4; }
   /* Group header: quiet label + count; a chevron only when it is collapsible. */
@@ -433,6 +450,19 @@ function fmtAge(ms){
   return Math.floor(s/86400)+'d';
 }
 function fmtMb(mb){ return mb >= 1024 ? (mb/1024).toFixed(1)+'GB' : mb+'MB'; }
+const PCOLOR = ['var(--vscode-charts-blue)','var(--vscode-charts-orange)','var(--vscode-charts-green)','var(--vscode-charts-purple)','var(--vscode-charts-yellow)','var(--vscode-charts-red)'];
+function projectStrip(p){
+  if(!p) return '';
+  const chip = (key, label, i, n) => '<button class="pfilter proj'+(p.filter===key?' active':'')+'" data-project="'+esc(key)+'" aria-pressed="'+(p.filter===key)+'"'
+    + (i>=0?' style="--pc:'+PCOLOR[i % PCOLOR.length]+'"':'')+'>'+esc(label)+' '+n+'</button>';
+  let total = 0;
+  for(const k in p.counts) total += p.counts[k];
+  return '<div class="top projrow" role="toolbar" aria-label="Session project filter" data-testid="csm-project-filter">'
+    + chip('all','All projects',-1,total)
+    + p.names.map((n,i)=>chip(n,n,i,p.counts[n]||0)).join('')
+    + chip('other','other',-1,p.counts.other||0)
+    + '</div>';
+}
 function metaLine(r){
   const bits = [];
   const due = r.due ? 'bitiş '+r.due : '';
@@ -441,7 +471,8 @@ function metaLine(r){
   if(extra) bits.push('<span class="sub">'+esc(extra)+'</span>');
   if(r.model) bits.push(esc(r.model)+(r.effort?' · '+esc(r.effort):''));
   else bits.push(esc(r.providerLabel));
-  if(r.dir) bits.push(esc(r.dir));
+  if(r.project) bits.push('<span class="ptag" style="--pc:'+PCOLOR[r.projectIdx % PCOLOR.length]+'">'+esc(r.project)+'</span>');
+  else if(r.dir) bits.push(esc(r.dir));
   if(r.cpuHog && r.cpu!=null) bits.push('<span class="hot">cpu '+r.cpu+'%</span>');
   if(r.rssMb!=null && r.rssMb>=1024) bits.push(esc(fmtMb(r.rssMb)));
   return bits.join(' · ');
@@ -481,6 +512,7 @@ function render(){
     + (enabled.has('codex')?pill('codex','Codex',last.providerCounts.codex):'')
     + (totals.length?'<span class="totals num">'+totals.join(' · ')+'</span>':'')
     + '</div>';
+  h += projectStrip(last.projects);
   const health = (last.health||[]).filter(x=>x.state!=='ready' && x.message);
   if(health.length) h += '<div class="health">'+health.map(x=>'<div><b>'+esc(x.provider==='codex'?'Codex':'Claude')+':</b> '+esc(x.message)+'</div>').join('')+'</div>';
   if(!last.groups.length){
@@ -505,7 +537,8 @@ document.getElementById('root').addEventListener('click', (ev) => {
   while(el && el !== ev.currentTarget && !(el.classList && (el.classList.contains('pfilter') || el.classList.contains('act') || el.classList.contains('row') || el.classList.contains('fold')))) el = el.parentElement;
   if(!el || el === ev.currentTarget) return;
   if(el.classList.contains('pfilter')){
-    vscodeApi.postMessage({ type: 'filterProvider', id: el.dataset.provider });
+    if(el.dataset.project) vscodeApi.postMessage({ type: 'filterProject', id: el.dataset.project });
+    else vscodeApi.postMessage({ type: 'filterProvider', id: el.dataset.provider });
     return;
   }
   if(el.classList.contains('fold')){
@@ -616,6 +649,7 @@ interface LimitsPayload {
   switchBadges?: Record<string, { rank?: number; loginNeeded?: string }>; // by account email
   showTokenStats?: boolean; // render the Tokens row + Models block (claudeSessionMonitor.showTokenStats)
   panelFresh?: boolean; // claude-switch owns switching: simplified cards, no Rotate
+  pool?: PoolSummary; // the table's "all accounts" row (fresh panel, 2+ Claude logins)
   ui?: { tab: LimitsTab; expandedAccounts: Record<string, boolean> }; // persisted in workspaceState
   useEmails?: string[]; // non-active accounts the panel can switch to
   usePending?: string; // email `claude-switch use` is switching to right now (until it exits or the 90 s UI timeout)
@@ -1054,6 +1088,9 @@ function limitsHtml(): string {
   .swblock { padding:0 0 4px; margin-bottom:0; border-bottom:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); }
   .swline { font-size:11px; line-height:1.3; overflow-wrap:anywhere; }
   .swline.sw-hint, .swline.sw-info { color: var(--vscode-descriptionForeground); }
+  .swline.sw-q-up { color: var(--vscode-charts-green); }
+  .swline.sw-q-tight { color: var(--vscode-charts-orange); }
+  .swline.sw-offline { color: var(--vscode-charts-yellow, #e6b800); }
   .swline.sw-error, .swline.sw-needsLogin { color: var(--vscode-descriptionForeground); }
   .swrank { color: var(--vscode-descriptionForeground); font-size:11px; }
   .clogin { color: var(--vscode-charts-red, #f14c4c); font-size:10px; font-weight:600; }
@@ -1110,26 +1147,49 @@ function limitsHtml(): string {
   .bmore { padding:3px 0; font-size:11px; color: var(--vscode-descriptionForeground); }
   .bnote { padding:8px 0 10px; font-size:10px; line-height:1.4; color: var(--vscode-descriptionForeground); }
   .bempty { padding:14px 0; color: var(--vscode-descriptionForeground); line-height:1.5; }
-  /* Collapsed card = one 16px line + 4px padding top and bottom + 1px separator = 25px. */
-  .card.ccard { padding:4px 0; }
-  .card.ccard:first-child { padding-top:0; }
+  /* Collapsed card = one table row: 16px line + 1px padding top and bottom + 1px hairline = 19px, so 25-30 logins fit. */
+  .card.ccard { padding:1px 0; border-top:1px solid color-mix(in srgb, var(--vscode-editorWidget-border, rgba(127,127,127,.25)) 55%, transparent); }
+  .card.ccard:first-child, .lhead + .card.ccard { border-top:0; }
+  .card.ccard.act { background: color-mix(in srgb, var(--vscode-charts-green, #4caf50) 9%, transparent); border-radius:3px; }
+  .card.ccard:not(.act) .chrow:hover { background: var(--vscode-list-hoverBackground, rgba(127,127,127,.1)); border-radius:3px; }
   .chdr { display:flex; align-items:center; gap:6px; cursor:pointer; min-width:0; overflow:hidden; height:16px; line-height:16px; user-select:none; }
   .chdr { container-type:inline-size; }
   .chdr .ctitle { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .chdr .chip { flex:none; }
   .chdr .cold { flex:none; font-size:10px; color: var(--vscode-charts-yellow, #cca700); white-space:nowrap; }
-  .chdr .chev { color: var(--vscode-descriptionForeground); font-size:10px; width:10px; flex:none; }
-  .chdr .cgauges { margin-left:auto; flex:none; font-size:11px; white-space:nowrap; }
-  .chdr .cgauges .hot { color: var(--vscode-charts-red, #f14c4c); }
-  .chdr .gs { display:none; }
-  @container (max-width: 360px) { .chdr .gl { display:none; } .chdr .gs { display:inline; } }
+  .chdr .chev, .lhead .chev { color: var(--vscode-descriptionForeground); font-size:10px; width:10px; flex:none; }
+  .ptag, .lhp { flex:none; width:36px; text-align:center; font-family: var(--vscode-editor-font-family, monospace); font-size:10px; font-weight:700; line-height:14px; border-radius:3px; }
+  .ptag.phi { color: var(--vscode-charts-purple, #b180d7); background: color-mix(in srgb, var(--vscode-charts-purple, #b180d7) 20%, transparent); }
+  .ptag.pmid { color: var(--vscode-charts-blue, #3794ff); background: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 18%, transparent); }
+  .ptag.plo { color: var(--vscode-descriptionForeground); background: color-mix(in srgb, var(--vscode-foreground) 10%, transparent); }
+  .ptag.pnone { color: var(--vscode-descriptionForeground); font-weight:400; overflow:hidden; }
+  .chdr .cgauges, .lhg { margin-left:auto; flex:none; display:flex; gap:6px; font-size:11px; white-space:nowrap; }
+  .hg, .gnil, .lhc { width:76px; flex:none; display:flex; align-items:center; justify-content:flex-end; gap:4px; }
+  .hg .gl, .hg .gs { display:none; }
+  .hg.zero { color: var(--vscode-descriptionForeground); }
+  .hg.warn { color: var(--vscode-charts-yellow, #cca700); }
+  .hg.hot { color: var(--vscode-charts-red, #f14c4c); font-weight:600; }
+  .hgb { order:-1; width:34px; height:3px; border-radius:2px; overflow:hidden; background: color-mix(in srgb, var(--vscode-foreground) 12%, transparent); }
+  .hgb b { display:block; height:100%; background: currentColor; opacity:.75; }
+  .hg.zero .hgb b { display:none; }
+  .lhead { display:flex; align-items:center; gap:6px; height:15px; padding-bottom:1px; font-size:10px; color: var(--vscode-descriptionForeground); border-bottom:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); margin-top:4px; }
+  .lhp { font-family: inherit; font-weight:400; }
+  .lhn { flex:1; min-width:0; }
+  .lhg { font-size:10px; }
+  .lhc { justify-content:flex-end; }
+  .lhs, .skipnil { flex:none; width:22px; text-align:center; }
+  .card.ccard.rdy .chip { color: var(--vscode-charts-green, #4caf50); }
+  .card.ccard.pool { border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.25)); margin-top:2px; padding-top:2px; font-weight:600; }
+  .card.ccard.pool .chdr { cursor:default; }
+  .card.ccard.pool .chip.prdy { color: var(--vscode-charts-green, #4caf50); }
+  @media (max-width: 440px) { .hgb { display:none; } .hg, .gnil, .lhc { width:38px; } }
   .chip { font-size:10px; color: var(--vscode-descriptionForeground); white-space:nowrap; }
   .chip.login { color: var(--vscode-charts-red, #f14c4c); font-weight:600; }
   /* Skip box: outside the role=button header so it never toggles the card; an excluded header is dimmed. */
   .chrow { display:flex; align-items:center; gap:6px; min-width:0; }
   .chrow .chdr { flex:1; min-width:0; }
   .chdr.excl { opacity:.55; }
-  .skipbox { flex:none; display:flex; align-items:center; gap:3px; font-size:10px; line-height:16px; color: var(--vscode-descriptionForeground); cursor:pointer; user-select:none; }
+  .skipbox { flex:none; width:22px; justify-content:center; display:flex; align-items:center; gap:3px; font-size:10px; line-height:16px; color: var(--vscode-descriptionForeground); cursor:pointer; user-select:none; }
   .skipbox input { margin:0; width:11px; height:11px; cursor:pointer; accent-color: var(--vscode-checkbox-background, auto); }
   body.vscode-dark .skipbox input { color-scheme: dark; }
   .cbody { margin-top:4px; padding-bottom:4px; }
@@ -1306,19 +1366,50 @@ function skipBox(card, email){
   if(card.provider!=='claude' || typeof h.excluded!=='boolean') return '';
   const p = pendingSkip[email], on = p ? p.value : h.excluded;
   return '<label class="skipbox" title="Skip: claude-switch never switches to this account. Untick to use it again.">'
-    + '<input type="checkbox" data-skip="'+esc(email)+'" aria-label="Skip '+esc(email)+' in claude-switch" data-testid="csm-account-skip"'+(on?' checked':'')+'> skip</label>';
+    + '<input type="checkbox" data-skip="'+esc(email)+'" aria-label="Skip '+esc(email)+' in claude-switch" data-testid="csm-account-skip"'+(on?' checked':'')+'></label>';
 }
-// Simplified card: ONE always-visible header line, gauge rows only when expanded.
+// Plan price tag: "$200" with the full plan in its title; tiers colour by price so the costly logins stand out.
+function planTag(card){
+  const m = /\$\s*(\d+)/.exec(card.plan||'');
+  if(!m) return '<span class="ptag pnone" title="'+esc(card.plan||'plan unknown')+'">'+(card.plan?esc(card.plan.slice(0,5)):'–')+'</span>';
+  const n = Number(m[1]);
+  return '<span class="ptag '+(n>=200?'phi':n>=100?'pmid':'plo')+'" title="'+esc(card.plan)+' / month" data-testid="csm-account-plan">$'+n+'</span>';
+}
+// Gauge columns of the account table: Session, Weekly, then every scoped weekly any card has (Fable, …).
+let gcols = [];
+function gaugeCols(cards){
+  const sc = [];
+  for(const c of cards) for(const g of ((c.hdr && c.hdr.gauges) || [])) if(!/^(Session|Weekly)$/i.test(g.label) && sc.indexOf(g.label)<0) sc.push(g.label);
+  return ['Session','Weekly'].concat(sc);
+}
+function gaugeCell(g, old){
+  if(!g) return '<span class="gnil"></span>';
+  const p = Math.max(0, Math.min(100, Number(g.pct)||0));
+  return '<span class="hg'+(g.hot?' hot':p>=70?' warn':'')+(p<=0?' zero':'')+'"><span class="gl">'+esc(g.label)+'</span><span class="gs">'+esc(g.short)+'</span> '+(old?'~':'')+fmtPct(g.pct)+'%'
+    + '<i class="hgb"><b style="width:'+p+'%"></b></i></span>';
+}
+function gaugeCells(h, old){
+  const gs = h.gauges || [];
+  return gcols.map(l=>gaugeCell(gs.find(g=>g.label.toLowerCase()===l.toLowerCase()), old)).join('');
+}
+// Column header above the account rows (same widths as the row cells).
+function tableHead(){
+  return '<div class="lhead" aria-hidden="true"><span class="chev"></span><span class="lhp">plan</span><span class="lhn">account</span>'
+    + '<span class="lhg">'+gcols.map(l=>'<span class="lhc">'+esc(l)+'</span>').join('')+'</span><span class="lhs">skip</span></div>';
+}
+// Simplified card: ONE always-visible table row, gauge rows only when expanded.
 function collapsibleCard(card){
   const h = card.hdr, open = expandedOf(card), age = readingAge(card), old = readingOld(card, age);
   const email = card.email || card.label.replace(/^(Claude|Codex) · /,'');
-  let out = '<div class="card ccard" data-testid="csm-account-row"><div class="chrow"><div class="chdr'+(h.excluded?' excl':'')+'" role="button" tabindex="0" data-toggle="'+esc(card.id)+'" aria-expanded="'+open+'" title="'+esc(card.label)+'">'
+  const box = skipBox(card, email);
+  let out = '<div class="card ccard'+(card.active?' act':'')+(h.chip==='ready'?' rdy':'')+'" data-testid="csm-account-row"><div class="chrow"><div class="chdr'+(h.excluded?' excl':'')+'" role="button" tabindex="0" data-toggle="'+esc(card.id)+'" aria-expanded="'+open+'" title="'+esc(card.label)+'">'
     + '<span class="chev">'+(open?'▾':'▸')+'</span>'
+    + planTag(card)
     + '<span class="ctitle">'+(h.rank?'<span class="swrank num">#'+h.rank+'</span> ':'')+esc(h.name)+'</span>'
     + chipHtml(h)
     + (old ? '<span class="cold num" title="time since the last successful usage read">'+fmtAge(age)+' ago</span>' : '')
-    + (h.gauges && h.gauges.length ? '<span class="cgauges num" data-testid="csm-account-gauges">'+h.gauges.map(g=>'<span class="hg'+(g.hot?' hot':'')+'"><span class="gl">'+esc(g.label)+'</span><span class="gs">'+esc(g.short)+'</span> '+(old?'~':'')+fmtPct(g.pct)+'%</span>').join(' · ')+'</span>' : '')
-    + '</div>' + skipBox(card, email) + '</div>';
+    + '<span class="cgauges num" data-testid="csm-account-gauges">'+gaugeCells(h, old)+'</span>'
+    + '</div>' + (box || '<span class="skipnil"></span>') + '</div>';
   if(open){
     out += '<div class="cbody">';
     const gauges = card.official ? (card.gauges||[]) : [];
@@ -1330,6 +1421,18 @@ function collapsibleCard(card){
     out += '</div>';
   }
   return out+'</div>';
+}
+// Last table row: the whole Claude pool. Plan cell = summed monthly price; each column = share of the pool's limit used.
+function poolRow(p){
+  const how = p.weighted ? 'each login weighted by its plan price' : 'each login counted equally (a plan price is unknown)';
+  const tip = p.ready+' of '+p.total+' Claude logins can take work now (Codex and skipped logins left out). Columns: share of the whole pool already used, '+how+'.';
+  return '<div class="card ccard pool" data-testid="csm-account-pool"><div class="chrow"><div class="chdr" title="'+esc(tip)+'">'
+    + '<span class="chev"></span>'
+    + '<span class="ptag plo" data-testid="csm-pool-price">'+(p.price?'$'+p.price:'Σ')+'</span>'
+    + '<span class="ctitle">all</span>'
+    + '<span class="chip'+(p.ready?' prdy':'')+'" data-testid="csm-pool-ready">'+p.ready+'/'+p.total+' ready</span>'
+    + '<span class="cgauges num" data-testid="csm-pool-gauges">'+gaugeCells(p, false)+'</span>'
+    + '</div><span class="skipnil"></span></div></div>';
 }
 // While a switch runs its button reads "Switching…" (also after a webview reload,
 // via the host's usePending) and every other Use button is disabled.
@@ -1456,7 +1559,10 @@ function accountsHtml(){
     note:last.usageNote||last.accountNote||null, sevenDayTokens:null, lifetimeTokens:null
   }];
   if(!last.panelFresh && last.accounts && last.accounts.length > 1) h += '<div class="rot"><button type="button" class="rotbtn" data-rotate="1" title="Switch Claude Code to the account with the most headroom">Rotate ▸</button></div>';
+  const table = last.panelFresh && cards.some(c=>c.hdr);
+  if(table){ gcols = gaugeCols(cards); h += tableHead(); }
   for(const c of cards) h += (last.panelFresh && c.hdr) ? collapsibleCard(c) : providerCard(c);
+  if(table && last.pool) h += poolRow(last.pool);
   if(cards.some(c=>c.provider==='claude')){
     const multiAcct = !!(last.accounts && last.accounts.length > 1);
     if(last.showTokenStats){
@@ -1586,6 +1692,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const savedProviderFilter = ctx.globalState.get<string>("providerFilter", "all");
   let providerFilter: AgentProvider | "all" =
     savedProviderFilter === "claude" || savedProviderFilter === "codex" ? savedProviderFilter : "all";
+  let projectFilter = ctx.globalState.get<string>("projectFilter", "all");
+  let projectStrip: ProjectStrip | null = null; // set by refreshOnce, read by pushSessions
   const stages = stageGuard(log); // a refresh stage or feature start that throws is logged and skipped (safeStage.ts)
   // An Extension Development Host only reads and shows both panels; dev.enableFeatures lists what it may do besides (observerMode.ts).
   const observer = observerMode({
@@ -1600,6 +1708,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   const resourceCache = new Map<number, ResStat>();
   const sessionsView = new SessionsView((action, sessionId) => {
+    if (action === "filterProject") {
+      projectFilter = sessionId;
+      void ctx.globalState.update("projectFilter", projectFilter);
+      refresh();
+      return;
+    }
     if (action === "filterProvider") {
       if (sessionId === "all" || sessionId === "claude" || sessionId === "codex") {
         providerFilter = sessionId;
@@ -1632,6 +1746,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
     accountsFile = next;
   }
   const usageByAccount = new Map<string, { usage: OfficialUsage | null; stale: boolean }>();
+  /** Newest usage reading held for any account (epoch seconds), or undefined before the first one. */
+  function newestReadingSec(): number | undefined {
+    let best = officialUsage?.ts ?? 0;
+    for (const { usage } of usageByAccount.values()) if (usage && usage.ts > best) best = usage.ts;
+    return best > 0 ? best : undefined;
+  }
   let othersInflight = false;
   let lastOthersCheck = 0;
 
@@ -2338,6 +2458,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
         let vault = await readVaultOauth(a.id);
         const cliBlob = cliPresent ? await readCliVault(a.id, log) : null;
         const cliOauth = cliBlob?.claudeAiOauth;
+        const seatTier = cliOauth ? claudePlanTier(cliOauth.rateLimitTier, cliOauth.subscriptionType, cliBlob?.oauthAccount?.seatTier) : undefined;
+        if (seatTier && seatTier !== a.tier && allowed("accountWrites")) {
+          // The plan label (and the panel's price order) follows the CLI vault's seat tier, also for never-active logins.
+          const f = readAccountsFile();
+          setAccounts({ ...f, accounts: f.accounts.map((x) => (x.id === a.id ? { ...x, tier: seatTier } : x)) });
+          writeAccountsFile(accountsFile);
+          a = accountsFile.accounts.find((x) => x.id === a.id) ?? a;
+          changed = true;
+        }
         const source = decidePassiveSource(vault, cliOauth);
         let seeded = false;
         let cliToken: string | undefined;
@@ -3045,6 +3174,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         [
           needsYouOnly ? "needs-you only" : "",
           providerFilter !== "all" ? providerLabel(providerFilter) : "",
+          projectStrip && projectFilter !== "all" ? projectFilter : "",
         ]
           .filter(Boolean)
           .join(" · "),
@@ -3060,10 +3190,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
           ? ""
           : enabledProviders().length === 0
             ? "Both providers are disabled. Enable Claude or Codex in Settings."
-            : providerFilter !== "all" || needsYouOnly
+            : providerFilter !== "all" || needsYouOnly || (projectStrip && projectFilter !== "all")
               ? "No sessions match the active filters."
               : "No recent Claude or Codex sessions. Start one and it will appear here.",
         burnShareBySession,
+        projectStrip,
       ),
     );
     let badge = 0;
@@ -3146,7 +3277,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const emailById = new Map(payload.accounts.map((a) => [a.id, a.email] as const));
       let providers = decorateCards(payload.providers).map((p) => ({ ...p, email: p.accountId ? emailById.get(p.accountId) ?? p.label.replace(/^Claude · /, "") : p.label.replace(/^(Claude|Codex) · /, "") }));
       if (fresh) {
-        providers = orderCards(providers, panel);
+        providers = orderCards(providers, panel, (p) => planPrice(p.plan));
         const claudeNames = displayNames(providers.filter((p) => p.provider === "claude").map((p) => p.email ?? p.label));
         let ci = 0;
         const badges = allBadges(panel);
@@ -3165,10 +3296,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
       limitsView.update({
         ...payload,
         providers,
-        switchHtml: installed ? renderSwitchBlock(panel, Date.now()) : undefined,
+        switchHtml: installed ? renderSwitchBlock(panel, Date.now(), newestReadingSec(), readQuotaEngine()) : undefined,
         switchActivity: renderSwitchActivity(panel, Date.now()) ?? undefined, // panel is null without claude-switch
         switchBadges: allBadges(panel),
         panelFresh: fresh,
+        pool: fresh ? poolSummary(providers, planPrice) : undefined,
         showTokenStats: showTokenStats(),
         burnOn: claudeEnabled(),
         ui: { tab: isLimitsTab(savedTab) ? savedTab : "accounts", expandedAccounts: ctx.workspaceState.get<Record<string, boolean>>("csm.expandedAccounts", {}) },
@@ -3292,6 +3424,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     let collected = true;
     if (claudeEnabled()) {
       try {
+        const tabLabels = vscode.window.tabGroups.all.flatMap((g) => g.tabs.filter(isClaudePanelTab).map((t) => t.label));
         claudeViews = await collector.collect({
           now,
           extraTranscripts: recentCache,
@@ -3302,6 +3435,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           showEnded: c.get<boolean>("showEnded", false),
           closingMarkers: c.get<boolean>("closingStatusMarkers", false),
           resumePids: resumeTerminals.livePids(),
+          hasOpenTab: (labels) => labels.some((title) => tabLabels.some((label) => labelsMatchStrict(label, title))),
           onError: (sid, e) => stages.fail(`collect ${sid}`, e),
         }, clock);
       } catch (e) {
@@ -3334,11 +3468,29 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }
     if (dismissalsChanged) void persistDismissals();
     if (dismissed.size) allViews = allViews.filter((v) => !dismissed.has(v.key));
+    const projectRules = readProjectRules(cfg().get<unknown>("projects", []));
+    if (projectRules.length) {
+      allViews = allViews.map((v) => ({
+        ...v,
+        project: projectOf(projectRules, { cwd: v.cwd, title: v.title, prompt: v.lastPrompt, refs: v.toolRefs }),
+      }));
+    }
+    if (projectFilter !== "all" && projectFilter !== OTHER_PROJECT && !projectRules.some((r) => r.name === projectFilter)) {
+      projectFilter = "all";
+      void ctx.globalState.update("projectFilter", projectFilter);
+    }
     lastAllViews = allViews;
     const settled = settledOverrides(autoResumeOverrides(), allViews); // a session's auto-resume choice ends with its limit
     if (settled) void ctx.globalState.update(OVERRIDES_KEY, settled);
 
     let views = filterProvider(allViews, providerFilter);
+    projectStrip = null;
+    if (projectRules.length) {
+      const counts: Record<string, number> = {};
+      for (const v of views) counts[v.project ?? OTHER_PROJECT] = (counts[v.project ?? OTHER_PROJECT] ?? 0) + 1;
+      projectStrip = { names: projectRules.map((r) => r.name), counts, filter: projectFilter };
+      if (projectFilter !== "all") views = views.filter((v) => (v.project ?? OTHER_PROJECT) === projectFilter);
+    }
     if (needsYouOnly) views = views.filter((v) => NEEDS_YOU.includes(groupOf(v)));
     lastViews = views;
 
@@ -3501,6 +3653,72 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (r.ok) return { ok: true };
     // Only a failed keystroke or typing stopped midway is final: every other reason typed nothing.
     return { ok: false, skip: nothingTyped(r.reason), reason: TYPED_REASON[r.reason] ?? r.reason, detail: r.detail };
+  }
+
+  /**
+   * Why a remote newSession cannot open in a Claude Code tab of this window
+   * (remoteNewTab.ts) and runs in a terminal instead, or undefined. A tab starts
+   * in the window's workspace folder, so that must be the session's folder; a
+   * first message needs Enter pressed by keystroke, so the typing rules must
+   * let it through right now.
+   */
+  function newTabBlocker(cmd: FleetCommand): string | undefined {
+    if (!vscode.extensions.getExtension(CLAUDE_CODE_ID)) return "Claude Code is not installed";
+    const own = ownFolders();
+    if (own.length !== 1 || own[0] !== cmd.cwd) return "the folder is not this window's one workspace folder";
+    if (typeof cmd.text !== "string" || cmd.text === "") return undefined;
+    if (process.platform !== "darwin") return "keystrokes need macOS";
+    if (!remoteFlag("remote.typeFallback")) return "typing disabled (remote.typeFallback is off)";
+    const held = automationGate.blocker("remoteTyping");
+    if (held) return `typing disabled (${held})`;
+    if (resumeActive) return "a typing sweep is running";
+    if (!windowFocused()) return "this VS Code window is not focused";
+    return undefined;
+  }
+
+  /** remoteNewTab.ts's deps: Claude Code's open command, this host's Claude processes, Enter by keystroke into the new tab. */
+  function newTabDeps(stop: AbortSignal): NewTabDeps {
+    let tab: vscode.Tab | undefined;
+    const claudeTabs = (): vscode.Tab[] => vscode.window.tabGroups.all.flatMap((g) => g.tabs.filter(isClaudePanelTab));
+    const where = (): { gi: number; ti: number } | undefined => {
+      const groups = vscode.window.tabGroups.all;
+      for (let gi = 0; gi < groups.length; gi++) {
+        const ti = tab ? groups[gi].tabs.indexOf(tab) : -1;
+        if (ti >= 0) return { gi, ti };
+      }
+      return undefined;
+    };
+    return {
+      allowed: () => remoteCwds(true),
+      ownSessions: async () => {
+        const parents = await readParentPids();
+        return parents && ownSessions(readLiveSessions(), parents, process.pid);
+      },
+      open: async (prompt) => {
+        const before = new Set(claudeTabs());
+        // Claude Code's own new-tab request: an editor tab whatever the preferred location, the prompt only fills the input.
+        await vscode.commands.executeCommand(OPEN_COMMAND, undefined, prompt, undefined, undefined, undefined, { programmatic: "pin-to-panel" });
+        for (let i = 0; i < 10 && !tab; i++) {
+          tab = claudeTabs().find((t) => !before.has(t));
+          if (!tab) await sleep(300);
+        }
+      },
+      pressEnter: async () => {
+        const at = where();
+        if (!at) return tab ? "the new tab was closed" : "the new tab was not found";
+        if (!windowFocused()) return TYPED_REASON["not-frontmost"];
+        const signal = automationGate.signal("remoteTyping");
+        await focusTab(at.gi, at.ti);
+        const r = await typeIntoFocusedSession("", 0, () => !disposed && !resumeActive && !signal.aborted && !stop.aborted, {
+          activate: false,
+          tabActive: () => vscode.window.tabGroups.activeTabGroup.activeTab === tab,
+          label: "remote newSession tab",
+        });
+        return r.ok ? undefined : (TYPED_REASON[r.reason] ?? r.reason);
+      },
+      monitorDir: MONITOR_DIR,
+      sleep,
+    };
   }
 
   /** Title candidates of every other listed session: a tab or terminal name they match too is ambiguous. */
@@ -4267,8 +4485,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
         };
       case "switchAccount":
         return cmd.account ? remoteSwitch(cmd.account) : { ok: false, message: "account is required" };
-      case "newSession":
-        // A new claude in a background terminal of this window, registered like a resume.
+      case "newSession": {
+        // A new Claude Code tab in this window when it can (remoteNewTab.ts), else a new claude in a
+        // background terminal of this window, registered like a resume.
+        const tabBlocked = newTabBlocker(cmd);
+        if (tabBlocked === undefined) return startNewTab(cmd, newTabDeps(signal));
+        log(`remote newSession: terminal, not a tab: ${tabBlocked}`);
         return startNewSession(cmd, {
           allowed: () => remoteCwds(true),
           claudeBinary: () => claudeBinary ?? Promise.resolve(undefined),
@@ -4277,6 +4499,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           monitorDir: MONITOR_DIR,
           sleep,
         });
+      }
       case "answer": {
         // An AskUserQuestion answer from the phone, handed to the waiting PermissionRequest hook (answers.ts).
         return submitAnswer(cmd, { nowSec: Date.now() / 1000, askPending: !!find()?.askPending });
@@ -4657,6 +4880,7 @@ function buildSessionsPayload(
   health: ProviderHealth[],
   emptyMessage: string,
   burnShare: ReadonlyMap<string, number> | null = null,
+  projects: ProjectStrip | null = null,
 ): SessionsPayload {
   const nowSec = Date.now() / 1000;
   const grouped = new Map<GroupKey, SessionRow[]>();
@@ -4704,6 +4928,8 @@ function buildSessionsPayload(
       effort: shortEffort(v.effort) ?? "",
       lastMs: v.lastActivityMs,
       dir: v.cwdLabel ?? "",
+      project: projects && v.project ? v.project : "",
+      projectIdx: projects && v.project ? projects.names.indexOf(v.project) : -1,
       cpu: res ? Math.round(res.cpu) : null,
       rssMb: res ? res.rssMb : null,
       cpuHog: !!res && res.cpu >= cpuHogThreshold,
@@ -4742,6 +4968,7 @@ function buildSessionsPayload(
     filter,
     providerCounts,
     providerFilter,
+    projects,
     health,
     emptyMessage,
   };

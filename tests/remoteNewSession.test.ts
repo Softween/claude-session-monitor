@@ -4,8 +4,11 @@ import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  ENTER_RETRY_MS,
+  FIRST_MESSAGE_SEEN_MS,
   READY_TIMEOUT_MS,
   SETTLE_MS,
+  userTurnAfter,
   readStartRecord,
   startNewSession,
   type NewSessionDeps,
@@ -158,7 +161,50 @@ describe("startNewSession", () => {
     const { deps, opened } = setup({ onSleep: () => writeRecord() });
     const out = await startNewSession({ id: "c", type: "newSession", cwd: "/r/REPOS", text: "merhaba" }, deps);
     expect(out).toEqual({ ok: true, message: `new session ${ID} started in REPOS; first message written, not in the transcript yet` });
+    // the message with Enter once, then Enter alone every 2 s for 20 s
+    expect(opened[0].sent.map((s) => s.text)).toEqual(["merhaba\r", ...Array(FIRST_MESSAGE_SEEN_MS / ENTER_RETRY_MS - 1).fill("\r")]);
+  });
+
+  it("presses Enter again until the transcript shows the message (claude drops an Enter during its startup hooks)", async () => {
+    let sends = 0;
+    const { deps, opened } = setup({
+      onSleep: () => writeRecord(),
+      onSend: () => {
+        fs.appendFileSync(transcript(), '{"type":"attachment"}\n'); // startup noise is not the message
+        if (++sends === 3) fs.appendFileSync(transcript(), '{"type":"user"}\n');
+      },
+    });
+    const out = await startNewSession({ id: "c", type: "newSession", cwd: "/r/REPOS", text: "merhaba" }, deps);
+    expect(out).toEqual({ ok: true, message: `new session ${ID} started in REPOS; first message delivered` });
+    expect(opened[0].sent.map((s) => s.text)).toEqual(["merhaba\r", "\r", "\r"]);
+  });
+
+  it("stops pressing Enter when claude exits", async () => {
+    const { deps, opened } = setup({
+      onSleep: () => writeRecord(),
+      onSend: () => {
+        opened[0].exitStatus = { code: 0 };
+      },
+    });
+    const out = await startNewSession({ id: "c", type: "newSession", cwd: "/r/REPOS", text: "merhaba" }, deps);
+    expect(out).toEqual({
+      ok: true,
+      message: `new session ${ID} started in REPOS; first message written, not in the transcript yet (Enter stopped: claude exited)`,
+    });
     expect(opened[0].sent.map((s) => s.text)).toEqual(["merhaba\r"]);
+  });
+});
+
+describe("userTurnAfter", () => {
+  it("finds a user turn only after the baseline", () => {
+    fs.writeFileSync(transcript(), '{"type":"user","old":1}\n');
+    const base = fs.statSync(transcript()).size;
+    expect(userTurnAfter(transcript(), base)).toBe(false);
+    fs.appendFileSync(transcript(), '{"type":"system"}\n');
+    expect(userTurnAfter(transcript(), base)).toBe(false);
+    fs.appendFileSync(transcript(), '{"type":"user"}\n');
+    expect(userTurnAfter(transcript(), base)).toBe(true);
+    expect(userTurnAfter(path.join(dir, "missing.jsonl"), 0)).toBe(false);
   });
 });
 

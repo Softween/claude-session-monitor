@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, labelsMatchStrict, truncatedLabel, TAB_TITLE_MAX, parsePsOutput, subtreeTotals, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec, accountPillLabels, filterHistoryForAccount, topSessionRows, sortByTokens, claudePlanLabel, claudePlanTier, codexPlanLabel } from "../src/view";
+import { groupOf, normPct, normResetMs, fmtMb, normLabel, labelsMatch, labelsMatchStrict, truncatedLabel, TAB_TITLE_MAX, parsePsOutput, subtreeTotals, clampPct, parseOfficialGauges, computeBurnEta, estimateCostUsd, shortModelName, shortEffort, isRedundantSub, fmtTokensCompact, nextUsageBackoffSec, accountPillLabels, filterHistoryForAccount, topSessionRows, sortByTokens, claudePlanLabel, claudePlanTier, codexPlanLabel, planPrice } from "../src/view";
 import type { SessionView } from "../src/core";
 
 const v = (bucket: SessionView["bucket"], sub: string): SessionView =>
@@ -436,6 +436,17 @@ describe("plan labels", () => {
     expect(claudePlanTier(null, null)).toBeUndefined();
     expect(claudePlanLabel(claudePlanTier("default_claude_max_5x", "team"))).toBe("Team");
     expect(claudePlanLabel("enterprise")).toBe("Enterprise");
+    // Team seats: oauthAccount.seatTier names premium vs standard
+    expect(claudePlanTier("default_claude_max_5x", "team", "team_tier_1")).toBe("team_tier_1");
+    expect(claudePlanTier("default_raven", "team", "team_standard")).toBe("team_standard");
+    expect(claudePlanTier("default_claude_max_20x", "max", "team_tier_1")).toBe("default_claude_max_20x");
+    expect(claudePlanLabel("team_tier_1")).toBe("$125 Team Premium");
+    expect(claudePlanLabel("team_standard")).toBe("$25 Team Standard");
+    expect(claudePlanLabel("team_other")).toBe("Team");
+    expect(planPrice("$200 Max")).toBe(200);
+    expect(planPrice("$125 Team Premium")).toBe(125);
+    expect(planPrice("Team")).toBeNull();
+    expect(planPrice(null)).toBeNull();
   });
   it("maps Codex plan types", () => {
     expect(codexPlanLabel("prolite")).toBe("$100 Pro Lite");

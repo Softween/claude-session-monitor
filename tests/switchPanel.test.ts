@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { accountBadges, displayNames, excludedEmails, excludedOf, headerChip, headerGauges, installedPanel, mergePanelAccounts, orderCards, panelAge, panelFresh, readPanel, renderSwitchActivity, renderSwitchBlock, switchInstalled, useTargets, worstGauge, type SwitchPanel } from "../src/switchPanel";
+import { accountBadges, displayNames, excludedEmails, excludedOf, headerChip, headerGauges, installedPanel, mergePanelAccounts, orderCards, panelAge, panelFresh, poolSummary, quotaEngineLine, readPanel, readQuotaEngine, renderSwitchActivity, renderSwitchBlock, switchInstalled, useTargets, worstGauge, type SwitchPanel } from "../src/switchPanel";
+
+import { planPrice } from "../src/view";
 
 const NOW = 1_792_200_000_000;
 const sec = NOW / 1000;
@@ -70,6 +72,16 @@ describe("renderSwitchBlock", () => {
     expect(renderSwitchActivity(null, NOW)).toBeNull();
     expect(renderSwitchActivity(full({ ts: sec - 11 * 60 }), NOW)).toBeNull();
     expect(renderSwitchActivity(full({ events: [] }), NOW)).toEqual({ count: 0, html: '<div class="swevents" data-testid="csm-switch-activity"><div class="swline sw-muted">No claude-switch activity yet</div></div>' });
+  });
+  it("offline line: a recent network failure with no reading after it", () => {
+    const off = (last: number) => full({ health: { offline: { count1h: 3, last } } });
+    const h = renderSwitchBlock(off(sec - 60), NOW, sec - 71 * 60);
+    expect(h).toContain('data-testid="csm-switch-offline"');
+    expect(h).toContain(`offline: usage API unreachable (last try ${hhmm(sec - 60)}) · last reading 71 min ago`);
+    expect(renderSwitchBlock(off(sec - 60), NOW)).toContain(`(last try ${hhmm(sec - 60)})</div>`); // no reading yet
+    expect(renderSwitchBlock(off(sec - 60), NOW, sec - 30)).not.toContain("offline"); // read after the failure: back online
+    expect(renderSwitchBlock(off(sec - 16 * 60), NOW, sec - 71 * 60)).not.toContain("offline"); // failure too old
+    expect(renderSwitchBlock(full(), NOW, sec - 71 * 60)).not.toContain("offline"); // no health block (older CLI)
   });
   it("shows PAUSED and omits the rank when unknown", () => {
     expect(renderSwitchBlock(full({ paused: true }), NOW)).toContain("#2 · PAUSED<");
@@ -154,6 +166,34 @@ describe("card helpers", () => {
     expect(headerChip({ ...base, gauges: [g("s", 100, 5000), g("w", 100, 9000), g("f", 40, 99999)] })).toEqual({ chip: "exhausted", resetMs: 9000 });
     expect(headerChip({ ...base, gauges: [g("s", 99, 5000)] })).toEqual({ chip: "ready" });
   });
+  it("pool row: plan-price weighted share per column, ready count, Codex and skipped logins left out", () => {
+    const card = (plan: string | null, active: boolean, gs: ReturnType<typeof g>[], extra: { provider?: string; excluded?: boolean; loginNeeded?: boolean } = {}) => ({
+      provider: extra.provider ?? "claude", plan,
+      hdr: { name: "x", ...headerChip({ active, loginNeeded: !!extra.loginNeeded, gauges: gs, excluded: extra.excluded }), gauges: headerGauges(gs) },
+    });
+    const cards = [
+      card("$200 Max", true, [g("Session (5h)", 40), g("Weekly (7d)", 90), g("Weekly · Fable", 10)]),
+      card("$200 Max", false, [g("Weekly (7d)", 100, 9000), g("Weekly · Fable", 30)]), // exhausted, no session reading
+      card("$25 Team Standard", false, [g("Session (5h)", 0), g("Weekly (7d)", 20)]), // no Fable gauge
+      card("$125 Team Premium", false, [g("Session (5h)", 80), g("Weekly (7d)", 0)], { loginNeeded: true }),
+      card("$200 Max", false, [g("Weekly (7d)", 0)], { excluded: true }), // skipped: out of the pool
+      card(null, false, [g("Weekly (7d)", 100)], { provider: "codex" }), // Codex: out of the pool
+    ];
+    expect(poolSummary(cards, planPrice)).toEqual({
+      ready: 2, total: 4, price: 550, weighted: true,
+      gauges: [
+        { label: "Session", short: "S", pct: 51.4, hot: false }, // (40*200 + 0*25 + 80*125) / 350: only logins with a session reading
+        { label: "Weekly", short: "W", pct: 70, hot: false }, // (90*200 + 100*200 + 20*25 + 0*125) / 550
+        { label: "Fable", short: "F", pct: 20, hot: false }, // (10*200 + 30*200) / 400
+      ],
+    });
+  });
+  it("pool row: equal weights when a plan price is unknown; none below two Claude logins", () => {
+    const card = (plan: string | null, pct: number) => ({ provider: "claude", plan, hdr: { name: "x", chip: "ready" as const, gauges: headerGauges([g("Weekly (7d)", pct)]) } });
+    expect(poolSummary([card("$200 Max", 100), card(null, 0)], planPrice)).toMatchObject({ weighted: false, price: 0, gauges: [{ label: "Weekly", pct: 50, hot: false }] });
+    expect(poolSummary([card("$200 Max", 95), card("$200 Max", 85)], planPrice)?.gauges[0]).toMatchObject({ pct: 90, hot: true });
+    expect(poolSummary([card("$200 Max", 50)], planPrice)).toBeUndefined();
+  });
 });
 
 describe("skip box (accounts claude-switch excludes)", () => {
@@ -218,5 +258,34 @@ describe("accountBadges", () => {
     expect(accountBadges(full(), "bilal@glossgo.com")).toEqual({ rank: 3 });
     expect(accountBadges(full(), "who@example.com")).toEqual({});
     expect(accountBadges(null, "x")).toEqual({});
+  });
+});
+
+describe("quota engine line", () => {
+  it("shows the level, the measured headroom and the effect", () => {
+    const h = renderSwitchBlock(full(), NOW, undefined, { level: 0, at: sec - 300, m: 1.26 });
+    expect(h).toContain(">quota · normal (0) · pool carries 1.26x today&#39;s pace · effort as set</div>");
+    expect(h).toContain('data-testid="csm-quota-engine"');
+    expect(quotaEngineLine({ level: 2, at: sec, m: 2.4 }, NOW)).toContain("plenty (+2) · pool carries 2.40x today&#39;s pace · effort +1, Fable on");
+    expect(quotaEngineLine({ level: 2, at: sec, m: 2.4 }, NOW)).toContain("sw-q-up");
+    const tight = quotaEngineLine({ level: -1, at: sec, m: 0.8 }, NOW);
+    expect(tight).toContain("tight (-1) · today&#39;s pace would stop us · main model Opus");
+    expect(tight).toContain("sw-q-tight");
+    expect(quotaEngineLine({ level: 1, at: sec, m: null }, NOW)).toContain("spare (+1) · pace not measured yet · effort +1");
+  });
+  it("hides when missing or over an hour old", () => {
+    expect(quotaEngineLine(null, NOW)).toBe("");
+    expect(quotaEngineLine({ level: 1, at: sec - 3601, m: 1.6 }, NOW)).toBe("");
+    expect(renderSwitchBlock(full(), NOW)).not.toContain("quota");
+  });
+  it("reads the engine file, null when missing or malformed", () => {
+    const d = mkdtempSync(join(tmpdir(), "qe-"));
+    writeFileSync(join(d, "ok.json"), JSON.stringify({ level: 1, at: sec, m: 1.6, why: "x" }));
+    writeFileSync(join(d, "bad.json"), "{nope");
+    writeFileSync(join(d, "nolevel.json"), JSON.stringify({ at: sec }));
+    expect(readQuotaEngine(join(d, "ok.json"))?.m).toBe(1.6);
+    expect(readQuotaEngine(join(d, "bad.json"))).toBeNull();
+    expect(readQuotaEngine(join(d, "nolevel.json"))).toBeNull();
+    expect(readQuotaEngine(join(d, "missing.json"))).toBeNull();
   });
 });

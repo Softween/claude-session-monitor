@@ -12,6 +12,9 @@ export const SWITCH_CLI = path.join(os.homedir(), ".claude", "bin", "claude-swit
 export const SWITCH_STATE_DIR = path.join(os.homedir(), ".claude", "state", "claude-switch");
 export const SWITCH_PANEL_FILE = path.join(SWITCH_STATE_DIR, "panel.json");
 export const PANEL_STALE_SEC = 600;
+/** ~/.claude/bin/quota_engine.py's decision (model-router runs it every 15 min); its consumers ignore it after an hour. */
+export const QUOTA_ENGINE_FILE = path.join(os.homedir(), ".claude", "state", "quota-engine", "state.json");
+export const QUOTA_ENGINE_STALE_SEC = 3600;
 const MAX_EVENTS = 8;
 
 /** True when the claude-switch CLI is installed (the one detection point for every claude-switch surface). */
@@ -39,6 +42,7 @@ export interface SwitchPanel {
   nextHint?: string;
   accounts?: PanelAccount[];
   events?: PanelEvent[];
+  health?: { offline?: { count1h?: number; last?: number | null } }; // log-tail counters (last = epoch seconds)
 }
 
 /** Parsed panel, or null when missing, unparsable or not schema v1. */
@@ -49,6 +53,35 @@ export function readPanel(file: string = SWITCH_PANEL_FILE): SwitchPanel | null 
   } catch {
     return null;
   }
+}
+
+/** The quota engine's level: -1 tight, 0 normal, 1 spare, 2 plenty; m = how many times today's pace the pool carries for
+ * 7 days without a stop. Null when missing or unparsable. */
+export interface QuotaEngine { level: number; at: number; m?: number | null; demand?: number }
+export function readQuotaEngine(file: string = QUOTA_ENGINE_FILE): QuotaEngine | null {
+  try {
+    const q = JSON.parse(fs.readFileSync(file, "utf8")) as QuotaEngine;
+    return q && typeof q.level === "number" && typeof q.at === "number" ? q : null;
+  } catch {
+    return null;
+  }
+}
+
+const QUOTA_LEVELS: Record<number, [string, string, string]> = {
+  [-1]: ["tight", "today's pace would stop us", "main model Opus"],
+  0: ["normal", "", "effort as set"],
+  1: ["spare", "", "effort +1"],
+  2: ["plenty", "", "effort +1, Fable on"],
+};
+
+/** The quota engine line under the claude-switch status; empty while the engine's file is missing or over an hour old. */
+export function quotaEngineLine(q: QuotaEngine | null, nowMs: number): string {
+  if (!q || nowMs / 1000 - q.at > QUOTA_ENGINE_STALE_SEC) return "";
+  const [name, why, effect] = QUOTA_LEVELS[q.level] ?? QUOTA_LEVELS[0];
+  const fits = typeof q.m === "number" ? `pool carries ${q.m.toFixed(2)}x today's pace` : "pace not measured yet";
+  const text = ["quota", `${name} (${q.level > 0 ? "+" : ""}${q.level})`, why || fits, effect].join(" · ");
+  const tone = q.level < 0 ? " sw-q-tight" : q.level > 0 ? " sw-q-up" : "";
+  return `<div class="swline sw-hint${tone}" data-testid="csm-quota-engine">${esc(text)}</div>`;
 }
 
 /** The panel only while the CLI is installed: a leftover panel.json alone never counts. */
@@ -69,6 +102,16 @@ const hhmm = (tsSec: number): string => {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 };
 const ageText = (sec: number): string => (sec < 90 ? `${sec}s` : `${Math.round(sec / 60)} min`);
+export const OFFLINE_WINDOW_SEC = 900;
+
+/** The offline line: claude-switch logged a network failure in the last OFFLINE_WINDOW_SEC and no reading arrived after it. */
+export function offlineLine(panel: SwitchPanel, nowMs: number, lastReadSec?: number): string {
+  const last = panel.health?.offline?.last;
+  if (typeof last !== "number" || nowMs / 1000 - last > OFFLINE_WINDOW_SEC) return "";
+  if (typeof lastReadSec === "number" && lastReadSec >= last) return "";
+  const read = typeof lastReadSec === "number" && lastReadSec > 0 ? ` · last reading ${ageText(Math.max(0, Math.round(nowMs / 1000 - lastReadSec)))} ago` : "";
+  return `<div class="swline sw-offline" data-testid="csm-switch-offline">offline: usage API unreachable (last try ${hhmm(last)})${esc(read)}</div>`;
+}
 
 function findAccount(panel: SwitchPanel, email: string): PanelAccount | undefined {
   return panel.accounts?.find((a) => a.email === email);
@@ -91,8 +134,9 @@ export function panelFresh(panel: SwitchPanel | null, nowMs: number): panel is S
 const ACTIVITY_KINDS = new Set(["switch", "restore", "needsLogin", "cleared", "error", "rollback", "paused", "resumed", "offline", "ratelimit"]);
 const MUTED_KINDS = new Set(["offline", "ratelimit"]);
 
-/** HTML for the claude-switch status lines at the top of the Usage Limits view (empty-state line when missing or stale). */
-export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number): string {
+/** HTML for the claude-switch status lines at the top of the Usage Limits view (empty-state line when missing or stale).
+ * lastReadSec: newest usage reading the extension holds (epoch seconds); a reading after the last network failure hides the offline line. */
+export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number, lastReadSec?: number, quota: QuotaEngine | null = null): string {
   const age = panel ? panelAge(panel, nowMs) : null;
   if (!panel || age === null || age > PANEL_STALE_SEC) {
     const why = panel && age !== null ? `${ageText(age)} old` : "file missing";
@@ -101,8 +145,9 @@ export function renderSwitchBlock(panel: SwitchPanel | null, nowMs: number): str
   const rank = rankOf(panel, panel.active?.email);
   const parts = [`claude-switch`, panel.active?.email ?? "?", ...(rank !== undefined ? [`#${rank}`] : []), panel.paused ? "PAUSED" : "auto"];
   let h = `<div class="swblock" data-testid="csm-switch-block"><div class="swline">${esc(parts.join(" · "))}</div>`;
+  h += offlineLine(panel, nowMs, lastReadSec);
   if (panel.nextHint) h += `<div class="swline sw-hint">next: ${esc(panel.nextHint)}</div>`;
-  return h + "</div>";
+  return h + quotaEngineLine(quota, nowMs) + "</div>";
 }
 
 /** The Activity tab: claude-switch's latest meaningful events, newest first; null while the panel is missing or stale. */
@@ -186,6 +231,38 @@ export function headerChip(
   return { chip: "ready", ...ex };
 }
 
+/** The table's "all accounts" row: logins able to take work now, their summed plan price, and per column the share of the pool used. */
+export interface PoolSummary { ready: number; total: number; price: number; weighted: boolean; gauges: HeaderGauge[] }
+
+/**
+ * Pools the Claude rows (Codex and skipped logins stay out; undefined below two logins). Ready = a "ready" chip or an
+ * active login that is neither exhausted nor waiting on a login. A column averages the logins that report that gauge,
+ * each weighted by its plan price ($200 weighs 8x a $25 seat), or equally when any price is unknown.
+ */
+export function poolSummary<C extends { provider: string; plan?: string | null; hdr?: CardHeader }>(
+  cards: C[],
+  price: (plan: string | null | undefined) => number | null,
+): PoolSummary | undefined {
+  const pool = cards.filter((c): c is C & { hdr: CardHeader } => c.provider === "claude" && !!c.hdr && !c.hdr.excluded);
+  if (pool.length < 2) return undefined;
+  const prices = pool.map((c) => price(c.plan));
+  const weighted = prices.every((p): p is number => typeof p === "number" && p > 0);
+  const weight = (i: number): number => (weighted ? (prices[i] as number) : 1);
+  const ready = pool.filter(({ hdr: h }) => h.chip === "ready" || (h.chip === "active" && !h.exhausted && !h.loginNeeded)).length;
+  const labels: string[] = [];
+  for (const c of pool) for (const g of c.hdr.gauges ?? []) if (!labels.includes(g.label)) labels.push(g.label);
+  const gauges = labels.map((label): HeaderGauge => {
+    let used = 0, cap = 0;
+    pool.forEach((c, i) => {
+      const g = (c.hdr.gauges ?? []).find((x) => x.label === label);
+      if (g) { used += g.pct * weight(i); cap += weight(i); }
+    });
+    const pct = Math.round((used / cap) * 10) / 10;
+    return { label, short: label.charAt(0).toUpperCase(), pct, hot: pct >= 90 };
+  });
+  return { ready, total: pool.length, price: weighted ? prices.reduce((s: number, p) => s + (p as number), 0) : 0, weighted, gauges };
+}
+
 /** claude-switch's skip flag for an account its panel lists (absent on older CLIs = false); undefined when it does not list the email. */
 export function excludedOf(panel: SwitchPanel | null, email: string): boolean | undefined {
   const a = panel ? findAccount(panel, email) : undefined;
@@ -202,15 +279,26 @@ export function excludedEmails(panel: SwitchPanel | null): Set<string> {
   return new Set((panel?.accounts ?? []).filter((a) => a.excluded === true).map((a) => a.email.toLowerCase()));
 }
 
-/** Claude cards by claude-switch priority (rank, else priority order); unranked after, Codex last. Stable. */
-export function orderCards<T extends { provider: string; label: string; email?: string }>(cards: T[], panel: SwitchPanel | null): T[] {
+/**
+ * Claude cards by plan price (highest first, when `price` is given), then claude-switch priority
+ * (rank, else priority order); unranked after, Codex last. Stable.
+ */
+export function orderCards<T extends { provider: string; label: string; email?: string }>(
+  cards: T[],
+  panel: SwitchPanel | null,
+  price?: (c: T) => number | null,
+): T[] {
   const email = (c: T): string => c.email ?? c.label.replace(/^(Claude|Codex) · /, "");
   const key = (c: T): number => {
     if (c.provider !== "claude") return Infinity;
     const r = panel ? rankOf(panel, email(c)) : undefined;
     return r ?? 1e6;
   };
-  return cards.map((c, i) => ({ c, i })).sort((x, y) => key(x.c) - key(y.c) || x.i - y.i).map((x) => x.c);
+  const cost = (c: T): number => (c.provider === "claude" && price ? price(c) ?? -1 : -1);
+  return cards
+    .map((c, i) => ({ c, i }))
+    .sort((x, y) => (x.c.provider === "claude" && y.c.provider === "claude" ? cost(y.c) - cost(x.c) : 0) || key(x.c) - key(y.c) || x.i - y.i)
+    .map((x) => x.c);
 }
 
 /** Add every panel account (uuid + email) missing from the registry; no tokens, active login untouched. */

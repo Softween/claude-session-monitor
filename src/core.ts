@@ -79,6 +79,7 @@ export interface TxInfo {
   effort?: string; // reasoning effort of the newest real assistant line (top-level `effort`)
   closing?: ClosingStatus; // closing status line of the newest end_turn text
   askPending?: boolean; // the newest tool_use is AskUserQuestion and no tool_result answered it yet
+  toolRefs?: string[]; // paths and commands of the newest tool calls, oldest first (projectOf)
 }
 
 export const BUCKET_ORDER: Record<Bucket, number> = {
@@ -406,6 +407,19 @@ function classifyConvLine(obj: any): {
   return { kind: "user_text", ctype: "user" };
 }
 
+const MAX_TOOL_REFS = 40;
+const MAX_REF_CHARS = 300;
+
+/** The paths and the command a tool call names, for project tagging ("" when it names none). */
+function toolRef(input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const o = input as Record<string, unknown>;
+  return ["file_path", "notebook_path", "path", "cwd", "command"]
+    .map((k) => (typeof o[k] === "string" ? (o[k] as string).slice(0, MAX_REF_CHARS) : ""))
+    .filter(Boolean)
+    .join(" ");
+}
+
 /** The newest tool_use block of a transcript, and whether a tool_result answered it (askPending). */
 interface LastUse {
   id: unknown;
@@ -431,7 +445,12 @@ function foldLines(info: TxInfo, lines: string[], lastUse: LastUse | undefined):
     const type = obj.type;
     const blocks = Array.isArray(obj.message?.content) ? obj.message.content : [];
     if (type === "assistant") {
-      for (const b of blocks) if (b?.type === "tool_use") lastUse = { id: b.id, name: b.name, answered: false };
+      for (const b of blocks) {
+        if (b?.type !== "tool_use") continue;
+        lastUse = { id: b.id, name: b.name, answered: false };
+        const ref = toolRef(b.input);
+        if (ref) info.toolRefs = [...(info.toolRefs ?? []), ref].slice(-MAX_TOOL_REFS);
+      }
     } else if (type === "user" && lastUse && !lastUse.answered) {
       const id = lastUse.id;
       lastUse = { ...lastUse, answered: blocks.some((b: any) => b?.type === "tool_result" && b.tool_use_id === id) };
@@ -867,6 +886,8 @@ function resolve(
     closingTiming,
     model,
     effort,
+    toolRefs: tx?.toolRefs,
+    lastPrompt: cleanTitle(hook?.prompt) || cleanTitle(tx?.lastPrompt),
     matchLabels,
     ...(aiTitle ? { aiTitle: true } : {}),
     ...(tx?.askPending ? { askPending: true } : {}),
@@ -993,6 +1014,7 @@ export interface CollectOpts {
   phantomGraceSec?: number; // default 600
   pidAlive?: (pid?: number) => boolean | undefined; // injectable for tests
   resumePids?: Map<string, number>; // session id -> pid of the live terminal this window resumed it in
+  hasOpenTab?: (labels: string[]) => boolean; // a Claude Code tab with one of these titles is open in this window
   onError?: (sessionId: string, error: unknown) => void; // a candidate that throws is dropped and reported here; the others still show
 }
 
@@ -1109,7 +1131,12 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
         hook && hook.pid === undefined && resumedPid
           ? { ...hook, pid: resumedPid, state: hook.state === "ended" ? "idle" : hook.state }
           : hook;
-      const view = resolve(sid, status, tx, { now, txPath, effort, closingMarkers: opts.closingMarkers });
+      const resolveOpts = { now, txPath, effort, closingMarkers: opts.closingMarkers };
+      let view = resolve(sid, status, tx, resolveOpts);
+      // A window reload ends every tab's process (SessionEnd) and Claude Code starts it again only
+      // when the tab is shown: while its tab is open the session is the user's turn, not closed.
+      if (status && view.bucket === "ended" && status.state === "ended" && opts.hasOpenTab?.(view.matchLabels))
+        view = resolve(sid, { ...status, state: "idle" }, tx, resolveOpts);
       views.push(view);
     } catch (error) {
       opts.onError?.(sid, error); // a malformed record or transcript drops only its own session
@@ -1415,7 +1442,8 @@ export function upsertActiveAccount(
     email: acct.email,
     lastSeenTs: nowSec,
     tokenExpiresAt: acct.tokenExpiresAt ?? prev?.tokenExpiresAt,
-    tier: acct.tier ?? prev?.tier,
+    // A bare "team" (keychain only) never overwrites a known seat tier ("team_tier_1").
+    tier: acct.tier && !prev?.tier?.startsWith(`${acct.tier}_`) ? acct.tier : prev?.tier ?? acct.tier,
   };
   const rest = f.accounts.filter((a) => a.id !== acct.id);
   return { v: 1, accounts: [entry, ...rest].sort((a, b) => b.lastSeenTs - a.lastSeenTs), activeId: acct.id };

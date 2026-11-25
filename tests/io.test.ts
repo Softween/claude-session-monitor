@@ -70,7 +70,10 @@ describe("readHookStatuses", () => {
     expect((await readHookStatuses(tmp, cache)).get("a")?.state).toBe("working");
     expect(readPaths).toEqual([]); // nothing changed: nothing read
 
-    fs.writeFileSync(path.join(tmp, "a.json"), record("a", "waiting"));
+    // Rewritten as hook.py does it, a temp file renamed over the record: a new inode, so the change
+    // is seen even at the same size and within the file system's mtime granularity.
+    fs.writeFileSync(path.join(tmp, ".a.tmp"), record("a", "waiting"));
+    fs.renameSync(path.join(tmp, ".a.tmp"), path.join(tmp, "a.json"));
     fs.rmSync(path.join(tmp, "b.json"));
     const third = await readHookStatuses(tmp, cache);
     expect(readPaths.map((p) => path.basename(p))).toEqual(["a.json"]);

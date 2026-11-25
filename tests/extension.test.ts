@@ -295,6 +295,7 @@ import * as ext from "../src/extension";
 import { keeperWaiting } from "../src/cliVault";
 import { ContinuityServer, storageKey } from "../src/continuity";
 import { TabWaker } from "../src/wakeTabs";
+import { SessionCollector } from "../src/sessionCollector";
 
 beforeEach(() => {
   fs.rmSync(HOME, { recursive: true, force: true });
@@ -2652,6 +2653,14 @@ describe("the health file and the overseer heartbeat", () => {
     expect(JSON.parse(fs.readFileSync(healthPath(), "utf8")).features).toMatchObject({ continuity: "error", sessions: "ok" });
   });
 
+  it("a refresh that throws outside every stage guard puts sessions in error in the health file", async () => {
+    rec.config.set("idleRamWarnMb", { valueOf: () => { throw new Error("idle RAM setting broke"); } }); // read after every stage guard
+    lastCtx = ctxWithFolder();
+    ext.activate(lastCtx);
+    await rec.commands.get("claudeSessionMonitor.refresh")!(); // the first refresh; the first health write waits for it
+    expect(JSON.parse(fs.readFileSync(healthPath(), "utf8")).features).toMatchObject({ sessions: "error", limits: "ok" });
+  });
+
   it("sends the overseer heartbeat for all live windows only where ~/.claude/bin/overseer exists", async () => {
     lastCtx = ctxWithFolder();
     ext.activate(lastCtx);
@@ -2680,3 +2689,20 @@ describe("the health file and the overseer heartbeat", () => {
   });
 });
 
+describe("a window that closes during a refresh", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("stops the refresh at its next await: no session collection and no file write after it", async () => {
+    const collect = vi.spyOn(SessionCollector.prototype, "collect");
+    lastCtx = mkCtx();
+    ext.activate(lastCtx); // the first refresh starts and waits on its transcript scan
+    disposeCtx(lastCtx);
+    lastCtx = undefined;
+    watchRec.writes.length = 0;
+    await settleAsync(10);
+    expect(collect).not.toHaveBeenCalled();
+    expect(watchRec.writes).toEqual([]);
+  });
+});

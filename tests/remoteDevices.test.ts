@@ -41,11 +41,13 @@ const FP = "21fe 31df a154 a261";
 let base: string;
 let file: string;
 let marker: string; // records that the first run happened
+let legacy: string; // where versions before this one kept the list
 
 beforeEach(() => {
   base = fs.mkdtempSync(path.join(os.tmpdir(), "csm-devices-"));
   file = path.join(base, "session-monitor", "remote", "devices.json");
   marker = path.join(base, "session-monitor", "remote", "devices-first-run.json");
+  legacy = path.join(base, "session-monitor", "remote-devices.json");
   warn.mockReset();
 });
 
@@ -91,6 +93,7 @@ function gate(
   const g = new DeviceGate({
     file,
     marker,
+    legacy,
     fs: nodeDeviceFs,
     now: o.now ?? (() => T0),
     prompt: async (d, sameName) => {
@@ -510,6 +513,50 @@ describe("DeviceGate: the first run happens once", () => {
     expect(fs.existsSync(marker)).toBe(true);
   });
 
+  it("takes over the list earlier versions kept in the monitor folder itself, decisions included, without asking the relay, and leaves that file to them", async () => {
+    const old = JSON.stringify({ version: 1, devices: { [IPHONE]: allowed("iPhone"), [IPAD]: denied("iPad"), [NEW]: allowed("iPad mini", T0) } });
+    fs.mkdirSync(path.dirname(legacy), { recursive: true });
+    fs.writeFileSync(legacy, old);
+    const relay = async () =>
+      tokens(
+        { id: IPHONE, name: "iPhone", createdAt: CUTOFF - DAY },
+        { id: IPAD, name: "iPad", createdAt: CUTOFF - DAY },
+        { id: NEW, name: "iPad mini", createdAt: T0 },
+      );
+    const { g, lookup, lookups, prompts } = gate({ relay });
+    expect(await g.refusal(IPAD, lookup)).toBe(PENDING);
+    await vi.waitFor(() => expect(fs.existsSync(file)).toBe(true));
+    expect(readStore()).toEqual(JSON.parse(old));
+    expect(fs.existsSync(marker)).toBe(true);
+    expect(await g.refusal(IPAD, lookup)).toBe(DENIED);
+    expect(await g.refusal(NEW, lookup)).toBeNull();
+    await flush();
+    expect(lookups()).toBe(0);
+    expect(prompts).toEqual([]);
+    expect(fs.readFileSync(legacy, "utf8")).toBe(old);
+  });
+
+  it("migrates from the relay as before when the earlier versions' list is not a version 1 device list", async () => {
+    fs.mkdirSync(path.dirname(legacy), { recursive: true });
+    fs.writeFileSync(legacy, "{ not a list");
+    const { g, lookup, lookups } = gate({ relay: async () => tokens({ id: IPHONE, name: "iPhone", createdAt: CUTOFF - DAY }) });
+    await g.migrate(lookup);
+    expect(lookups()).toBe(1);
+    expect(Object.keys(readStore().devices)).toEqual([IPHONE]);
+    expect(fs.existsSync(marker)).toBe(true);
+  });
+
+  it("never takes over the earlier versions' list once the first run is recorded: a lost list stays lost", async () => {
+    writeStore({ [IPHONE]: allowed("iPhone") });
+    const { g, lookup } = gate();
+    await g.migrate(lookup);
+    fs.rmSync(file);
+    fs.writeFileSync(legacy, JSON.stringify({ version: 1, devices: { [IPHONE]: allowed("iPhone") } }));
+    await g.migrate(lookup);
+    expect(await g.refusal(IPHONE, lookup)).toBe(MISSING);
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
   it("saves no decision into a list that went missing after the first run", async () => {
     writeStore({ [IPHONE]: allowed("iPhone") });
     let answer: (d: DeviceDecision) => void = () => undefined;
@@ -723,6 +770,7 @@ describe("where the device list lives", () => {
     const paths = devicePaths(monitor);
     expect(path.relative(monitor, paths.file)).toBe(path.join("remote", "devices.json"));
     expect(path.relative(monitor, paths.marker)).toBe(path.join("remote", "devices-first-run.json"));
+    expect(path.relative(monitor, paths.legacy)).toBe("remote-devices.json"); // where versions before this one kept the list
     // An older window's cleanup removes every top-level .json file older than 12 h.
     const old = new Date(Date.now() - 13 * 3600_000);
     for (const f of [paths.file, paths.marker]) {

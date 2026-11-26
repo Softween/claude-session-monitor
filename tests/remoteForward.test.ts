@@ -1,4 +1,4 @@
-import { createHash } from "crypto";
+import { createHash, createPrivateKey, randomUUID, sign } from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -48,16 +48,18 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-/** What the windows of one Mac share: a temp folder with the health files, the inboxes and the seen-id store. */
+/** What the windows of one Mac share: a temp folder with the health files, the inboxes and the seen-id store, and the nonces taken. */
 interface Machine {
   dir: string;
   ended: Set<number>; // pids whose process ended
+  nonces: { claim(id: string): boolean }; // the signed commands' nonces (remoteSigned.ts), in memory here
 }
 
 function machine(): Machine {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "csm-forward-"));
   dirs.push(dir);
-  return { dir, ended: new Set() };
+  const taken = new Set<string>();
+  return { dir, ended: new Set(), nonces: { claim: (id) => !taken.has(id) && !!taken.add(id) } };
 }
 
 /** Window `win`'s health file, written now (live) unless `over` says otherwise. */
@@ -89,8 +91,25 @@ interface Win {
 
 type Exec = (cmd: FleetCommand, signal: AbortSignal) => Promise<CommandOutcome>;
 
-/** Every paired device confirmed on this Mac (remoteDevices.ts): the tests that are not about the device check. */
-const everyDevice: DeviceCheck = { migrate: async () => undefined, refusal: async () => null };
+// The phone's key in these tests (the RFC 8032 test 1 key) and the arguments its signature covers (remoteSigned.ts).
+const KEY = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+const phoneKey = createPrivateKey({
+  key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), Buffer.from("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60", "hex")]),
+  format: "der",
+  type: "pkcs8",
+});
+const ARG_NAMES = ["sessionId", "text", "account", "cwd", "enabled", "toolUseId", "answers"];
+
+/** `cmd` as the relay serves it: from device phone-1 unless it names one, signed by the phone for host "mac" now, with a fresh nonce. */
+function signedByPhone(cmd: FleetCommand): FleetCommand {
+  const deviceId = cmd.deviceId ?? "phone-1";
+  const args = Object.fromEntries(Object.entries(cmd).filter(([name]) => ARG_NAMES.includes(name)));
+  const text = JSON.stringify({ v: 1, nonce: randomUUID(), deviceId, host: "mac", type: cmd.type, args, ts: Date.now() });
+  return { ...cmd, deviceId, signed: text, sig: sign(null, Buffer.from(text, "utf8"), phoneKey).toString("base64") };
+}
+
+/** Every paired device confirmed on this Mac with the phone's key pinned (remoteDevices.ts): the tests that are not about the device check. */
+const everyDevice: DeviceCheck = { migrate: async () => undefined, refusal: async () => null, pinnedKey: () => KEY, askToPin: () => false };
 
 /** A window's bridge on the machine; its executor answers "ran in <win>" unless the test passes one. */
 function windowOn(m: Machine, win: string, exec?: Exec, over: Partial<ForwardDeps> = {}, devices: DeviceCheck = everyDevice): Win {
@@ -123,6 +142,7 @@ function windowOn(m: Machine, win: string, exec?: Exec, over: Partial<ForwardDep
     forward,
     holdsChanged: () => void w.changed++,
     devices,
+    nonces: m.nonces,
   });
   bridges.push(w.bridge);
   return w;
@@ -141,7 +161,10 @@ function response(body: unknown) {
   return { ok: true, status: 200, headers: { get: (n: string) => (n.toLowerCase() === "content-length" ? String(text.length) : null) }, text: async () => text };
 }
 
-/** A relay every window polls: poll n (from any window) gets batches[n] once `gate` opens, later polls hang until their bridge stops. */
+/**
+ * A relay every window polls: poll n (from any window) gets batches[n], each command signed by the phone, once `gate`
+ * opens; later polls hang until their bridge stops.
+ */
 function relay(batches: FleetCommand[][], gate: Promise<void> = Promise.resolve()) {
   const results: Array<{ id: string; body: CommandOutcome }> = [];
   let polls = 0;
@@ -150,7 +173,7 @@ function relay(batches: FleetCommand[][], gate: Promise<void> = Promise.resolve(
       const batch = batches[polls++];
       if (!batch) return new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(new Error("aborted"))));
       await gate;
-      return response({ success: true, data: { commands: batch } });
+      return response({ success: true, data: { commands: batch.map(signedByPhone) } });
     }
     const hit = /\/fleet\/commands\/([^/]+)\/result$/.exec(url);
     if (hit) results.push({ id: decodeURIComponent(hit[1]), body: JSON.parse(init.body ?? "{}") });
@@ -229,7 +252,8 @@ describe("a tab-bound remote command runs in the window that holds the session",
 
     expect(r.results[0]).toEqual({ id: "c1", body: { ok: true, message: "delivered via typed" } });
     expect(a.ran).toEqual([]);
-    expect(b.ran).toEqual([{ id: "c1", type: "send", sessionId: SID, text: "run the tests", createdAt: expect.any(Number), deviceId: "phone-1" }]); // unchanged
+    // As handed over: built from the signed type and arguments, with the relay's id, device and time.
+    expect(b.ran).toEqual([{ id: "c1", type: "send", sessionId: SID, text: "run the tests", createdAt: expect.any(Number), deviceId: "phone-1" }]);
     expect(a.logs.join("\n")).toContain(`send c1 handed to window ${WIN_B}, which holds the session`);
     expect(b.logs.join("\n")).toContain(`send c1 from window ${WIN_A} -> ok: delivered via typed`);
     expect(inboxFiles(m)).toEqual([]); // the command and its result were removed once read
@@ -287,6 +311,8 @@ describe("a tab-bound remote command runs in the window that holds the session",
       expect(fs.statSync(path.join(inbox, name)).mode & 0o777).toBe(0o600);
     }
     expect(parseRequest(fs.readFileSync(path.join(inbox, name), "utf8"))).toMatchObject({ from: WIN_A, cmd: { id: "c1", type: "resume", sessionId: SID } });
+    // The command built from the signed type and arguments, without the signature: the holder does not check it again.
+    expect(parseRequest(fs.readFileSync(path.join(inbox, name), "utf8"))?.cmd).toEqual({ id: "c1", type: "resume", sessionId: SID, deviceId: "phone-1", createdAt: expect.any(Number) });
     expect(r.results).toEqual([]);
 
     m.ended.add(HOLDER_PID);
@@ -594,6 +620,8 @@ describe("the window that holds the session checks a handed-over command again",
         checked.push([deviceId, ask]);
         return deviceId === "phone-1" ? null : NOT_CONFIRMED;
       },
+      pinnedKey: () => KEY,
+      askToPin: () => false,
     };
     const b = windowOn(m, WIN_B, undefined, {}, devices);
     record(m, "c1");

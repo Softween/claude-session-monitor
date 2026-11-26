@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanupEndedMonitorFiles, cleanupMonitorFiles } from "../src/core";
 
 const warn = vi.hoisted(() => vi.fn<(...args: unknown[]) => Promise<string | undefined>>(async () => undefined));
 vi.mock("vscode", () => ({ window: { showWarningMessage: warn } }));
@@ -9,16 +10,20 @@ vi.mock("vscode", () => ({ window: { showWarningMessage: warn } }));
 import {
   DENIED,
   DEVICE_MIGRATION_CUTOFF,
+  MISSING,
   NOT_CONFIRMED,
   PENDING,
   UNREADABLE,
   DeviceGate,
   askOnThisMac,
+  askPinOnThisMac,
   deviceName,
+  devicePaths,
   nodeDeviceFs,
   pairedDevices,
   type DeviceDecision,
   type PairedDevice,
+  type PinDecision,
 } from "../src/remoteDevices";
 
 const T0 = Date.UTC(2026, 10, 21, 12, 0, 0);
@@ -28,20 +33,28 @@ const IPHONE = "11111111-1111-4111-8111-111111111111";
 const IPAD = "22222222-2222-4222-8222-222222222222";
 const NEW = "33333333-3333-4333-8333-333333333333";
 const WORK = "44444444-4444-4444-8444-444444444444";
+// The RFC 8032 test 1 and test 2 public keys (base64 of the raw 32 bytes) and the first one's fingerprint.
+const KEY = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+const OTHER_KEY = "PUAXw+hDiVqStwqnTRt+vJyYLM8uxJaMwM1V8Sr0Zgw=";
+const FP = "21fe 31df a154 a261";
 
 let base: string;
 let file: string;
+let marker: string; // records that the first run happened
+let legacy: string; // where versions before this one kept the list
 
 beforeEach(() => {
   base = fs.mkdtempSync(path.join(os.tmpdir(), "csm-devices-"));
-  file = path.join(base, "session-monitor", "remote-devices.json");
+  file = path.join(base, "session-monitor", "remote", "devices.json");
+  marker = path.join(base, "session-monitor", "remote", "devices-first-run.json");
+  legacy = path.join(base, "session-monitor", "remote-devices.json");
   warn.mockReset();
 });
 
 afterEach(() => fs.rmSync(base, { recursive: true, force: true }));
 
 /** The relay's GET /fleet/tokens data, as the bridge's request resolves it. */
-const tokens = (...list: Array<{ id: string; name: string; createdAt: number | null }>) => ({
+const tokens = (...list: Array<{ id: string; name: string; createdAt: number | null; publicKey?: string | null }>) => ({
   tokens: list.map((t) => ({ ...t, lastUsedAt: null, current: false })),
 });
 
@@ -58,15 +71,29 @@ const readStore = () => JSON.parse(fs.readFileSync(file, "utf8"));
 /** Lets the background lookup and prompt run when nothing holds them open. */
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
-/** A gate over `file`; each prompt takes the next of `answers` (a pending promise holds the notification or modal open). */
-function gate(o: { relay?: () => Promise<unknown>; answers?: Array<DeviceDecision | Promise<DeviceDecision>>; now?: () => number } = {}) {
+/**
+ * A gate over `file`; each prompt takes the next of `answers`, each prompt to pin a key the next of `pinAnswers`
+ * (a pending promise holds the notification or modal open).
+ */
+function gate(
+  o: {
+    relay?: () => Promise<unknown>;
+    answers?: Array<DeviceDecision | Promise<DeviceDecision>>;
+    pinAnswers?: Array<PinDecision | Promise<PinDecision>>;
+    now?: () => number;
+  } = {},
+) {
   const prompts: PairedDevice[] = [];
+  const pinPrompts: PairedDevice[] = [];
   const sameNames: string[][] = [];
   const logs: string[] = [];
   const answers = [...(o.answers ?? [])];
+  const pinAnswers = [...(o.pinAnswers ?? [])];
   let lookups = 0;
   const g = new DeviceGate({
     file,
+    marker,
+    legacy,
     fs: nodeDeviceFs,
     now: o.now ?? (() => T0),
     prompt: async (d, sameName) => {
@@ -74,13 +101,17 @@ function gate(o: { relay?: () => Promise<unknown>; answers?: Array<DeviceDecisio
       sameNames.push(sameName);
       return answers.shift();
     },
+    askPin: async (d) => {
+      pinPrompts.push(d);
+      return await pinAnswers.shift();
+    },
     log: (m) => logs.push(m),
   });
   const lookup = async () => {
     lookups++;
     return (o.relay ?? (async () => tokens()))();
   };
-  return { g, lookup, prompts, sameNames, logs, lookups: () => lookups };
+  return { g, lookup, prompts, pinPrompts, sameNames, logs, lookups: () => lookups };
 }
 
 describe("DeviceGate: which devices run commands", () => {
@@ -315,6 +346,232 @@ describe("DeviceGate: first run", () => {
   });
 });
 
+describe("DeviceGate: the key a device signs its commands with", () => {
+  const iPhone = (publicKey: string = KEY): PairedDevice => ({ id: IPHONE, name: "iPhone", pairedAt: T0 - DAY, publicKey });
+
+  it("Allow in the modal pins the key the modal showed; Deny pins nothing", async () => {
+    writeStore({});
+    const relay = async () => tokens({ id: NEW, name: "iPad", createdAt: T0, publicKey: KEY }, { id: IPAD, name: "Old iPad", createdAt: T0, publicKey: OTHER_KEY });
+    const { g, lookup, prompts, logs } = gate({ relay, answers: ["allow", "deny"] });
+    expect(await g.refusal(NEW, lookup)).toBe(NOT_CONFIRMED);
+    await vi.waitFor(() => expect(readStore().devices[NEW]).toEqual({ state: "allowed", name: "iPad", pairedAt: T0, decidedAt: T0, publicKey: KEY }));
+    expect(prompts[0]).toEqual({ id: NEW, name: "iPad", pairedAt: T0, publicKey: KEY });
+    expect(g.pinnedKey(NEW)).toBe(KEY);
+    expect(logs.join("\n")).toContain(FP);
+    expect(await g.refusal(IPAD, lookup)).toBe(NOT_CONFIRMED);
+    await vi.waitFor(() => expect(readStore().devices[IPAD]).toEqual({ state: "denied", name: "Old iPad", pairedAt: T0, decidedAt: T0 }));
+    expect(g.pinnedKey(IPAD)).toBeUndefined();
+  });
+
+  it("an Allow keeps a key pinned before it: another window allowed the device with its key while this modal was open", async () => {
+    writeStore({});
+    let answer: (d: DeviceDecision) => void = () => undefined;
+    const open = new Promise<DeviceDecision>((resolve) => (answer = resolve));
+    const relay = async () => tokens({ id: NEW, name: "iPad", createdAt: T0, publicKey: OTHER_KEY });
+    const { g, lookup, prompts } = gate({ relay, answers: [open] });
+    expect(await g.refusal(NEW, lookup)).toBe(NOT_CONFIRMED);
+    await vi.waitFor(() => expect(prompts).toHaveLength(1));
+    writeStore({ [NEW]: { ...allowed("iPad", T0), publicKey: KEY } });
+    answer("allow");
+    await vi.waitFor(() => expect(readStore().devices[NEW].decidedAt).toBe(T0));
+    expect(readStore().devices[NEW]).toEqual({ state: "allowed", name: "iPad", pairedAt: T0, decidedAt: T0, publicKey: KEY });
+  });
+
+  it("pinnedKey gives the key stored for a device as it is stored, and undefined when none is", () => {
+    writeStore({
+      [IPHONE]: { ...allowed("iPhone"), publicKey: KEY },
+      [IPAD]: allowed("iPad"),
+      [WORK]: { ...allowed("Work"), publicKey: null },
+      [NEW]: { ...allowed("New"), publicKey: "pk-iphone" },
+    });
+    const { g } = gate();
+    expect(g.pinnedKey(IPHONE)).toBe(KEY);
+    expect(g.pinnedKey(IPAD)).toBeUndefined();
+    expect(g.pinnedKey(WORK)).toBeUndefined();
+    // Not a key: nothing verifies against it, and it is never replaced.
+    expect(g.pinnedKey(NEW)).toBe("pk-iphone");
+    expect(g.pinnedKey("constructor")).toBeUndefined();
+    fs.writeFileSync(file, "{not json");
+    expect(g.pinnedKey(IPHONE)).toBeUndefined();
+  });
+
+  it("asks once per device at a time to pin the key of an allowed device without one, and Pin Key pins it keeping every other field", async () => {
+    writeStore({ [IPHONE]: allowed("iPhone"), [IPAD]: { ...allowed("iPad"), note: "kept" } }, { note: "kept" });
+    let answer: (pin: PinDecision) => void = () => undefined;
+    const open = new Promise<PinDecision>((resolve) => (answer = resolve));
+    const { g, pinPrompts, logs } = gate({ pinAnswers: [open] });
+    expect(g.askToPin(iPhone())).toBe(true);
+    expect(g.askToPin(iPhone())).toBe(true); // its prompt is open
+    await vi.waitFor(() => expect(pinPrompts).toHaveLength(1));
+    await flush();
+    expect(pinPrompts).toEqual([iPhone()]);
+    answer("pin");
+    await vi.waitFor(() => expect(g.pinnedKey(IPHONE)).toBe(KEY));
+    expect(readStore()).toEqual({
+      version: 1,
+      note: "kept",
+      devices: { [IPHONE]: { ...allowed("iPhone"), publicKey: KEY }, [IPAD]: { ...allowed("iPad"), note: "kept" } },
+    });
+    expect(logs.join("\n")).toContain(FP);
+  });
+
+  it("Deny Device in the pin prompt denies the device as Deny does: its commands are refused until it is paired again", async () => {
+    writeStore({ [IPHONE]: allowed("iPhone") });
+    const { g, lookup, pinPrompts } = gate({ pinAnswers: ["deny"] });
+    expect(g.askToPin(iPhone())).toBe(true);
+    await vi.waitFor(() => expect(readStore().devices[IPHONE]).toEqual({ ...allowed("iPhone"), state: "denied", decidedAt: T0 }));
+    expect(await g.refusal(IPHONE, lookup)).toBe(DENIED);
+    expect(g.askToPin(iPhone())).toBe(false);
+    expect(pinPrompts).toHaveLength(1);
+  });
+
+  it("after Don't Pin or a dismissal it does not ask about the device again for 10 minutes, in any window, and pins nothing", async () => {
+    writeStore({ [IPHONE]: allowed("iPhone") });
+    let clock = T0;
+    const one = gate({ pinAnswers: [undefined], now: () => clock });
+    expect(one.g.askToPin(iPhone())).toBe(true);
+    await vi.waitFor(() => expect(readStore().devices[IPHONE]).toEqual({ ...allowed("iPhone"), pinSkippedAt: T0 }));
+    const other = gate({ pinAnswers: ["pin"], now: () => clock }); // another window
+    clock = T0 + 10 * 60_000 - 1;
+    expect(one.g.askToPin(iPhone())).toBe(false);
+    expect(other.g.askToPin(iPhone())).toBe(false);
+    await flush();
+    expect([one.pinPrompts.length, other.pinPrompts.length]).toEqual([1, 0]);
+    expect(one.g.pinnedKey(IPHONE)).toBeUndefined();
+    clock = T0 + 10 * 60_000;
+    expect(other.g.askToPin(iPhone())).toBe(true);
+    await vi.waitFor(() => expect(other.g.pinnedKey(IPHONE)).toBe(KEY));
+  });
+
+  it("never asks for a device that has a key pinned, is not allowed or is not in the file, or for a device without a key", async () => {
+    writeStore({ [IPHONE]: { ...allowed("iPhone"), publicKey: OTHER_KEY }, [IPAD]: denied("iPad") });
+    const { g, pinPrompts } = gate({ pinAnswers: ["pin", "pin", "pin", "pin"] });
+    expect(g.askToPin(iPhone())).toBe(false);
+    expect(g.askToPin({ id: IPAD, name: "iPad", pairedAt: T0, publicKey: KEY })).toBe(false);
+    expect(g.askToPin({ id: NEW, name: "New", pairedAt: T0, publicKey: KEY })).toBe(false);
+    expect(g.askToPin({ id: WORK, name: "Work", pairedAt: T0 })).toBe(false);
+    await flush();
+    expect(pinPrompts).toEqual([]);
+    expect(readStore().devices).toEqual({ [IPHONE]: { ...allowed("iPhone"), publicKey: OTHER_KEY }, [IPAD]: denied("iPad") });
+  });
+
+  it("reads the file again before it pins: a key another window pinned meanwhile and a Deny given meanwhile both stay", async () => {
+    writeStore({ [IPHONE]: allowed("iPhone"), [IPAD]: allowed("iPad") });
+    const answers: Array<(pin: PinDecision) => void> = [];
+    const pending = () => new Promise<PinDecision>((resolve) => answers.push(resolve));
+    const { g, pinPrompts } = gate({ pinAnswers: [pending(), pending()] });
+    g.askToPin(iPhone());
+    g.askToPin({ id: IPAD, name: "iPad", pairedAt: T0 - DAY, publicKey: KEY });
+    await vi.waitFor(() => expect(pinPrompts).toHaveLength(2));
+    const meanwhile = { [IPHONE]: { ...allowed("iPhone"), publicKey: OTHER_KEY }, [IPAD]: denied("iPad") };
+    writeStore(meanwhile);
+    for (const answer of answers) answer("pin");
+    await flush();
+    await flush();
+    expect(readStore().devices).toEqual(meanwhile);
+  });
+});
+
+describe("DeviceGate: the first run happens once", () => {
+  it("records the first run in a marker under remote/: once the list goes missing, every command is refused and nothing migrates again", async () => {
+    const relay = async () => tokens({ id: IPHONE, name: "iPhone", createdAt: CUTOFF - DAY });
+    const { g, lookup, prompts, logs, lookups } = gate({ relay });
+    await g.migrate(lookup);
+    expect(Object.keys(readStore().devices)).toEqual([IPHONE]);
+    expect(fs.existsSync(marker)).toBe(true);
+    fs.rmSync(file);
+    const looked = lookups();
+    await g.migrate(lookup);
+    expect(await g.refusal(IPHONE, lookup)).toBe(MISSING);
+    expect(await g.refusal(NEW, lookup)).toBe(MISSING);
+    await flush();
+    expect(lookups()).toBe(looked);
+    expect(prompts).toEqual([]);
+    expect(fs.existsSync(file)).toBe(false);
+    expect(logs.join("\n")).toContain(marker); // how to start over on purpose
+  });
+
+  it("marks the first run for a list an earlier version wrote, so losing that list later is no reset either", async () => {
+    writeStore({ [IPHONE]: allowed("iPhone") });
+    const { g, lookup } = gate({ relay: async () => tokens({ id: IPHONE, name: "iPhone", createdAt: CUTOFF - DAY }) });
+    expect(fs.existsSync(marker)).toBe(false);
+    await g.migrate(lookup);
+    expect(fs.existsSync(marker)).toBe(true);
+    fs.rmSync(file);
+    expect(await g.refusal(IPHONE, lookup)).toBe(MISSING);
+  });
+
+  it("without the marker and the list it migrates as before: removing both starts over on purpose", async () => {
+    const relay = async () => tokens({ id: IPHONE, name: "iPhone", createdAt: CUTOFF - DAY });
+    const { g, lookup } = gate({ relay });
+    await g.migrate(lookup);
+    fs.rmSync(file);
+    fs.rmSync(marker);
+    expect(await g.refusal(IPHONE, lookup)).toBe(PENDING);
+    await vi.waitFor(() => expect(fs.existsSync(file)).toBe(true));
+    expect(await g.refusal(IPHONE, lookup)).toBeNull();
+    expect(fs.existsSync(marker)).toBe(true);
+  });
+
+  it("takes over the list earlier versions kept in the monitor folder itself, decisions included, without asking the relay, and leaves that file to them", async () => {
+    const old = JSON.stringify({ version: 1, devices: { [IPHONE]: allowed("iPhone"), [IPAD]: denied("iPad"), [NEW]: allowed("iPad mini", T0) } });
+    fs.mkdirSync(path.dirname(legacy), { recursive: true });
+    fs.writeFileSync(legacy, old);
+    const relay = async () =>
+      tokens(
+        { id: IPHONE, name: "iPhone", createdAt: CUTOFF - DAY },
+        { id: IPAD, name: "iPad", createdAt: CUTOFF - DAY },
+        { id: NEW, name: "iPad mini", createdAt: T0 },
+      );
+    const { g, lookup, lookups, prompts } = gate({ relay });
+    expect(await g.refusal(IPAD, lookup)).toBe(PENDING);
+    await vi.waitFor(() => expect(fs.existsSync(file)).toBe(true));
+    expect(readStore()).toEqual(JSON.parse(old));
+    expect(fs.existsSync(marker)).toBe(true);
+    expect(await g.refusal(IPAD, lookup)).toBe(DENIED);
+    expect(await g.refusal(NEW, lookup)).toBeNull();
+    await flush();
+    expect(lookups()).toBe(0);
+    expect(prompts).toEqual([]);
+    expect(fs.readFileSync(legacy, "utf8")).toBe(old);
+  });
+
+  it("migrates from the relay as before when the earlier versions' list is not a version 1 device list", async () => {
+    fs.mkdirSync(path.dirname(legacy), { recursive: true });
+    fs.writeFileSync(legacy, "{ not a list");
+    const { g, lookup, lookups } = gate({ relay: async () => tokens({ id: IPHONE, name: "iPhone", createdAt: CUTOFF - DAY }) });
+    await g.migrate(lookup);
+    expect(lookups()).toBe(1);
+    expect(Object.keys(readStore().devices)).toEqual([IPHONE]);
+    expect(fs.existsSync(marker)).toBe(true);
+  });
+
+  it("never takes over the earlier versions' list once the first run is recorded: a lost list stays lost", async () => {
+    writeStore({ [IPHONE]: allowed("iPhone") });
+    const { g, lookup } = gate();
+    await g.migrate(lookup);
+    fs.rmSync(file);
+    fs.writeFileSync(legacy, JSON.stringify({ version: 1, devices: { [IPHONE]: allowed("iPhone") } }));
+    await g.migrate(lookup);
+    expect(await g.refusal(IPHONE, lookup)).toBe(MISSING);
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it("saves no decision into a list that went missing after the first run", async () => {
+    writeStore({ [IPHONE]: allowed("iPhone") });
+    let answer: (d: DeviceDecision) => void = () => undefined;
+    const open = new Promise<DeviceDecision>((resolve) => (answer = resolve));
+    const { g, lookup, prompts } = gate({ relay: async () => tokens({ id: NEW, name: "iPad", createdAt: T0 }), answers: [open] });
+    await g.migrate(lookup);
+    expect(await g.refusal(NEW, lookup)).toBe(NOT_CONFIRMED);
+    await vi.waitFor(() => expect(prompts).toHaveLength(1));
+    fs.rmSync(file);
+    answer("allow");
+    await flush();
+    expect(fs.existsSync(file)).toBe(false);
+  });
+});
+
 describe("the notification and the modal", () => {
   const device: PairedDevice = { id: NEW, name: "Ali's iPad", pairedAt: T0 };
 
@@ -322,7 +579,7 @@ describe("the notification and the modal", () => {
     writeStore({});
     const answers: Array<(pick: string | undefined) => void> = [];
     warn.mockImplementation(() => new Promise((resolve) => answers.push(resolve)));
-    const g = new DeviceGate({ file, fs: nodeDeviceFs, now: () => T0, prompt: askOnThisMac, log: () => undefined });
+    const g = new DeviceGate({ file, marker, fs: nodeDeviceFs, now: () => T0, prompt: askOnThisMac, askPin: askPinOnThisMac, log: () => undefined });
     const lookup = async () => tokens({ id: NEW, name: "iPad", createdAt: T0 });
     expect(await g.refusal(NEW, lookup)).toBe(NOT_CONFIRMED);
     await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(1));
@@ -364,7 +621,7 @@ describe("the notification and the modal", () => {
 
   it("shows the pairing time and the id's first 8 characters before the name, and says when an allowed device has the same name", async () => {
     warn.mockResolvedValue("Review…");
-    const dated: PairedDevice = { id: NEW, name: "iPhone 15, paired with the relay on 3/2/2025, 9:41 AM?.", pairedAt: T0 };
+    const dated: PairedDevice = { id: NEW, name: "iPhone 15, paired with the relay on 3/2/25, 9:41 AM?.", pairedAt: T0 };
     await askOnThisMac(dated, []);
     await askOnThisMac(dated, [IPHONE]);
     await askOnThisMac(dated, [IPHONE, IPAD]);
@@ -384,6 +641,62 @@ describe("the notification and the modal", () => {
     expect(detail(5)).toContain(IPHONE.slice(0, 8));
     expect(detail(5)).toContain(IPAD.slice(0, 8));
     expect(warn.mock.calls[6][0]).toContain("an unknown time");
+  });
+
+  it("names the key's fingerprint first in the modal and says Allow pins it; for a device without a key it says it is asked later", async () => {
+    warn.mockResolvedValueOnce("Review…").mockResolvedValueOnce(undefined);
+    await askOnThisMac({ ...device, publicKey: KEY }, []);
+    const [message, options] = warn.mock.calls[1] as [string, { detail: string }];
+    expect(message.split("\n")).toEqual([`Agent Sessions: key fingerprint ${FP}`, expect.stringMatching(/^Run remote commands from the device paired/)]);
+    expect(options.detail).toMatch(/Allow also pins this key/);
+    expect(warn.mock.calls[0][0]).not.toContain(FP);
+    warn.mockResolvedValueOnce("Review…").mockResolvedValueOnce(undefined);
+    await askOnThisMac(device, []);
+    const [plainMessage, plain] = warn.mock.calls[3] as [string, { detail: string }];
+    expect(plainMessage).not.toMatch(/fingerprint/i);
+    expect(plain.detail).not.toMatch(/fingerprint/i);
+    expect(plain.detail).toMatch(/no key yet/);
+  });
+
+  it("asks to pin a key with a notification first, then a modal with the fingerprint first; Don't Pin is its first button, the one Return presses", async () => {
+    const keyed: PairedDevice = { ...device, publicKey: KEY };
+    warn.mockResolvedValueOnce(undefined);
+    expect(await askPinOnThisMac(keyed)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0].slice(1)).toEqual(["Review…"]);
+    for (const [pick, decision] of [["Don't Pin", undefined], [undefined, undefined], ["Pin Key", "pin"], ["Deny Device", "deny"]] as const) {
+      warn.mockResolvedValueOnce("Review…").mockResolvedValueOnce(pick);
+      expect(await askPinOnThisMac(keyed)).toBe(decision);
+    }
+    expect(warn).toHaveBeenCalledTimes(9);
+    const [message, options, ...buttons] = warn.mock.calls[2] as [string, { modal?: boolean; detail?: string }, ...string[]];
+    expect(options.modal).toBe(true);
+    const [first, second] = message.split("\n");
+    expect(first).toBe(`Agent Sessions: key fingerprint ${FP}`);
+    expect(second).toContain("now signs its commands");
+    expect(second.indexOf(NEW.slice(0, 8))).toBeLessThan(second.indexOf(device.name));
+    expect(options.detail).toMatch(/Deny Device/);
+    // A fingerprint the phone does not show did not come from the phone: the text steers that to Don't Pin.
+    expect(options.detail).toContain("Pin only if the phone shows this same fingerprint (on the phone: Ayarlar > Eşleştirilmiş cihazlar > Anahtar parmak izi).");
+    expect(options.detail).toContain("If it differs, choose Don't Pin: the key did not come from the phone.");
+    expect(buttons).toEqual(["Don't Pin", "Pin Key", "Deny Device"]);
+  });
+
+  it("shows a relay name that looks like a fingerprint as a placeholder, in the notifications and in both dialogs", async () => {
+    warn.mockResolvedValue("Review…");
+    for (const name of ["iPhone, key fingerprint 21fe 31df a154 a261", "Fingerprint checked", "iPad 21FE", "iPad ２１ｆｅ"]) {
+      warn.mockClear();
+      await askOnThisMac({ ...device, name, publicKey: OTHER_KEY }, []);
+      await askPinOnThisMac({ ...device, name, publicKey: OTHER_KEY });
+      expect(warn).toHaveBeenCalledTimes(4);
+      for (const [message] of warn.mock.calls as Array<[string]>) {
+        expect(message).not.toContain(name);
+        expect(message).toContain('named "[name not shown]"');
+      }
+    }
+    warn.mockClear();
+    await askPinOnThisMac({ ...device, name: "Ali's iPhone 15", publicKey: OTHER_KEY });
+    expect(warn.mock.calls[1][0]).toContain(`named "Ali's iPhone 15"`);
   });
 
   it("never lets the device name form a link in the notification", async () => {
@@ -431,6 +744,44 @@ describe("device names and the relay's list", () => {
     ]);
     for (const data of [undefined, {}, { tokens: "none" }]) expect(() => pairedDevices(data)).toThrow();
   });
+
+  it("reads a device's key only when it is canonical base64 of 32 bytes", () => {
+    const listed = pairedDevices({
+      tokens: [
+        { id: NEW, name: "iPad", createdAt: 5, publicKey: KEY },
+        { id: IPAD, name: "Old iPad", createdAt: 5, publicKey: null },
+        { id: IPHONE, name: "iPhone", createdAt: 5, publicKey: KEY.slice(0, -1) },
+        { id: WORK, name: "Work", createdAt: 5, publicKey: Buffer.alloc(33).toString("base64") },
+      ],
+    });
+    expect(listed).toEqual([
+      { id: NEW, name: "iPad", pairedAt: 5, publicKey: KEY },
+      { id: IPAD, name: "Old iPad", pairedAt: 5 },
+      { id: IPHONE, name: "iPhone", pairedAt: 5 },
+      { id: WORK, name: "Work", pairedAt: 5 },
+    ]);
+    expect(listed.slice(1).some((d) => "publicKey" in d)).toBe(false);
+  });
+});
+
+describe("where the device list lives", () => {
+  it("keeps the list and its first-run record in remote/, which no monitor folder cleanup looks into, however old they are", () => {
+    const monitor = path.join(base, "session-monitor");
+    const paths = devicePaths(monitor);
+    expect(path.relative(monitor, paths.file)).toBe(path.join("remote", "devices.json"));
+    expect(path.relative(monitor, paths.marker)).toBe(path.join("remote", "devices-first-run.json"));
+    expect(path.relative(monitor, paths.legacy)).toBe("remote-devices.json"); // where versions before this one kept the list
+    // An older window's cleanup removes every top-level .json file older than 12 h.
+    const old = new Date(Date.now() - 13 * 3600_000);
+    for (const f of [paths.file, paths.marker]) {
+      nodeDeviceFs.write(f, JSON.stringify({ version: 1, devices: {} }), false);
+      fs.utimesSync(f, old, old);
+    }
+    const nowSec = Date.now() / 1000;
+    cleanupMonitorFiles(12 * 3600_000, nowSec, monitor);
+    cleanupEndedMonitorFiles(nowSec, 12 * 3600_000, monitor);
+    expect([fs.existsSync(paths.file), fs.existsSync(paths.marker)]).toEqual([true, true]);
+  });
 });
 
 describe("nodeDeviceFs", () => {
@@ -448,10 +799,10 @@ describe("nodeDeviceFs", () => {
     // Only when new: the file exists, so nothing changes.
     expect(nodeDeviceFs.write(file, "three", true)).toBe(false);
     expect(nodeDeviceFs.read(file)).toBe("two");
-    expect(fs.readdirSync(dir)).toEqual(["remote-devices.json"]);
-    const other = path.join(base, "fresh", "remote-devices.json");
+    expect(fs.readdirSync(dir)).toEqual(["devices.json"]);
+    const other = path.join(base, "fresh", "devices.json");
     expect(nodeDeviceFs.write(other, "new", true)).toBe(true);
     expect(nodeDeviceFs.read(other)).toBe("new");
-    expect(fs.readdirSync(path.dirname(other))).toEqual(["remote-devices.json"]);
+    expect(fs.readdirSync(path.dirname(other))).toEqual(["devices.json"]);
   });
 });

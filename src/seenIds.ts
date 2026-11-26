@@ -4,8 +4,9 @@
  * 0700, files 0600), holding when it was recorded. Recording an id creates its
  * file atomically and fails while the file exists, so of two windows that get
  * the same id at the same time only one goes on. Records are kept for 10
- * minutes (a remote command stays valid for 2), then removed, and so is a temp
- * file a crash left once it is 2 minutes old. The remote bridge records each
+ * minutes (a remote command stays valid for 2), then removed by their file
+ * time, which is the time they hold; a record whose file time cannot be read
+ * stays. A temp file a crash left goes once it is 2 minutes old. The remote bridge records each
  * command id before it runs (remoteForward.ts). No vscode import: the clock and
  * the file system come in through SeenDeps.
  */
@@ -20,12 +21,12 @@ const RECORD = /^[0-9a-f]{32}\.json$/;
 
 /** The file operations of the store; nodeSeenFs is the real one. */
 export interface SeenFs {
-  /** Creates `file` holding `text` unless it exists, atomically (the folder is created 0700); false when it exists. */
-  create(file: string, text: string): boolean;
+  /** Creates `file` holding `text` unless it exists, atomically (the folder is created 0700), with `mtimeMs` as its file time when given; false when it exists. */
+  create(file: string, text: string, mtimeMs?: number): boolean;
   read(file: string): string | undefined; // undefined when missing or unreadable
   list(dir: string): string[]; // [] when the folder is missing
   remove(file: string): void;
-  mtimeMs(file: string): number | undefined; // undefined when missing
+  mtimeMs(file: string): number | undefined; // undefined when missing or when it cannot be read
 }
 
 export interface SeenDeps {
@@ -46,7 +47,8 @@ export class SeenIds {
   /** Records `id` now: true when it was not recorded yet, false when it was (within the retention). */
   claim(id: string): boolean {
     this.prune();
-    return this.deps.fs.create(this.fileOf(id), JSON.stringify({ ts: this.deps.now() }));
+    const now = this.deps.now();
+    return this.deps.fs.create(this.fileOf(id), JSON.stringify({ ts: now }), now);
   }
 
   /** Whether `id` is recorded within the retention. */
@@ -55,7 +57,10 @@ export class SeenIds {
     return ts !== undefined && this.deps.now() - ts < this.retainMs;
   }
 
-  /** Removes the records older than the retention, the unreadable ones and the temp files a crash left. */
+  /**
+   * Removes the records whose file time is older than the retention, without reading them, and the temp files a
+   * crash left. A record whose file time cannot be read stays, so a failing disk never lets an id through again.
+   */
   prune(): void {
     const now = this.deps.now();
     for (const name of this.deps.fs.list(this.deps.dir)) {
@@ -66,8 +71,8 @@ export class SeenIds {
         if (mtime !== undefined && now - mtime > TEMP_MAX_AGE_MS) this.deps.fs.remove(file);
         continue;
       }
-      const ts = this.recordedAt(file);
-      if (ts === undefined || now - ts >= this.retainMs) this.deps.fs.remove(file);
+      const mtime = this.deps.fs.mtimeMs(file);
+      if (mtime !== undefined && now - mtime >= this.retainMs) this.deps.fs.remove(file);
     }
   }
 
@@ -86,17 +91,18 @@ export class SeenIds {
 }
 
 /**
- * The real file system. create writes a temp file (0600) and hard-links it to
- * the record's name: the link fails while the name exists, and a reader never
- * sees a record without its time.
+ * The real file system. create writes a temp file (0600), gives it its file
+ * time and hard-links it to the record's name: the link fails while the name
+ * exists, and a reader never sees a record without its time.
  */
 export const nodeSeenFs: SeenFs = {
-  create(file, text) {
+  create(file, text, mtimeMs) {
     const dir = path.dirname(file);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`);
     try {
       fs.writeFileSync(tmp, text, { mode: 0o600, flag: "wx" });
+      if (mtimeMs !== undefined) fs.utimesSync(tmp, mtimeMs / 1000, mtimeMs / 1000);
       fs.linkSync(tmp, file);
       return true;
     } catch (e) {

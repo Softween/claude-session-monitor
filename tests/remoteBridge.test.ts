@@ -1,3 +1,4 @@
+import { createPrivateKey, randomUUID, sign } from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -23,6 +24,8 @@ import type { PeerSendResult } from "../src/peerSend";
 import { DEFAULT_ALLOWED_COMMANDS, REMOTE_COMMAND_TYPES } from "../src/remote";
 import { RemoteBridge, TYPED_REASON, deliverText, remoteAllowedCommands, remoteFlag, type CommandOutcome, type FleetCommand, type PathAttempt } from "../src/remoteBridge";
 import { DeviceGate, nodeDeviceFs, type DeviceCheck } from "../src/remoteDevices";
+import { RemoteForwarder } from "../src/remoteForward";
+import { CONFIRM_KEY, NONCE_SEEN, NOT_VERIFIED, OTHER_HOST, TOO_OLD, UNSIGNED } from "../src/remoteSigned";
 
 afterEach(() => {
   settings.clear();
@@ -285,8 +288,34 @@ function relay(commands: unknown[], contentLength?: string, tokens: unknown[] = 
   return { calls, results };
 }
 
-/** Every device confirmed: the tests that are not about the device check (remoteDevices.ts). */
-const everyDevice: DeviceCheck = { migrate: async () => undefined, refusal: async () => null };
+// The phone's key in these tests: the RFC 8032 test 1 key (remoteSigned.test.ts checks the protocol's test vector with it).
+const KEY = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+const phoneKey = createPrivateKey({
+  key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), Buffer.from("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60", "hex")]),
+  format: "der",
+  type: "pkcs8",
+});
+const ARG_NAMES = ["sessionId", "text", "account", "cwd", "enabled", "toolUseId", "answers"];
+
+/**
+ * `cmd` as the phone sends it through the relay: its type and arguments signed for host "mac" with a fresh nonce
+ * and the current time, by device "phone" unless `cmd` names one (undefined included); `over` replaces signed fields.
+ */
+function signed<T extends { type: string; deviceId?: string | null }>(cmd: T, over: Record<string, unknown> = {}): T & { signed: string; sig: string } {
+  const withDevice: T = "deviceId" in cmd ? cmd : { ...cmd, deviceId: "phone" };
+  const args = Object.fromEntries(Object.entries(cmd).filter(([name]) => ARG_NAMES.includes(name)));
+  const text = JSON.stringify({ v: 1, nonce: randomUUID(), deviceId: withDevice.deviceId, host: "mac", type: cmd.type, args, ts: Date.now(), ...over });
+  return { ...withDevice, signed: text, sig: sign(null, Buffer.from(text, "utf8"), phoneKey).toString("base64") };
+}
+
+/** A nonce store in memory: each nonce is taken once. */
+function memoryNonces(): { claim(id: string): boolean } {
+  const taken = new Set<string>();
+  return { claim: (id) => !taken.has(id) && !!taken.add(id) };
+}
+
+/** Every device confirmed, with the phone's key pinned: the tests that are not about the device check (remoteDevices.ts). */
+const everyDevice: DeviceCheck = { migrate: async () => undefined, refusal: async () => null, pinnedKey: () => KEY, askToPin: () => false };
 
 /** A bridge on the fake relay; `flags` are user settings (commands on unless a test passes its own). */
 function startBridge(
@@ -301,15 +330,15 @@ function startBridge(
     extension: { packageJSON: { version: "0.0.0-test" } },
     secrets: { get: async () => JSON.stringify({ origin: "https://relay.test", token: "test-token" }) },
   };
-  return new RemoteBridge(ctx as never, { log: () => undefined, accounts: () => ({ accounts: [], bestId: null }), execute, devices });
+  return new RemoteBridge(ctx as never, { log: () => undefined, accounts: () => ({ accounts: [], bestId: null }), execute, devices, nonces: memoryNonces() });
 }
 
 describe("RemoteBridge command loop", () => {
   it("runs at most 20 commands per poll, expires old or undated ones unrun, and refuses redirects", async () => {
     const now = Date.now();
-    const commands: FleetCommand[] = Array.from({ length: 25 }, (_, i) => ({ id: `c${i}`, type: "kill", sessionId: "s1", createdAt: now }));
+    const commands: FleetCommand[] = Array.from({ length: 25 }, (_, i) => signed({ id: `c${i}`, type: "kill", sessionId: "s1", createdAt: now }));
     commands[1] = { ...commands[1], createdAt: now - 121_000 };
-    commands[2] = { id: "c2", type: "kill", sessionId: "s1" };
+    commands[2] = signed({ id: "c2", type: "kill", sessionId: "s1" });
     const r = relay(commands);
     const executed: string[] = [];
     const bridge = startBridge(async (cmd) => {
@@ -358,7 +387,7 @@ describe("RemoteBridge command loop", () => {
   it("runs only allowed types: by default send, newSession, switchAccount and unknown types are answered unrun", async () => {
     const now = Date.now();
     const types = ["resume", "send", "kill", "newSession", "resumeAll", "switchAccount", "autoResume", "answer", "reboot"];
-    const r = relay(types.map((type, i) => ({ id: `t${i}`, type, sessionId: "s1", createdAt: now })));
+    const r = relay(types.map((type, i) => signed({ id: `t${i}`, type, sessionId: "s1", createdAt: now })));
     const executed: string[] = [];
     const bridge = startBridge(async (cmd) => {
       executed.push(cmd.type);
@@ -378,8 +407,8 @@ describe("RemoteBridge command loop", () => {
   it("a user allowlist replaces the default one", async () => {
     const now = Date.now();
     const r = relay([
-      { id: "s1", type: "send", sessionId: "s1", text: "hi", createdAt: now },
-      { id: "k1", type: "kill", sessionId: "s1", createdAt: now },
+      signed({ id: "s1", type: "send", sessionId: "s1", text: "hi", createdAt: now }),
+      signed({ id: "k1", type: "kill", sessionId: "s1", createdAt: now }),
     ]);
     const execute = vi.fn(async () => ({ ok: true, message: "ran" }));
     const bridge = startBridge(execute, { "remote.acceptCommands": true, "remote.allowedCommands": ["send"] });
@@ -396,7 +425,7 @@ describe("RemoteBridge command loop", () => {
 
   it("answers 'timed out' when a command runs past 60 s", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const r = relay([{ id: "slow", type: "kill", sessionId: "s1", createdAt: Date.now() }]);
+    const r = relay([signed({ id: "slow", type: "kill", sessionId: "s1", createdAt: Date.now() })]);
     const bridge = startBridge(() => new Promise<CommandOutcome>(() => undefined));
     await bridge.restart();
     await vi.advanceTimersByTimeAsync(59_000);
@@ -408,7 +437,7 @@ describe("RemoteBridge command loop", () => {
 
   it("cancels a command that runs past 60 s: its signal aborts and it types nothing more", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const r = relay([{ id: "slow", type: "send", sessionId: "s1", text: "a long text", createdAt: Date.now() }]);
+    const r = relay([signed({ id: "slow", type: "send", sessionId: "s1", text: "a long text", createdAt: Date.now() })]);
     let keystrokes = 0;
     let signal: AbortSignal | undefined;
     const bridge = startBridge(
@@ -435,7 +464,7 @@ describe("RemoteBridge command loop", () => {
   });
 
   it("after a newSession that started, pushes a snapshot inside the 10 s gap before it posts the result", async () => {
-    const r = relay([{ id: "n1", type: "newSession", cwd: "/r/app", createdAt: Date.now() }]);
+    const r = relay([signed({ id: "n1", type: "newSession", cwd: "/r/app", createdAt: Date.now() })]);
     let release: () => void = () => undefined;
     const gate = new Promise<void>((resolve) => (release = resolve));
     const bridge = startBridge(
@@ -509,6 +538,7 @@ describe("remote.allowedCwds in the pushed snapshot", () => {
       execute: async () => ({ ok: true, message: "" }),
       allowedCwds: () => ["/r/app", "/x/tool"],
       devices: everyDevice,
+      nonces: memoryNonces(),
     });
     await bridge.restart();
     bridge.onRows([sessionRow("s1", "/r/app"), sessionRow("s2", "/x/secret")]);
@@ -545,24 +575,27 @@ describe("RemoteBridge device check", () => {
   function devicesIn(file: string, prompts: string[], now = Date.now) {
     return new DeviceGate({
       file,
+      marker: path.join(path.dirname(file), "devices-first-run.json"),
       fs: nodeDeviceFs,
       now,
       prompt: async (d) => {
         prompts.push(`${d.id} ${d.name}`);
         return undefined;
       },
+      askPin: async () => false,
       log: () => undefined,
     });
   }
 
   it("runs a command only from a device confirmed on this Mac and posts every refusal to the relay", async () => {
     base = fs.mkdtempSync(path.join(os.tmpdir(), "csm-bridge-devices-"));
-    const file = path.join(base, "remote-devices.json");
+    const file = path.join(base, "remote", "devices.json");
     const entry = (state: string, name: string) => ({ state, name, pairedAt: 1, decidedAt: 2 });
-    fs.writeFileSync(file, JSON.stringify({ version: 1, devices: { phone: entry("allowed", "iPhone"), tablet: entry("denied", "iPad") } }));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ version: 1, devices: { phone: { ...entry("allowed", "iPhone"), publicKey: KEY }, tablet: entry("denied", "iPad") } }));
     const prompts: string[] = [];
     const now = Date.now();
-    const kill = (id: string, deviceId?: string | null) => ({ id, type: "kill", sessionId: "s1", createdAt: now, ...(deviceId === undefined ? {} : { deviceId }) });
+    const kill = (id: string, deviceId?: string | null) => signed({ id, type: "kill", sessionId: "s1", createdAt: now, deviceId });
     const r = relay([kill("a", "phone"), kill("b", "tablet"), kill("c", "stranger"), kill("d"), kill("e", null)], undefined, [
       { id: "stranger", name: "Unknown phone", createdAt: now - 1000, lastUsedAt: null, current: false },
     ]);
@@ -585,7 +618,7 @@ describe("RemoteBridge device check", () => {
 
   it("on its first start confirms the devices the relay lists, with the bridge token, once", async () => {
     base = fs.mkdtempSync(path.join(os.tmpdir(), "csm-bridge-devices-"));
-    const file = path.join(base, "session-monitor", "remote-devices.json");
+    const file = path.join(base, "session-monitor", "remote", "devices.json");
     const r = relay([], undefined, [{ id: "phone", name: "iPhone", createdAt: 1, lastUsedAt: null, current: false }]);
     const bridge = startBridge(vi.fn(async () => ({ ok: true, message: "ran" })), undefined, devicesIn(file, [], () => 5));
     await bridge.restart();
@@ -600,5 +633,136 @@ describe("RemoteBridge device check", () => {
     const lookups = r.calls.filter((c) => c.url === "https://relay.test/fleet/tokens");
     expect(lookups).toHaveLength(1);
     expect((lookups[0].init as unknown as { headers: Record<string, string> }).headers.Authorization).toBe("Bearer test-token");
+  });
+});
+
+describe("RemoteBridge signed commands", () => {
+  let base = "";
+  afterEach(() => {
+    if (base) fs.rmSync(base, { recursive: true, force: true });
+    base = "";
+  });
+
+  const ran = async (cmd: FleetCommand): Promise<CommandOutcome> => ({ ok: true, message: `ran ${cmd.id}` });
+
+  it("refuses an unsigned command and one whose signature does not verify: neither reaches any delivery path", async () => {
+    const now = Date.now();
+    const good = signed({ id: "ok", type: "send", sessionId: "s1", text: "hi", createdAt: now });
+    const r = relay([
+      { id: "u1", type: "send", sessionId: "s1", text: "hi", createdAt: now },
+      { ...signed({ id: "x1", type: "send", sessionId: "s1", text: "hi", createdAt: now }), sig: good.sig },
+      { ...good, id: "x2", signed: good.signed.replace('"text":"hi"', '"text":"bye"') },
+      good,
+    ]);
+    const execute = vi.fn(ran);
+    const bridge = startBridge(execute, { "remote.acceptCommands": true, "remote.allowedCommands": ["send"], "remote.typeFallback": true });
+    await bridge.restart();
+    await vi.waitFor(() => expect(r.results).toHaveLength(4));
+    bridge.dispose();
+
+    expect(r.results).toEqual([
+      { id: "u1", body: { ok: false, message: UNSIGNED } },
+      { id: "x1", body: { ok: false, message: NOT_VERIFIED } },
+      { id: "x2", body: { ok: false, message: NOT_VERIFIED } },
+      { id: "ok", body: { ok: true, message: "ran ok" } },
+    ]);
+    expect(execute.mock.calls.map(([cmd]) => cmd.id)).toEqual(["ok"]);
+  });
+
+  it("runs a command from its signed type and arguments, never from the relay's other fields, here and in a hand-over", async () => {
+    const now = Date.now();
+    const s = signed({ id: "c1", type: "resume", sessionId: "signed-session", createdAt: now });
+    const r = relay([{ ...s, type: "kill", sessionId: "relay-session", text: "relay text", cwd: "/elsewhere" }]);
+    const run = vi.spyOn(RemoteForwarder.prototype, "run");
+    const execute = vi.fn(ran);
+    const bridge = startBridge(execute);
+    let claimed: FleetCommand[] = [];
+    try {
+      await bridge.restart();
+      await vi.waitFor(() => expect(r.results).toHaveLength(1));
+      claimed = run.mock.calls.map(([cmd]) => cmd); // read before mockRestore, which clears them
+    } finally {
+      bridge.dispose();
+      run.mockRestore();
+    }
+
+    // What the forwarder claims and runs here or hands to the window holding the session: the relay gives only its id, device and time.
+    const rebuilt = { id: "c1", type: "resume", sessionId: "signed-session", deviceId: "phone", createdAt: now };
+    expect(claimed).toEqual([rebuilt]);
+    expect(execute.mock.calls.map(([cmd]) => cmd)).toEqual([rebuilt]);
+    expect(r.results[0].body).toEqual({ ok: true, message: "ran c1" });
+  });
+
+  it("runs a signed command once: the relay handing it out again under another id gets it refused", async () => {
+    const s = signed({ id: "a1", type: "kill", sessionId: "s1", createdAt: Date.now() });
+    const r = relay([s, { ...s, id: "a2" }]);
+    const execute = vi.fn(ran);
+    const bridge = startBridge(execute);
+    await bridge.restart();
+    await vi.waitFor(() => expect(r.results).toHaveLength(2));
+    bridge.dispose();
+
+    expect(r.results).toEqual([
+      { id: "a1", body: { ok: true, message: "ran a1" } },
+      { id: "a2", body: { ok: false, message: NONCE_SEEN } },
+    ]);
+  });
+
+  it("refuses a command signed for another host or more than 5 minutes ago", async () => {
+    const now = Date.now();
+    const r = relay([
+      signed({ id: "h1", type: "kill", sessionId: "s1", createdAt: now }, { host: "Mac-test" }),
+      signed({ id: "o1", type: "kill", sessionId: "s1", createdAt: now }, { ts: now - 6 * 60_000 }),
+    ]);
+    const execute = vi.fn(ran);
+    const bridge = startBridge(execute);
+    await bridge.restart();
+    await vi.waitFor(() => expect(r.results).toHaveLength(2));
+    bridge.dispose();
+
+    expect(r.results).toEqual([
+      { id: "h1", body: { ok: false, message: OTHER_HOST } },
+      { id: "o1", body: { ok: false, message: TOO_OLD } },
+    ]);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("an allowed device without a pinned key: its first signed command is refused and asks to pin the relay's key; once pinned, its commands run", async () => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "csm-bridge-keys-"));
+    const file = path.join(base, "remote", "devices.json");
+    const migrated = { state: "allowed", name: "iPhone", pairedAt: 1, decidedAt: 2 };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ version: 1, devices: { phone: migrated } }));
+    const pinAsks: string[] = [];
+    const gate = new DeviceGate({
+      file,
+      marker: path.join(base, "remote", "devices-first-run.json"),
+      fs: nodeDeviceFs,
+      now: Date.now,
+      prompt: async () => undefined,
+      askPin: async (d) => {
+        pinAsks.push(`${d.id} ${d.publicKey}`);
+        return "pin";
+      },
+      log: () => undefined,
+    });
+    const listed = [{ id: "phone", name: "iPhone", createdAt: 1, lastUsedAt: null, current: false, publicKey: KEY }];
+    const execute = vi.fn(ran);
+    const first = relay([signed({ id: "p1", type: "kill", sessionId: "s1", createdAt: Date.now() })], undefined, listed);
+    const bridge = startBridge(execute, undefined, gate);
+    await bridge.restart();
+    await vi.waitFor(() => expect(first.results).toHaveLength(1));
+    await vi.waitFor(() => expect(JSON.parse(fs.readFileSync(file, "utf8")).devices.phone).toEqual({ ...migrated, publicKey: KEY }));
+    bridge.dispose();
+    expect(first.results[0].body).toEqual({ ok: false, message: CONFIRM_KEY });
+    expect(pinAsks).toEqual([`phone ${KEY}`]);
+
+    const second = relay([signed({ id: "p2", type: "kill", sessionId: "s1", createdAt: Date.now() })], undefined, listed);
+    const again = startBridge(execute, undefined, gate);
+    await again.restart();
+    await vi.waitFor(() => expect(second.results).toHaveLength(1));
+    again.dispose();
+    expect(second.results[0].body).toEqual({ ok: true, message: "ran p2" });
+    expect(execute.mock.calls.map(([cmd]) => cmd.id)).toEqual(["p2"]);
   });
 });

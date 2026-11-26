@@ -17,7 +17,7 @@ vi.mock("fs", async (orig) => {
   };
 });
 
-import { SEEN_RETAIN_MS, SeenIds, nodeSeenFs } from "../src/seenIds";
+import { SEEN_RETAIN_MS, SeenIds, nodeSeenFs, type SeenFs } from "../src/seenIds";
 
 const NOW = Date.parse("2026-11-21T12:00:00.000Z");
 const dirs: string[] = [];
@@ -79,15 +79,20 @@ describe("SeenIds", () => {
     expect(fs.readdirSync(path.dirname(dir))).toEqual(["seen"]);
   });
 
-  it("prune removes old and unreadable records and leaves a fresh temp file and other names alone", () => {
+  it("prune removes records by their file time, unreadable ones too, and leaves a fresh temp file and other names alone", () => {
     const dir = storeDir();
     const clock = { now: NOW };
     const seen = store(dir, clock);
     seen.claim("old");
     clock.now = NOW + SEEN_RETAIN_MS / 2;
     seen.claim("fresh");
+    // A record holds its time and carries it as its file time: an unreadable one goes by its file time alone.
     const unreadable = path.join(dir, `${"0".repeat(32)}.json`);
-    fs.writeFileSync(unreadable, "not json");
+    const unreadableFresh = path.join(dir, `${"9".repeat(32)}.json`);
+    for (const [file, at] of [[unreadable, NOW], [unreadableFresh, NOW + SEEN_RETAIN_MS / 2]] as const) {
+      fs.writeFileSync(file, "not json");
+      fs.utimesSync(file, new Date(at), new Date(at));
+    }
     clock.now = NOW + SEEN_RETAIN_MS + 1;
     const temp = path.join(dir, `.${"1".repeat(32)}.json.123.abc.tmp`); // a create in progress
     fs.writeFileSync(temp, JSON.stringify({ ts: 0 }));
@@ -97,10 +102,44 @@ describe("SeenIds", () => {
     expect(seen.has("fresh")).toBe(true);
     expect(seen.has("old")).toBe(false);
     const left = fs.readdirSync(dir);
-    expect(left.filter((n) => /^[0-9a-f]{32}\.json$/.test(n))).toHaveLength(1); // the fresh record
+    expect(left.filter((n) => /^[0-9a-f]{32}\.json$/.test(n))).toHaveLength(2); // the fresh record and the fresh unreadable one
     expect(left).toContain(path.basename(temp));
     expect(left).toContain("notes.txt");
     expect(fs.existsSync(unreadable)).toBe(false);
+    expect(fs.existsSync(unreadableFresh)).toBe(true);
+  });
+
+  it("gives a record the store's clock as its file time", () => {
+    const dir = storeDir();
+    const seen = store(dir, { now: NOW });
+    expect(seen.claim("cmd-1")).toBe(true);
+    const [name] = fs.readdirSync(dir);
+    expect(Math.abs(fs.statSync(path.join(dir, name)).mtimeMs - NOW)).toBeLessThan(1);
+  });
+
+  it("prune never removes a record it cannot read or stat, and removes an old one without reading it", () => {
+    const record = `${"a".repeat(32)}.json`;
+    const removed: string[] = [];
+    let mtime: number | undefined;
+    const failing: SeenFs = {
+      create: () => false, // the record exists
+      read: () => {
+        throw Object.assign(new Error("EMFILE: too many open files, open"), { code: "EMFILE" });
+      },
+      list: () => [record],
+      remove: (file) => void removed.push(file),
+      mtimeMs: () => mtime, // undefined: the stat failed
+    };
+    const seen = new SeenIds({ dir: "/store", now: () => NOW, fs: failing });
+    seen.prune();
+    expect(seen.claim("cmd-1")).toBe(false);
+    expect(removed).toEqual([]);
+    mtime = NOW - SEEN_RETAIN_MS + 1; // readable time, still within the retention
+    seen.prune();
+    expect(removed).toEqual([]);
+    mtime = NOW - SEEN_RETAIN_MS;
+    seen.prune();
+    expect(removed).toEqual([path.join("/store", record)]);
   });
 
   it("prune removes a temp file a crash left once it is 2 minutes old", () => {

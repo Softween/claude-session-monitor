@@ -38,7 +38,7 @@ export interface FeatureStages {
 
 /** The stage names extension.ts gives the stage guard, by feature. */
 export const FEATURES: Readonly<Record<string, FeatureStages>> = {
-  sessions: { stages: ["first refresh", "collect", "session drops", "sessions", "stuck check", "transitions", "sampling"] },
+  sessions: { stages: ["refresh", "collect", "session drops", "sessions", "stuck check", "transitions", "sampling"] },
   limits: { stages: ["limits"] },
   remote: { start: "remote bridge start", stages: ["remote bridge"] },
   autoResume: { stages: ["auto-resume"] },
@@ -86,13 +86,31 @@ export class DurationRing {
   }
 }
 
-/** Runs `fn` and adds how long it took to `ring`, a throw included. */
-export function timed(ring: DurationRing, fn: () => void, now: () => number = () => performance.now()): void {
-  const started = now();
-  try {
-    fn();
-  } finally {
-    ring.add(now() - started);
+/**
+ * The main-thread time of an async run such as a refresh: the time between
+ * its awaits. The run awaits through wait(), and the time a wait takes is not
+ * counted, nor is work done inside the awaited promise meanwhile.
+ */
+export class BusyClock {
+  private busy = 0;
+  private mark: number;
+
+  constructor(private readonly now: () => number = () => performance.now()) {
+    this.mark = now();
+  }
+
+  async wait<T>(promise: Promise<T>): Promise<T> {
+    this.busy += this.now() - this.mark;
+    try {
+      return await promise;
+    } finally {
+      this.mark = this.now();
+    }
+  }
+
+  /** The ms counted so far, the current slice included. */
+  total(): number {
+    return this.busy + this.now() - this.mark;
   }
 }
 

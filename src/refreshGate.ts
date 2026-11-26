@@ -64,6 +64,24 @@ export function throttle(fn: () => void, gapMs: number, lastStart: () => number,
 }
 
 /**
+ * `fn` runs once at a time: a call while it runs gets the run in flight (like
+ * BurnTracker.refresh). A throw goes to `onError`; the promise never rejects.
+ */
+export function singleFlight(fn: () => Promise<void>, onError: (error: unknown) => void): () => Promise<void> {
+  let inflight: Promise<void> | undefined;
+  return () => {
+    inflight ??= fn()
+      .catch((error: unknown) => {
+        onError(error);
+      })
+      .finally(() => {
+        inflight = undefined;
+      });
+    return inflight;
+  };
+}
+
+/**
  * A Codex snapshot without the poll's own time stamps (health.updatedAt,
  * usage.ts) and the age text of each row (detail, tooltip): equal for two
  * polls that saw the same data.

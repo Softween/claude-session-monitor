@@ -606,6 +606,7 @@
     "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "verify": "esbuild src/verify.ts --bundle --platform=node --format=cjs --outfile=dist/verify.cjs && node dist/verify.cjs",
     "burn": "esbuild src/burnCli.ts --bundle --platform=node --format=cjs --outfile=dist/burn.cjs && node dist/burn.cjs",
+    "bench": "esbuild src/benchRefresh.ts --bundle --platform=node --format=cjs --outfile=dist/bench.cjs && node dist/bench.cjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

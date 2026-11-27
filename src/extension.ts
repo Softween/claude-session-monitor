@@ -115,6 +115,17 @@ import {
   type PendingCapture,
 } from "./capture";
 import {
+  CAPTURE_HOLDS,
+  SEED_HOLDS,
+  fetchProfileAnswer,
+  heldFor,
+  judgeOwner,
+  ownerKey,
+  profileAskable,
+  type OwnerHold,
+  type ProfileAnswer,
+} from "./loginOwner";
+import {
   countBuckets,
   findRecentTranscripts,
   cleanupMonitorFiles,
@@ -2490,7 +2501,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
             a = accountsFile.accounts.find((x) => x.id === a.id) ?? a;
             changed = true;
           }
-        } else if (cliPresent && vault && source === "use-own-and-seed" && shouldSeed(seededRefreshTokens.get(a.id), vault.refreshToken)) {
+        } else if (cliPresent && vault && source === "use-own-and-seed" && shouldSeed(seededRefreshTokens.get(a.id), vault.refreshToken) && (await seedOwnerConfirmed(a.id, vault))) {
           let ident: Record<string, unknown> | undefined;
           try {
             ident = parseJsonObject(await ctx.secrets.get(vaultIdentKey(a.id)));
@@ -2606,6 +2617,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastSwitchTs = 0;
   let switchInflight = false;
   const seededRefreshTokens = new Map<string, string | undefined>(); // accountId -> refresh token last seeded into the CLI vault
+  const seedHolds = new Map<string, OwnerHold>(); // accountId -> own login the profile did not confirm for a seed (loginOwner.ts)
   const refreshFailTs = new Map<string, number>(); // accountId -> ms of the last failed refresh
   const httpFetch: FetchLike = (url, init) => fetch(url, init);
 
@@ -2615,6 +2627,41 @@ export function activate(ctx: vscode.ExtensionContext): void {
     } catch {
       return undefined;
     }
+  }
+
+  /** Whose login this is, per api/oauth/profile with the usage poll's headers; no request without a live access token. */
+  async function askProfile(login: OAuthBlob | undefined): Promise<ProfileAnswer> {
+    if (!login?.accessToken || !profileAskable(login, Date.now())) return { uuid: null, reason: "no live access token" };
+    return fetchProfileAnswer(usageReq(login.accessToken).headers, (url, init) => fetch(url, init));
+  }
+
+  /**
+   * Seed gate (2026-11-27, incident 2026-11-26: B's login, vaulted under A, was
+   * seeded over A's claude-switch entry and the keeper refreshed it as A). True
+   * only when the profile names `id` for the own vault login. An expired login
+   * is not asked about (no seed until our own refresh renews it); a login
+   * another account owns is refused for good (its own refresh stops too, see
+   * refreshStoredAccount); no answer waits 5 min. Never flags needsLogin.
+   */
+  async function seedOwnerConfirmed(id: string, own: OAuthBlob): Promise<boolean> {
+    if (!profileAskable(own, Date.now())) return false;
+    const key = ownerKey(id, own.refreshToken);
+    if (heldFor(seedHolds.get(id), key, Date.now())) return false;
+    const answer = await askProfile(own);
+    const j = judgeOwner(seedHolds.get(id), key, id, answer, Date.now(), SEED_HOLDS);
+    if (!j.hold) {
+      seedHolds.delete(id);
+      return true;
+    }
+    seedHolds.set(id, j.hold);
+    if (j.log) {
+      log(
+        j.verdict === "mismatch"
+          ? `cli vault seed refused (acct ${id.slice(0, 8)}): login belongs to acct ${String(answer.uuid).slice(0, 8)}`
+          : `cli vault seed postponed (acct ${id.slice(0, 8)}): profile gave no answer (${answer.reason}), asking again in 5 min`,
+      );
+    }
+    return false;
   }
 
   // --- Login capture (pure decisions in src/capture.ts) ----------------------
@@ -2628,6 +2675,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let captureKcTs = 0; // ms of the capture loop's last fresh keychain read
   let captureDirty = false; // oauthAccount edited (same account) since that read: read within 5 s
   let capturePending: PendingCapture | null = null; // changed login waiting out the settle window
+  let captureHold: OwnerHold | null = null; // last settled pair the profile did not confirm, and until when it is not asked again
 
   /** Other accounts whose vaulted blob holds this refresh token (stale data or an earlier mismatched pair). */
   async function vaultOwners(id: string, refreshToken: string | undefined): Promise<string[]> {
@@ -2648,9 +2696,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   /**
    * Write a settled login under `ident.id`. The pair held for the settle window
-   * (30 s when `owners` is non-empty), so ~/.claude.json is trusted: the same
-   * refresh token vaulted under another id is moved here (that id's entries are
-   * deleted). False when a store failed.
+   * (30 s when `owners` is non-empty) and the profile named `ident.id` for it
+   * (captureOwnerConfirmed), so the same refresh token vaulted under another id
+   * is moved here (that id's entries are deleted). False when a store failed.
    */
   async function writeVault(ident: ActiveIdentity, creds: ClaudeCredentials, owners: string[]): Promise<boolean> {
     const rt = creds.oauth?.refreshToken;
@@ -2673,12 +2721,37 @@ export function activate(ctx: vscode.ExtensionContext): void {
   }
 
   /**
+   * Capture gate (2026-11-27, incident 2026-11-26: a failed switch rollback left
+   * B's login in the keychain while ~/.claude.json named A, and the 30 s settle
+   * vaulted it under A). True only when the profile names `ident.id` for the
+   * keychain login. Another account: not asked again for 5 min; no answer: 60 s;
+   * each logged once per (account, refresh token) pair.
+   */
+  async function captureOwnerConfirmed(ident: ActiveIdentity, login: OAuthBlob | undefined): Promise<boolean> {
+    const key = ownerKey(ident.id, login?.refreshToken);
+    if (heldFor(captureHold, key, Date.now())) return false;
+    const answer = await askProfile(login);
+    const j = judgeOwner(captureHold, key, ident.id, answer, Date.now(), CAPTURE_HOLDS);
+    captureHold = j.hold;
+    if (j.hold && j.log) {
+      log(
+        j.verdict === "mismatch"
+          ? `capture: keychain login belongs to acct ${String(answer.uuid).slice(0, 8)} while ~/.claude.json names ${ident.id.slice(0, 8)}: not vaulted`
+          : `capture: could not confirm whose login the keychain holds (acct ${ident.id.slice(0, 8)}, ${answer.reason}): not vaulted, asking again in 60 s`,
+      );
+    }
+    return !j.hold;
+  }
+
+  /**
    * The one code path that vaults the active login. Takes a pair read FRESH on
    * this tick (keychain + ~/.claude.json), stores only once the settle window
-   * confirmed the pair (3 s; 30 s when the token would move from another id),
+   * confirmed the pair (3 s; 30 s when the token would move from another id)
+   * AND the profile named this account for the login (captureOwnerConfirmed;
+   * "unconfirmed" otherwise: nothing stored or deleted, not a store failure),
    * then records the account in the registry (which clears needsLogin).
    */
-  async function vaultActiveLogin(ident: ActiveIdentity, creds: ClaudeCredentials): Promise<"stored" | "skipped" | "waiting" | "failed"> {
+  async function vaultActiveLogin(ident: ActiveIdentity, creds: ClaudeCredentials): Promise<"stored" | "skipped" | "waiting" | "unconfirmed" | "failed"> {
     if (!(await captureWanted(ident, creds))) {
       capturePending = null;
       return "skipped";
@@ -2689,6 +2762,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     const settle = settleCapture(capturePending, { accountUuid: ident.id, refreshToken: rt }, Date.now(), minMs);
     capturePending = settle.pending;
     if (settle.action === "wait") return "waiting";
+    if (!(await captureOwnerConfirmed(ident, creds.oauth))) return "unconfirmed";
     if (!(await writeVault(ident, creds, owners))) return "failed";
     refreshFailTs.delete(ident.id);
     setAccounts(
@@ -2813,13 +2887,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
   /**
    * Refresh an INACTIVE account's stored token pair (never the active login:
-   * Claude Code owns that one). Returns the new access token, or undefined on
-   * failure (the existing stale/backoff handling then applies).
+   * Claude Code owns that one), nor a login the profile gave to another account
+   * (seedOwnerConfirmed): refreshing it as this account would rotate the other
+   * account's token. Returns the new access token, or undefined on failure (the
+   * existing stale/backoff handling then applies).
    */
   async function refreshStoredAccount(id: string, oauth: OAuthBlob, force: boolean): Promise<string | undefined> {
     if (id === accountsFile.activeId) return undefined;
     const entry = accountsFile.accounts.find((x) => x.id === id);
     if (entry && refreshBlocked(entry, oauth.refreshToken)) return undefined; // rejected token still vaulted: wait for a new login
+    if (heldFor(seedHolds.get(id), ownerKey(id, oauth.refreshToken), Date.now())?.verdict === "mismatch") return undefined; // another account's login: never refresh it as this one
     const failed = refreshFailTs.get(id);
     if (!force && failed && Date.now() - failed < 10 * 60_000) return undefined;
     const r = await refreshOAuth(oauth, httpFetch, Date.now());

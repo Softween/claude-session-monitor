@@ -1250,10 +1250,12 @@ describe("active login and Use this account", () => {
   // Limit resets ride on the usage polls: a passive account with a fresh token (claude-switch installed).
   const FABLE_GRANT = { id: "launch-2610-fable", resets_left: 1, ends_at: "2027-03-09T07:59:00Z", clears: ["five_hour", "seven_day_overage_included"], paused: false, usable_now: true, use_requires_limit: false, type: "full", gives_back_weekly: true, unavailable_reason: null };
   const passiveB = () => ({ [`csm.oauth.${UB}`]: JSON.stringify({ accessToken: "at-b", refreshToken: "rt-b", expiresAt: Date.now() + 3_600_000 }), [`csm.token.${UB}`]: "at-b" });
+  const PROFILE = "https://api.anthropic.com/api/oauth/profile";
   function usageReplies(body: unknown): ReturnType<typeof vi.fn> {
     const fetchMock = (globalThis as any).fetch as ReturnType<typeof vi.fn>;
     fetchMock.mockClear();
-    fetchMock.mockImplementation(async () => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => body }));
+    // B's login is seeded into claude-switch's vault only once the profile names B for it.
+    fetchMock.mockImplementation(async (url: string) => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => (url === PROFILE ? { account: { uuid: UB } } : body) }));
     return fetchMock;
   }
 
@@ -1640,17 +1642,206 @@ describe("active login and Use this account", () => {
   });
 
   it("with the claude-switch CLI a passive account's token is seeded into its vault and the keeper owns the refresh, as before", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true }); // the clock is moved past the seeded token's expiry below
     installSwitchCli();
     seedRegistryOnA();
     writeLogin(UA, "a@x.com");
-    const expired = JSON.stringify({ accessToken: "at-b", refreshToken: "rt-b", expiresAt: Date.now() - 60_000 });
-    const { posted } = activateWithLimitsView({ [`csm.oauth.${UB}`]: expired });
-    await vi.waitFor(() => expect(debugLog()).toContain("cli vault seeded (acct bbbbbbbb)"));
-    expect(fs.statSync(`${SW}/vault/${UB}.json`).mode & 0o777).toBe(0o600);
-    expect(debugLog()).toContain("acct bbbbbbbb: tokens expired, waiting for claude-switch keeper");
-    expect(debugLog()).not.toContain("oauth refresh failed");
-    await vi.waitFor(() => expect(card(posted[posted.length - 1], UB).note).toBe("waiting for claude-switch keeper"));
-    expect(posted[posted.length - 1].switchHtml).toContain("claude-switch: no data (file missing)");
+    // Only a login the profile can confirm is seeded (an expired one cannot be asked about): a live token the profile names B for.
+    const live = JSON.stringify({ accessToken: "at-b", refreshToken: "rt-b", expiresAt: Date.now() + 3_600_000 });
+    const fetchMock = usageReplies({});
+    try {
+      const { posted } = activateWithLimitsView({ [`csm.oauth.${UB}`]: live });
+      await vi.waitFor(() => expect(debugLog()).toContain("cli vault seeded (acct bbbbbbbb)"));
+      expect(fs.statSync(`${SW}/vault/${UB}.json`).mode & 0o777).toBe(0o600);
+      vi.setSystemTime(Date.now() + 2 * 3_600_000); // the seeded token expires before the keeper refreshed it
+      await vi.waitFor(() => expect(debugLog()).toContain("acct bbbbbbbb: tokens expired, waiting for claude-switch keeper"), { timeout: 5000 });
+      expect(debugLog()).not.toContain("oauth refresh failed");
+      await vi.waitFor(() => expect(card(posted[posted.length - 1], UB).note).toBe("waiting for claude-switch keeper"));
+      expect(posted[posted.length - 1].switchHtml).toContain("claude-switch: no data (file missing)");
+    } finally {
+      fetchMock.mockImplementation(() => Promise.reject(new Error("mocked")));
+    }
+  });
+
+  // Login ownership (2026-11-27): a login is vaulted, moved or seeded under an account only once api/oauth/profile named that account for it.
+  const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+  const loginOf = (tag: string, ms: number) => ({ accessToken: `at-${tag}`, refreshToken: `rt-${tag}`, expiresAt: Date.now() + ms });
+  const ownerClock = () => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+  async function runFor(seconds: number): Promise<void> {
+    for (let i = 0; i < seconds; i++) {
+      vi.advanceTimersByTime(1000);
+      await settleAsync();
+    }
+  }
+  // Capture reads the keychain only on macOS: CI runs on Linux.
+  function onMac(): () => void {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+    return () => Object.defineProperty(process, "platform", platform);
+  }
+  // The keychain item `security` reads: Claude Code's current login.
+  function keychainHolds(blob: object): void {
+    rec.execFileImpl = (args) => {
+      if (args[0] !== "security") return false;
+      args[args.length - 1](null, JSON.stringify({ claudeAiOauth: blob }), "");
+      return true;
+    };
+  }
+  // The profile answers per access token; usage polls answer `usageStatus` (0: network error); anything else fails.
+  function profileReplies(answer: (token: string) => { status: number; uuid?: string }, usageStatus = 0): ReturnType<typeof vi.fn> {
+    const fetchMock = (globalThis as any).fetch as ReturnType<typeof vi.fn>;
+    fetchMock.mockClear();
+    fetchMock.mockImplementation(async (url: string, init: any) => {
+      const reply = (status: number, body: unknown) => ({ ok: status === 200, status, headers: { get: () => null }, json: async () => body });
+      if (url === PROFILE) {
+        const r = answer(String(init.headers.Authorization).replace(/^Bearer /, ""));
+        return reply(r.status, { account: { uuid: r.uuid, email: "x@x.com" }, organization: {} });
+      }
+      if (usageStatus && url.startsWith("https://api.anthropic.com/api/oauth/usage")) return reply(usageStatus, {});
+      throw new Error("mocked");
+    });
+    return fetchMock;
+  }
+  const profileCalls = (fetchMock: ReturnType<typeof vi.fn>): string[] =>
+    fetchMock.mock.calls.filter((c: unknown[]) => c[0] === PROFILE).map((c: any[]) => c[1].headers.Authorization);
+  // SecretStorage over a Map: a test reads what the extension stored and deleted.
+  function activateWithVault(secrets: Map<string, string>): any {
+    const ctx = mkCtx();
+    ctx.workspaceState = { get: (_k: string, def?: unknown) => def, update: () => Promise.resolve() };
+    ctx.secrets.get = (k: string) => Promise.resolve(secrets.get(k));
+    ctx.secrets.store = vi.fn((k: string, v: string) => {
+      secrets.set(k, v);
+      return Promise.resolve();
+    });
+    ctx.secrets.delete = vi.fn((k: string) => {
+      secrets.delete(k);
+      return Promise.resolve();
+    });
+    lastCtx = ctx;
+    ext.activate(ctx);
+    return ctx;
+  }
+  const storedUnder = (ctx: any, id: string): string[] => ctx.secrets.store.mock.calls.map((c: string[]) => c[0]).filter((k: string) => k.endsWith(id));
+
+  it("the 2026-11-26 incident: B's login in the keychain while ~/.claude.json names A for over 30 s is not vaulted under A, B's entries stay and A's claude-switch entry is untouched", async () => {
+    const restore = onMac();
+    ownerClock();
+    installSwitchCli();
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    const loginA = loginOf("a", 1_800_000);
+    const loginB = loginOf("b", 3_600_000); // fresher than A's claude-switch entry: moved under A it would be seeded over it
+    const secrets = new Map<string, string>([
+      [`csm.oauth.${UA}`, JSON.stringify(loginA)],
+      [`csm.token.${UA}`, "at-a"],
+      [`csm.oauth.${UB}`, JSON.stringify(loginB)],
+      [`csm.token.${UB}`, "at-b"],
+      [`csm.ident.${UB}`, JSON.stringify({ accountUuid: UB, emailAddress: "b@x.com" })],
+    ]);
+    fs.mkdirSync(`${SW}/vault`, { recursive: true });
+    const aFile = `${SW}/vault/${UA}.json`;
+    fs.writeFileSync(aFile, JSON.stringify({ claudeAiOauth: loginA, email: "a@x.com" }), { mode: 0o600 });
+    const aBefore = fs.readFileSync(aFile, "utf8");
+    keychainHolds(loginB); // the switch's rollback failed: the keychain is on B, ~/.claude.json still on A
+    const fetchMock = profileReplies((token) => ({ status: 200, uuid: token === "at-b" ? UB : UA }));
+    const setupWrites = watchRec.writes.length;
+    try {
+      const ctx = activateWithVault(secrets);
+      await runFor(45);
+      expect(debugLog()).toContain("capture: keychain login belongs to acct bbbbbbbb while ~/.claude.json names aaaaaaaa: not vaulted");
+      expect(profileCalls(fetchMock)).toContain("Bearer at-b");
+      // ~/.claude.json follows to B (the switch completes); A is now a passive account and gets polled.
+      writeLogin(UB, "b@x.com");
+      const later = new Date(Date.now() + 5_000);
+      fs.utimesSync(`${HOME}/.claude.json`, later, later);
+      await runFor(65);
+      expect(registry().activeId).toBe(UB);
+      expect(secrets.get(`csm.oauth.${UB}`)).toBe(JSON.stringify(loginB));
+      expect(secrets.get(`csm.token.${UB}`)).toBe("at-b");
+      expect(secrets.has(`csm.ident.${UB}`)).toBe(true);
+      expect(secrets.get(`csm.oauth.${UA}`)).toBe(JSON.stringify(loginA));
+      expect(storedUnder(ctx, UA)).toEqual([]);
+      expect(ctx.secrets.delete).not.toHaveBeenCalled();
+      expect(debugLog()).not.toContain("moved vault entry");
+      expect(debugLog()).not.toContain("cli vault seeded (acct aaaaaaaa)");
+      expect(fs.readFileSync(aFile, "utf8")).toBe(aBefore);
+      expect(watchRec.writes.slice(setupWrites).filter((w) => w.includes(UA) && w.includes("/vault/"))).toEqual([]);
+    } finally {
+      restore();
+      fetchMock.mockImplementation(() => Promise.reject(new Error("mocked")));
+    }
+  });
+
+  it("a profile that cannot answer (429) vaults nothing, is asked at most once a minute for the same login, and the first pass after it confirms stores the login", async () => {
+    const restore = onMac();
+    ownerClock();
+    seedRegistryOnA();
+    writeLogin(UA, "a@x.com");
+    const loginA = loginOf("a", 3_600_000);
+    keychainHolds(loginA);
+    let status = 429;
+    const fetchMock = profileReplies(() => ({ status, uuid: UA }));
+    const secrets = new Map<string, string>();
+    const keychainReads = () => rec.execFiles.filter((a) => a[0] === "security").length;
+    try {
+      const ctx = activateWithVault(secrets);
+      await runFor(25);
+      expect(profileCalls(fetchMock)).toEqual(["Bearer at-a"]);
+      expect(keychainReads()).toBeLessThanOrEqual(4); // no retry loop: a spinning capture reads the keychain on every 1.5 s tick
+      for (let i = 0; i < 3; i++) {
+        await rec.commands.get("claudeSessionMonitor.refreshUsage")!(); // forced capture passes inside the minute
+        await runFor(8);
+      }
+      expect(profileCalls(fetchMock)).toHaveLength(1);
+      expect(ctx.secrets.store).not.toHaveBeenCalled();
+      expect(ctx.secrets.delete).not.toHaveBeenCalled();
+      expect(debugLog().match(/capture: could not confirm whose login/g)).toHaveLength(1);
+      expect(debugLog()).not.toContain("vault store failed");
+      status = 200;
+      await runFor(20); // past the minute
+      await rec.commands.get("claudeSessionMonitor.refreshUsage")!();
+      await runFor(5);
+      expect(profileCalls(fetchMock)).toHaveLength(2);
+      expect(secrets.get(`csm.oauth.${UA}`)).toBe(JSON.stringify(loginA));
+      expect(debugLog()).toContain("capture: vaulted login (acct aaaaaaaa)");
+      expect(debugLog().match(/capture: could not confirm whose login/g)).toHaveLength(1);
+    } finally {
+      restore();
+      fetchMock.mockImplementation(() => Promise.reject(new Error("mocked")));
+    }
+  });
+
+  it("a passive account whose own vault holds another account's login is never seeded into claude-switch's vault, never refreshed by the extension and not flagged needsLogin", async () => {
+    ownerClock();
+    installSwitchCli();
+    writeLogin(UB, "b@x.com");
+    fs.mkdirSync(MON, { recursive: true });
+    const accounts = [{ id: UB, email: "b@x.com", lastSeenTs: 100 }, { id: UA, email: "a@x.com", lastSeenTs: 50 }];
+    fs.writeFileSync(`${MON}/accounts.json`, JSON.stringify({ v: 1, activeId: UB, accounts }));
+    // A's own vault entry holds B's login (what the incident left), 2 min from expiry: our own refresh would be due.
+    const secrets = new Map<string, string>([
+      [`csm.oauth.${UA}`, JSON.stringify(loginOf("b", 120_000))],
+      [`csm.token.${UA}`, "at-b"],
+    ]);
+    const fetchMock = profileReplies((token) => ({ status: 200, uuid: token === "at-b" ? UB : UA }), 401);
+    try {
+      activateWithVault(secrets);
+      await runFor(5);
+      expect(debugLog()).toContain("cli vault seed refused (acct aaaaaaaa): login belongs to acct bbbbbbbb");
+      await runFor(65);
+      await rec.commands.get("claudeSessionMonitor.refreshUsage")!();
+      await runFor(5);
+      expect(debugLog()).toContain("usage acct aaaaaaaa: token rejected (401)"); // the poll ran, and its 401 did not refresh either
+      expect(profileCalls(fetchMock)).toEqual(["Bearer at-b"]);
+      expect(debugLog().match(/cli vault seed refused/g)).toHaveLength(1);
+      expect(debugLog()).not.toContain("cli vault seeded");
+      expect(fs.existsSync(`${SW}/vault/${UA}.json`)).toBe(false);
+      expect(fetchMock.mock.calls.filter((c: unknown[]) => c[0] === TOKEN_URL)).toEqual([]);
+      expect(debugLog()).not.toContain("oauth refresh");
+      expect(registry().accounts.find((a: { id: string }) => a.id === UA).needsLogin).toBeUndefined();
+    } finally {
+      fetchMock.mockImplementation(() => Promise.reject(new Error("mocked")));
+    }
   });
 });
 
@@ -2366,8 +2557,8 @@ describe("observer mode in an Extension Development Host", () => {
   const debugLog = () => (fs.existsSync(`${MON}/csm-debug.log`) ? fs.readFileSync(`${MON}/csm-debug.log`, "utf8") : "");
 
   // What a normal window acts on: a registry still on A while ~/.claude.json names B (the registry
-  // follows), A's live usage at 99% near its reset (auto-resume), B's stored token expired with
-  // claude-switch installed (its vault gets seeded), a status file 13 h old (cleanup), a transcript
+  // follows), A's live usage at 99% near its reset (auto-resume), B's stored live token with
+  // claude-switch installed (its vault gets seeded once the profile names B), a status file 13 h old (cleanup), a transcript
   // (the token-count cache), and the wake, continuity and auto-resume settings on. Returns the secrets.
   function seedSharedState(): Record<string, string> {
     const now = Date.now();
@@ -2387,7 +2578,7 @@ describe("observer mode in an Extension Development Host", () => {
     const turn = { type: "assistant", message: { content: [{ type: "text", text: "a" }], usage: { input_tokens: 1000, output_tokens: 0 } }, timestamp: new Date(now - 600_000).toISOString() };
     fs.writeFileSync(`${HOME}/.claude/projects/-repo/observer-tx.jsonl`, JSON.stringify(turn) + "\n");
     for (const key of ["wakeDeadTabs", "continuityChannel", "autoResumeAfterReset"]) rec.config.set(key, true);
-    return { [`csm.oauth.${UB}`]: JSON.stringify({ accessToken: "at-b", refreshToken: "rt-b", expiresAt: now - 60_000 }) };
+    return { [`csm.oauth.${UB}`]: JSON.stringify({ accessToken: "at-b", refreshToken: "rt-b", expiresAt: now + 3_600_000 }) };
   }
 
   // Activates in `mode` with the limits view resolved; only what the extension writes from here on is recorded.
@@ -2452,19 +2643,28 @@ describe("observer mode in an Extension Development Host", () => {
   ])("%s mode keeps every feature: the same state starts the bridge and the guard, runs `which claude` and writes the shared files", async (_name, mode) => {
     fakeClock();
     const secrets = seedSharedState();
-    activateIn(mode, secrets);
-    await runFor(65);
-    expect(rec.bridgeDeps).not.toBeNull();
-    expect(rec.customEditors).toEqual(["claudeSessionMonitor.restartGuard"]);
-    expect(rec.execFiles.map((args) => args[0])).toContain("which");
-    expect(fs.existsSync(OLD_STATUS)).toBe(false); // the stale status file was cleaned up
-    // Both finish on real file I/O, not on the fake clock: wait for them.
-    await vi.waitFor(() => expect(JSON.parse(fs.readFileSync(`${MON}/accounts.json`, "utf8")).activeId).toBe(UB), { timeout: 5000 }); // the registry followed ~/.claude.json
-    await vi.waitFor(() => expect(fs.existsSync(`${HOME}/.claude/state/claude-switch/vault/${UB}.json`)).toBe(true), { timeout: 5000 }); // B's token seeded for claude-switch
-    expect(fs.existsSync(`${MON}/token-buckets.json`)).toBe(true);
-    expect(debugLog()).toContain("auto-resume scheduled");
-    expect(debugLog()).toContain("wake: activation");
-    expect(rec.outputChannels).toEqual([]);
+    const fetchMock = (globalThis as any).fetch as ReturnType<typeof vi.fn>;
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url !== "https://api.anthropic.com/api/oauth/profile") throw new Error("mocked");
+      return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ account: { uuid: UB } }) }; // the seed asks whose login it is
+    });
+    try {
+      activateIn(mode, secrets);
+      await runFor(65);
+      expect(rec.bridgeDeps).not.toBeNull();
+      expect(rec.customEditors).toEqual(["claudeSessionMonitor.restartGuard"]);
+      expect(rec.execFiles.map((args) => args[0])).toContain("which");
+      expect(fs.existsSync(OLD_STATUS)).toBe(false); // the stale status file was cleaned up
+      // Both finish on real file I/O, not on the fake clock: wait for them.
+      await vi.waitFor(() => expect(JSON.parse(fs.readFileSync(`${MON}/accounts.json`, "utf8")).activeId).toBe(UB), { timeout: 5000 }); // the registry followed ~/.claude.json
+      await vi.waitFor(() => expect(fs.existsSync(`${HOME}/.claude/state/claude-switch/vault/${UB}.json`)).toBe(true), { timeout: 5000 }); // B's token seeded for claude-switch
+      expect(fs.existsSync(`${MON}/token-buckets.json`)).toBe(true);
+      expect(debugLog()).toContain("auto-resume scheduled");
+      expect(debugLog()).toContain("wake: activation");
+      expect(rec.outputChannels).toEqual([]);
+    } finally {
+      fetchMock.mockImplementation(() => Promise.reject(new Error("mocked")));
+    }
   });
 
   it("dev.enableFeatures turns a listed feature back on in Development mode and leaves the others off", async () => {

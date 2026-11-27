@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 2.45.1
+- **A login is filed under an account only after Anthropic confirms it is that account's.** Before the extension saves the Claude Code login under the account `~/.claude.json` names, or hands a saved login to claude-switch, it asks Anthropic's profile endpoint whose login it is. When the answer names another account, nothing is saved, moved or handed over, that account's saved login stays where it was, and the debug log says which account the login belongs to; the panel does not show "login needed" for it, and the extension never refreshes such a login as the wrong account. Before, a switch that left the keychain and `~/.claude.json` on different accounts for over 30 s could save one account's login under the other, and both accounts then needed a new browser login. When the endpoint cannot answer, the login is not saved yet and is asked about again a minute later (five for claude-switch). An expired saved login is handed to claude-switch only after it has been refreshed.
+
 ## 2.45.0
 - **An "all" row closes the account table.** Under the last login it shows how many Claude logins can take work now (`8/11 ready`), their summed monthly plan price, and for every column (Session, Weekly, Fable, …) the share of the whole pool already used. Each login weighs by its plan price, so a $200 login counts eight times a $25 seat; when any plan price is unknown every login counts equally. Codex and skipped logins stay out, and a column averages only the logins that report that gauge.
 

@@ -7,9 +7,11 @@
  * extensions asks first, as it does for the guard tab. The session's adapter
  * lives in this extension host and answers every request without running
  * anything. Its toolbar, status bar colour and Run and Debug view are
- * suppressed; the Run and Debug icon's `1` badge, its Call Stack entry, the
- * status bar's debug item (debug.showInStatusBar) and F5 not starting a debug
- * run while it runs remain.
+ * suppressed; the Run and Debug icon's `1` badge, that view's debugging panes
+ * in place of its start page, the status bar's debug item
+ * (debug.showInStatusBar) and F5 not starting a debug run while it runs remain.
+ * A restart the user confirms ends the session with VS Code's "Extension host
+ * shut down" error notice; the next activation starts it again.
  */
 import * as vscode from "vscode";
 

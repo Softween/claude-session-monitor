@@ -4,7 +4,7 @@
  * A dev host runs next to the owner's own windows, on the same machine and the
  * same ~/.claude, so every feature that acts on that shared state would act a
  * second time from it: the remote bridge, account rotation, auto-resume, tab
- * wakes, the continuity channel, the restart guard, account and settings writes,
+ * wakes, the continuity channel, the restart guard, the daily reload, account and settings writes,
  * the window's own usage polls and the files under ~/.claude/session-monitor.
  * In Development mode all of them are off: the window reads the sessions, usage
  * and accounts the other windows saved and shows them in both panels.
@@ -22,6 +22,7 @@ export const OBSERVER_FEATURES = [
   "wake", // tab wakes after a restart (wakeDeadTabs)
   "continuity", // the continuity channel
   "restartGuard", // the restart guard tab or its debug session
+  "dailyReload", // the daily window reload (dailyReload)
   "usagePolls", // this window's own usage polls and what they save: usage snapshots, limits history, reset readings, registry entries, token refreshes
   "accountWrites", // login capture into the token vault, account switches (keychain, ~/.claude.json), claude-switch runs, forgetting accounts, reset claims, ~/.claude/settings.json, registry writes
   "sharedFiles", // the debug log, the monitor folders, the token-count cache and the stale status-file cleanup

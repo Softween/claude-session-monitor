@@ -70,6 +70,7 @@ export interface LiveSession {
   sessionId: string;
   pid: number;
   entrypoint?: string;
+  status?: string; // Claude Code's own "busy" | "idle"; absent on a CLI that records none
 }
 
 export interface WakeStore {
@@ -508,7 +509,7 @@ export class TabWaker<M> {
 
 /** Running Claude processes: ~/.claude/sessions/<pid>.json records whose pid is alive. */
 export function readLiveSessions(dir = SESSIONS_DIR, alive: (pid: number) => boolean | undefined = pidAlive): LiveSession[] {
-  let recs: Array<SessionRecord & { entrypoint?: unknown }>;
+  let recs: Array<SessionRecord & { entrypoint?: unknown; status?: unknown }>;
   try {
     recs = loadRecords(dir);
   } catch {
@@ -520,6 +521,7 @@ export function readLiveSessions(dir = SESSIONS_DIR, alive: (pid: number) => boo
       sessionId: r.sessionId as string,
       pid: r.pid,
       entrypoint: typeof r.entrypoint === "string" ? r.entrypoint : undefined,
+      status: typeof r.status === "string" ? r.status : undefined,
     }));
 }
 

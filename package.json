@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.46.0",
+  "version": "2.47.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -507,6 +507,26 @@
           "default": "tab",
           "markdownDescription": "How `#claudeSessionMonitor.restartGuard#` keeps VS Code asking before it restarts extensions: `tab` keeps the **Claude restart guard** tab open, `hidden` keeps a debug session that runs nothing instead and opens no tab. With `hidden`, a session you stop starts again; when it cannot start, or ends within 5 s of starting 3 times in a row, the tab is used until the next change of either setting or the next window start. An untrusted workspace uses the tab until it is trusted."
         },
+        "claudeSessionMonitor.dailyReload": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "markdownDescription": "Run **Developer: Reload Window** on its own once the window has been open `#claudeSessionMonitor.dailyReloadAfterHours#` hours, to give back the memory a long-open window collects. A reload stops every Claude Code session in the window, because each session's process runs inside the extension host; each comes back when its tab is shown. So it waits for a calm moment: none of this window's sessions has had work in flight (a running turn, or background agents that outlive it) for 2 minutes, no tab wake or resume sweep runs, and keyboard and mouse have been idle `#claudeSessionMonitor.dailyReloadIdleMinutes#` minutes (when the idle time cannot be read, it never reloads). Checked every minute; when due, a notification gives 20 s and a **Not now** button, which waits an hour. The window reloads only if the moment is still calm after the 20 s. User settings only."
+        },
+        "claudeSessionMonitor.dailyReloadAfterHours": {
+          "type": "number",
+          "default": 20,
+          "minimum": 0.01,
+          "scope": "application",
+          "markdownDescription": "How long the window's extension host must have run before `#claudeSessionMonitor.dailyReload#` reloads it, in hours. Counted from the last window start or reload. The reload stops the window's Claude Code sessions; they come back as their tabs are shown."
+        },
+        "claudeSessionMonitor.dailyReloadIdleMinutes": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "scope": "application",
+          "markdownDescription": "How long keyboard and mouse must have been idle before `#claudeSessionMonitor.dailyReload#` reloads the window, in minutes (macOS HID idle time). The reload stops the window's Claude Code sessions; they come back as their tabs are shown."
+        },
         "claudeSessionMonitor.idleRamWarnMb": {
           "type": "number",
           "default": 2000,
@@ -582,6 +602,7 @@
               "wake",
               "continuity",
               "restartGuard",
+              "dailyReload",
               "usagePolls",
               "accountWrites",
               "sharedFiles"
@@ -589,7 +610,7 @@
           },
           "uniqueItems": true,
           "default": [],
-          "markdownDescription": "Extension Development Host only; every other window ignores it. There the monitor runs in observer mode: it reads the sessions, usage and accounts the other windows saved and shows both panels, and every feature that acts on the shared state is off. List the ones a live test needs (read when the window starts; each feature's own setting still applies): `remoteBridge` (the remote bridge), `rotation` (`autoRotate`), `autoResume` (`autoResumeAfterReset`), `wake` (`wakeDeadTabs`), `continuity` (`continuityChannel`), `restartGuard` (the restart guard, its tab or its debug session), `usagePolls` (this window's own usage polls and what they save: usage snapshots, limits history, reset readings, account registry, token refreshes), `accountWrites` (login capture, account switches through the keychain and `~/.claude.json`, claude-switch runs, forgetting accounts, reset claims, `~/.claude/settings.json`), `sharedFiles` (the debug log, the monitor folders, the token-count cache and the stale status-file cleanup; while it is off the log goes to the **Agent Session Monitor (observer)** Output channel)."
+          "markdownDescription": "Extension Development Host only; every other window ignores it. There the monitor runs in observer mode: it reads the sessions, usage and accounts the other windows saved and shows both panels, and every feature that acts on the shared state is off. List the ones a live test needs (read when the window starts; each feature's own setting still applies): `remoteBridge` (the remote bridge), `rotation` (`autoRotate`), `autoResume` (`autoResumeAfterReset`), `wake` (`wakeDeadTabs`), `continuity` (`continuityChannel`), `restartGuard` (the restart guard, its tab or its debug session), `dailyReload` (`dailyReload`),`usagePolls` (this window's own usage polls and what they save: usage snapshots, limits history, reset readings, account registry, token refreshes), `accountWrites` (login capture, account switches through the keychain and `~/.claude.json`, claude-switch runs, forgetting accounts, reset claims, `~/.claude/settings.json`), `sharedFiles` (the debug log, the monitor folders, the token-count cache and the stale status-file cleanup; while it is off the log goes to the **Agent Session Monitor (observer)** Output channel)."
         }
       }
     },

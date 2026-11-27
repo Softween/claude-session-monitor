@@ -55,6 +55,7 @@ describe("featureStatuses", () => {
       continuity: "ok",
       wake: "disabled",
       restartGuard: "ok",
+      dailyReload: "ok",
     });
   });
 
@@ -112,7 +113,7 @@ describe("the health file", () => {
       pid: 4242,
       version: "2.40.0",
       ts: NOW / 1000,
-      features: { sessions: "ok", limits: "ok", remote: "disabled", autoResume: "ok", continuity: "ok", wake: "error", restartGuard: "ok" },
+      features: { sessions: "ok", limits: "ok", remote: "disabled", autoResume: "ok", continuity: "ok", wake: "error", restartGuard: "ok", dailyReload: "ok" },
       refreshP95Ms: 9,
       refreshSamples: 3,
       guardArmed: true,

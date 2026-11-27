@@ -45,6 +45,7 @@ export const FEATURES: Readonly<Record<string, FeatureStages>> = {
   continuity: { start: "continuity start", stages: ["continuity"] },
   wake: { start: "tab wake start", stages: ["tab wake"] },
   restartGuard: { start: "restart guard start", stages: [] },
+  dailyReload: { start: "daily reload start", stages: [] },
 };
 
 /**

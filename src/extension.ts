@@ -58,6 +58,7 @@ import { nothingTyped, typeIntoPrompt, type TypeResult } from "./keystrokeTyping
 import { FOCUS_COMMAND, FOCUS_SETTLE_MS, focusCommandBlocker, typingLine, waitForActive } from "./promptFocus";
 import { acquireSwitchLock, autoRotateOn, remoteSwitch as routeRemoteSwitch } from "./accountSwitch";
 import { activateRestartGuard } from "./restartGuard";
+import { activateDailyReload, inFlight } from "./dailyReload";
 import { observerMode } from "./observerMode";
 import { AutomationGate, CLAUDE_CODE_ID, readPulseStage, type Automation } from "./automationGate";
 import {
@@ -4755,6 +4756,19 @@ export function activate(ctx: vscode.ExtensionContext): void {
     focusGroup: focusTabGroup,
     idleMs: probes.idleMs,
   })) : undefined;
+  // Reload the window at a calm moment once it has been open dailyReloadAfterHours (dailyReload.ts).
+  if (allowed("dailyReload")) stages.safe("daily reload start", () => activateDailyReload(ctx, {
+    log,
+    idleMs: probes.idleMs,
+    // This window's sessions with work in flight (inFlight); every session when ownership cannot be read.
+    working: async () => {
+      const live = probes.liveSessions();
+      const parents = await probes.parentPids();
+      const own = parents ? new Set(ownSessions(live, parents, process.pid)) : undefined;
+      return inFlight(live, lastAllViews.filter((v) => groupOf(v) === "working").map((v) => v.sessionId), own);
+    },
+    busy: () => tabWaker?.isBusy() === true || resumeActive,
+  }));
   // The commands of a feature observer mode keeps off say so instead of "command not found".
   for (const { command, feature } of observer.offCommands()) {
     ctx.subscriptions.push(vscode.commands.registerCommand(command, () => observer.actionAllowed(feature)));
@@ -4782,6 +4796,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       continuity: allowed("continuity") && claudeEnabled() && cfg().get<boolean>("continuityChannel", false) === true,
       wake: allowed("wake") && claudeEnabled() && cfg().get<boolean>("wakeDeadTabs", false) === true,
       restartGuard: allowed("restartGuard") && cfg().get<boolean>("restartGuard", false) === true,
+      dailyReload: allowed("dailyReload") && cfg().get<boolean>("dailyReload", false) === true,
     }),
     failures: () => stages.lastFailures(),
     refresh: refreshMs,

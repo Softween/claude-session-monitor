@@ -58,7 +58,7 @@ describe("observer mode", () => {
 
   it("names what is off and what dev.enableFeatures turned on in its activation line", () => {
     expect(make(true, ["wake", "continuity"]).mode.summary()).toBe(
-      "observer mode (Extension Development Host): off remoteBridge, rotation, autoResume, restartGuard, usagePolls, accountWrites, sharedFiles; on through dev.enableFeatures wake, continuity",
+      "observer mode (Extension Development Host): off remoteBridge, rotation, autoResume, restartGuard, dailyReload, usagePolls, accountWrites, sharedFiles; on through dev.enableFeatures wake, continuity",
     );
     expect(make(true, []).mode.summary()).toMatch(/; on through dev\.enableFeatures none$/);
   });

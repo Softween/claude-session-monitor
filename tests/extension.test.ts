@@ -2636,7 +2636,7 @@ describe("observer mode in an Extension Development Host", () => {
     expect(rec.webviews.map((w) => w.id)).toEqual(expect.arrayContaining(["claudeSessionMonitor.view", "claudeSessionMonitor.limits"]));
     expect(card(posted[posted.length - 1], UB).gauges[0].pct).toBe(99); // B's usage as the other windows saved it
     expect(observerLog()).toContain(
-      "observer mode (Extension Development Host): off remoteBridge, rotation, autoResume, wake, continuity, restartGuard, usagePolls, accountWrites, sharedFiles",
+      "observer mode (Extension Development Host): off remoteBridge, rotation, autoResume, wake, continuity, restartGuard, dailyReload, usagePolls, accountWrites, sharedFiles",
     );
     expect(observerLog()).toContain("active: b@x.com (acct bbbbbbbb, from claude.json)");
     expect(observerLog()).not.toContain("auto-resume scheduled");
@@ -2832,7 +2832,7 @@ describe("the health file and the overseer heartbeat", () => {
       pid: process.pid,
       version: "9.9.9",
       ts: Math.floor(Date.now() / 1000),
-      features: { sessions: "ok", limits: "ok", remote: "disabled", autoResume: "disabled", continuity: "disabled", wake: "disabled", restartGuard: "disabled" },
+      features: { sessions: "ok", limits: "ok", remote: "disabled", autoResume: "disabled", continuity: "disabled", wake: "disabled", restartGuard: "disabled", dailyReload: "disabled" },
       refreshP95Ms: expect.any(Number),
       refreshSamples: expect.any(Number),
       guardArmed: false,

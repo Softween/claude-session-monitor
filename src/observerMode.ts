@@ -21,7 +21,7 @@ export const OBSERVER_FEATURES = [
   "autoResume", // the auto-resume sweep after a limit reset
   "wake", // tab wakes after a restart (wakeDeadTabs)
   "continuity", // the continuity channel
-  "restartGuard", // the restart guard tab
+  "restartGuard", // the restart guard tab or its debug session
   "usagePolls", // this window's own usage polls and what they save: usage snapshots, limits history, reset readings, registry entries, token refreshes
   "accountWrites", // login capture into the token vault, account switches (keychain, ~/.claude.json), claude-switch runs, forgetting accounts, reset claims, ~/.claude/settings.json, registry writes
   "sharedFiles", // the debug log, the monitor folders, the token-count cache and the stale status-file cleanup

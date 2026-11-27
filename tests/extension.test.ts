@@ -248,6 +248,12 @@ vi.mock("vscode", () => {
           },
         };
       },
+      onDidGrantWorkspaceTrust: () => ({ dispose() {} }),
+    },
+    debug: {
+      registerDebugAdapterDescriptorFactory: () => ({ dispose() {} }),
+      onDidStartDebugSession: () => ({ dispose() {} }),
+      onDidTerminateDebugSession: () => ({ dispose() {} }),
     },
     commands: {
       registerCommand: (id: string, fn: any) => {

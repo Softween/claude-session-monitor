@@ -2,7 +2,7 @@
   "name": "claude-code-session-monitor",
   "displayName": "Agent Session Monitor: Claude + Codex",
   "description": "Monitor Claude Code and Codex sessions together: live state, attention, limits, provider-aware actions, CPU/RAM, and honest usage data.",
-  "version": "2.45.1",
+  "version": "2.46.0",
   "publisher": "softween",
   "license": "MIT",
   "icon": "icon.png",
@@ -492,7 +492,20 @@
         "claudeSessionMonitor.restartGuard": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Keep a small **Claude restart guard** tab open in the first editor group, so VS Code asks (**Please confirm restart of extensions.**) before it restarts extensions, for example to apply an extension update. Restarting extensions stops every Claude Code session in the window, because each session's process runs inside the extension host. Updates still install and take effect at the next window reload; window reloads themselves are not guarded. The tab is shown once when the window starts and your previous tab comes back right away; a tab you close opens again the next time the window is not focused, so nothing moves while you work in it. Off closes the tab and keeps it closed. **Agent Sessions: Open Claude restart guard** opens it again."
+          "markdownDescription": "Keep a small **Claude restart guard** tab open in the first editor group, so VS Code asks (**Please confirm restart of extensions.**) before it restarts extensions, for example to apply an extension update. Restarting extensions stops every Claude Code session in the window, because each session's process runs inside the extension host. Updates still install and take effect at the next window reload; window reloads themselves are not guarded. The tab is shown once when the window starts and your previous tab comes back right away; a tab you close opens again the next time the window is not focused, so nothing moves while you work in it. Off closes the tab and keeps it closed. **Agent Sessions: Open Claude restart guard** opens it again. `#claudeSessionMonitor.restartGuardStyle#` set to `hidden` keeps a debug session running instead of the tab."
+        },
+        "claudeSessionMonitor.restartGuardStyle": {
+          "type": "string",
+          "enum": [
+            "tab",
+            "hidden"
+          ],
+          "enumDescriptions": [
+            "The Claude restart guard tab in the first editor group.",
+            "No tab: a debug session named Claude restart guard that runs nothing. VS Code also asks before it restarts extensions while a debug session runs. Its toolbar, status bar colour and Run and Debug view stay hidden, but the Run and Debug icon shows a 1 badge, the Run and Debug view shows its debugging panes, empty, in place of its start page, the status bar gets VS Code's small debug item once a session has started (debug.showInStatusBar set to never hides it), and F5 does not start a debug run while it runs (Run > Start Debugging in the menu bar still does). When you confirm a restart with Restart Anyway, VS Code reports \"Debug adapter process has terminated unexpectedly (Extension host shut down)\" once, and the guard starts again with the new extension host. Needs a trusted workspace; an untrusted one uses the tab until it is trusted."
+          ],
+          "default": "tab",
+          "markdownDescription": "How `#claudeSessionMonitor.restartGuard#` keeps VS Code asking before it restarts extensions: `tab` keeps the **Claude restart guard** tab open, `hidden` keeps a debug session that runs nothing instead and opens no tab. With `hidden`, a session you stop starts again; when it cannot start, or ends within 5 s of starting 3 times in a row, the tab is used until the next change of either setting or the next window start. An untrusted workspace uses the tab until it is trusted."
         },
         "claudeSessionMonitor.idleRamWarnMb": {
           "type": "number",
@@ -576,7 +589,7 @@
           },
           "uniqueItems": true,
           "default": [],
-          "markdownDescription": "Extension Development Host only; every other window ignores it. There the monitor runs in observer mode: it reads the sessions, usage and accounts the other windows saved and shows both panels, and every feature that acts on the shared state is off. List the ones a live test needs (read when the window starts; each feature's own setting still applies): `remoteBridge` (the remote bridge), `rotation` (`autoRotate`), `autoResume` (`autoResumeAfterReset`), `wake` (`wakeDeadTabs`), `continuity` (`continuityChannel`), `restartGuard` (the restart guard tab), `usagePolls` (this window's own usage polls and what they save: usage snapshots, limits history, reset readings, account registry, token refreshes), `accountWrites` (login capture, account switches through the keychain and `~/.claude.json`, claude-switch runs, forgetting accounts, reset claims, `~/.claude/settings.json`), `sharedFiles` (the debug log, the monitor folders, the token-count cache and the stale status-file cleanup; while it is off the log goes to the **Agent Session Monitor (observer)** Output channel)."
+          "markdownDescription": "Extension Development Host only; every other window ignores it. There the monitor runs in observer mode: it reads the sessions, usage and accounts the other windows saved and shows both panels, and every feature that acts on the shared state is off. List the ones a live test needs (read when the window starts; each feature's own setting still applies): `remoteBridge` (the remote bridge), `rotation` (`autoRotate`), `autoResume` (`autoResumeAfterReset`), `wake` (`wakeDeadTabs`), `continuity` (`continuityChannel`), `restartGuard` (the restart guard, its tab or its debug session), `usagePolls` (this window's own usage polls and what they save: usage snapshots, limits history, reset readings, account registry, token refreshes), `accountWrites` (login capture, account switches through the keychain and `~/.claude.json`, claude-switch runs, forgetting accounts, reset claims, `~/.claude/settings.json`), `sharedFiles` (the debug log, the monitor folders, the token-count cache and the stale status-file cleanup; while it is off the log goes to the **Agent Session Monitor (observer)** Output channel)."
         }
       }
     },
@@ -590,6 +603,12 @@
           }
         ],
         "priority": "default"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "claude-restart-guard",
+        "label": "Claude restart guard"
       }
     ],
     "keybindings": [

@@ -156,10 +156,16 @@ export function fakeVscode({ pkg, rec, missing, workspaceDir }) {
         {
           getConfiguration: configuration(pkg, missing),
           onDidChangeConfiguration: onEvent,
+          onDidGrantWorkspaceTrust: onEvent,
           workspaceFolders: [{ uri: fileUri(workspaceDir), name: path.basename(workspaceDir), index: 0 }],
           isTrusted: true,
         },
         "vscode.workspace",
+        missing,
+      ),
+      debug: track(
+        { registerDebugAdapterDescriptorFactory: () => disposable(), onDidStartDebugSession: onEvent, onDidTerminateDebugSession: onEvent },
+        "vscode.debug",
         missing,
       ),
       extensions: track({ all: [], getExtension: () => undefined, onDidChange: onEvent }, "vscode.extensions", missing),

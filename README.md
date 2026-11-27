@@ -152,6 +152,9 @@ provider-qualified ids and capability flags.
 - Codex communication stays on local stdio with the official Codex app-server.
 - Claude's account-usage request is a read-only request to Anthropic using the
   locally stored Claude credential; the token is never logged.
+- Before a Claude login is saved under an account (multi-account, below), one more
+  read-only request asks Anthropic's profile endpoint which account that login belongs
+  to. Only the account id in the answer is used.
 - **Multi-account**: with `trackAllAccounts` on (default), each login's OAuth tokens
   (access and refresh token) are kept in **VS Code Secret Storage** (your OS keychain — same protection as the
   original) so the panel can keep refreshing the account you logged out of; account

@@ -17,15 +17,21 @@
  * tab that was active in its group is put back as soon as it is resolved, if the
  * guard still covers it. At activation the guard first waits for a 2 s pause in
  * input while the window is focused.
+ *
+ * With claudeSessionMonitor.restartGuardStyle set to `hidden` no tab is kept:
+ * a debug session that runs nothing vetoes the restart instead
+ * (restartGuardSession.ts).
  */
 import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
+import { GuardSession, QUICK_END_MS, QUICK_ENDS_MAX } from "./restartGuardSession";
 
 export const GUARD_VIEW_TYPE = "claudeSessionMonitor.restartGuard";
 export const GUARD_FILE_NAME = "Restart stops Claude sessions.claudeguard";
 export const OPEN_GUARD_COMMAND = "claudeSessionMonitor.openRestartGuard";
 const SETTING = "restartGuard";
+const STYLE_SETTING = "restartGuardStyle";
 const GUARD_FILE_TEXT =
   "Kept open by Agent Session Monitor so VS Code asks before it restarts extensions (claudeSessionMonitor.restartGuard).\n";
 const RESOLVE_TIMEOUT_MS = 10_000;
@@ -115,7 +121,7 @@ export class GuardEditorProvider implements vscode.CustomTextEditorProvider {
 
 /** The guard's state for the health file (health.ts). */
 export interface RestartGuardState {
-  /** The setting is on and a guard editor this extension host resolved is open: a restart asks first. */
+  /** The setting is on and a guard editor this extension host resolved is open, or the guard's debug session runs: a restart asks first. */
   armed(): boolean;
 }
 
@@ -181,37 +187,131 @@ async function ensureGuard(provider: GuardEditorProvider, fileUri: () => vscode.
   deps.log(`restart guard: ${tab ? "restored tab shown once" : "tab opened"}${late}`);
 }
 
-async function closeGuard(log: (msg: string) => void): Promise<void> {
+async function closeGuard(log: (msg: string) => void, why = "off"): Promise<void> {
   const tabs = vscode.window.tabGroups.all.flatMap((g) => g.tabs.filter(isGuardTab));
   if (!tabs.length) return;
   await vscode.window.tabGroups.close(tabs);
-  log(`restart guard: off, closed ${tabs.length} tab(s)`);
+  log(`restart guard: ${why}, closed ${tabs.length} tab(s)`);
+}
+
+type Run = (what: string, job: () => Promise<void>) => void;
+
+/**
+ * Arms the guard in its effective style: `hidden` when restartGuardStyle says
+ * so, the workspace is trusted (starting a debug session in an untrusted one
+ * asks for trust) and the session neither failed to start nor ended quickly 3
+ * times in a row since the last setting change or activation; `tab` otherwise.
+ * A switch arms the new style before it drops the old one, so a restart is not
+ * left unguarded in between. A guard session someone else ends starts again.
+ */
+class GuardStyle {
+  private readonly session: GuardSession;
+  private fallback: string | undefined; // why `hidden` uses the tab until the next setting change or activation
+
+  constructor(
+    subscriptions: vscode.Disposable[],
+    private readonly openTab: () => Promise<void>,
+    private readonly enabled: () => boolean,
+    private readonly run: Run,
+    private readonly log: (msg: string) => void,
+  ) {
+    this.session = new GuardSession(subscriptions, (runaway) => this.ended(runaway));
+  }
+
+  /** True while the guard's debug session runs. */
+  get running(): boolean {
+    return this.session.running;
+  }
+
+  /** The restartGuardStyle setting asks for `hidden`. */
+  wantsHidden(): boolean {
+    return vscode.workspace.getConfiguration("claudeSessionMonitor").get<string>(STYLE_SETTING, "tab") === "hidden";
+  }
+
+  /** The effective style is `hidden`; `logWhy` logs why an untrusted workspace uses the tab. */
+  hidden(logWhy = false): boolean {
+    if (!this.wantsHidden()) return false;
+    if (vscode.workspace.isTrusted) return this.fallback === undefined;
+    if (logWhy) this.log("restart guard: hidden needs a trusted workspace, using the tab until it is trusted");
+    return false;
+  }
+
+  /** A guard setting changed: `hidden` gets a fresh try. */
+  reset(): void {
+    this.fallback = undefined;
+    this.session.resetRunaway();
+  }
+
+  /** Opens the tab (ensureGuard), then stops the session. */
+  async armTab(): Promise<void> {
+    await this.openTab();
+    if (await this.session.stop()) this.log("restart guard: tab in use, stopped the hidden session");
+  }
+
+  /** Starts the session, then closes the guard tabs; a session that does not start leaves the tab in use. */
+  async armHidden(): Promise<void> {
+    if (!this.session.running) {
+      const failure = await this.session.start();
+      if (failure !== undefined) {
+        this.useTab(`hidden session could not start (${failure})`);
+        return this.armTab();
+      }
+      this.log("restart guard: hidden session started");
+    }
+    await closeGuard(this.log, "hidden session running");
+  }
+
+  /** Closes the guard tabs and stops the session. */
+  async off(): Promise<void> {
+    await closeGuard(this.log);
+    if (await this.session.stop()) this.log("restart guard: off, stopped the hidden session");
+  }
+
+  private useTab(why: string): void {
+    this.fallback = why;
+    this.log(`restart guard: ${why}, using the tab`);
+  }
+
+  private ended(runaway: boolean): void {
+    if (!this.enabled() || !this.hidden()) return;
+    if (runaway) {
+      this.useTab(`hidden session ended within ${QUICK_END_MS / 1000} s of starting ${QUICK_ENDS_MAX} times in a row`);
+      this.run("open", () => this.armTab());
+      return;
+    }
+    this.log("restart guard: hidden session ended, starting again");
+    this.run("hidden", () => this.armHidden());
+  }
 }
 
 /**
- * Registers the guard editor and the Open command, and applies the setting now
- * and on every change: on opens the guard, off closes it. A guard tab closed
- * while the setting is on opens again the next time the window is not focused
- * (right away when it is not focused already): nothing moves while you work in
- * the window, and a restart is not left unguarded until the next activation.
- * At activation the guard opens after a pause in input (untilPaused).
+ * Registers the guard editor, the Open command and the guard's debug adapter,
+ * and applies the settings now, on every change and when the workspace is
+ * trusted: on arms the guard in its effective style (GuardStyle), off closes
+ * the tab and stops the session. With the tab, a guard tab closed while the
+ * setting is on opens again the next time the window is not focused (right away
+ * when it is not focused already): nothing moves while you work in the window,
+ * and a restart is not left unguarded until the next activation. At activation
+ * the tab opens after a pause in input (untilPaused); the session starts at once.
  */
 export function activateRestartGuard(ctx: vscode.ExtensionContext, deps: GuardDeps): RestartGuardState {
   const provider = new GuardEditorProvider();
   const fileUri = (): vscode.Uri => vscode.Uri.file(ensureGuardFile(ctx.globalStorageUri.fsPath));
   const enabled = (): boolean => vscode.workspace.getConfiguration("claudeSessionMonitor").get<boolean>(SETTING, false) === true;
   let queue: Promise<void> = Promise.resolve(); // one guard job at a time
-  const run = (what: string, job: () => Promise<void>): void => {
+  const run: Run = (what, job) => {
     queue = queue.then(job).catch((e: unknown) => deps.log(`restart guard: ${what} failed: ${e instanceof Error ? e.message : String(e)}`));
   };
+  const style = new GuardStyle(ctx.subscriptions, () => ensureGuard(provider, fileUri, deps), enabled, run, deps.log);
   const apply = (atActivation = false): void => {
-    const open = (): Promise<void> => ensureGuard(provider, fileUri, deps);
-    if (enabled()) run("open", atActivation ? () => untilPaused(deps).then(open) : open);
-    else run("close", () => closeGuard(deps.log));
+    const open = (): Promise<void> => style.armTab();
+    if (!enabled()) run("close", () => style.off());
+    else if (style.hidden(true)) run("hidden", () => style.armHidden());
+    else run("open", atActivation ? () => untilPaused(deps).then(open) : open);
   };
   let reopenPending = false; // a guard tab was closed while the setting is on
   const reopenIfDue = (): void => {
-    if (!reopenPending || vscode.window.state.focused || !enabled()) return;
+    if (!reopenPending || vscode.window.state.focused || !enabled() || style.hidden()) return;
     reopenPending = false;
     run("open", () => ensureGuard(provider, fileUri, deps));
   };
@@ -221,10 +321,15 @@ export function activateRestartGuard(ctx: vscode.ExtensionContext, deps: GuardDe
       run("open", () => openGuard(findGuardTab(vscode.window.tabGroups.all), fileUri, false)),
     ),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration(`claudeSessionMonitor.${SETTING}`)) apply();
+      if (![SETTING, STYLE_SETTING].some((k) => e.affectsConfiguration(`claudeSessionMonitor.${k}`))) return;
+      style.reset();
+      apply();
+    }),
+    vscode.workspace.onDidGrantWorkspaceTrust(() => {
+      if (enabled() && style.wantsHidden()) apply();
     }),
     vscode.window.tabGroups.onDidChangeTabs((e) => {
-      if (!enabled() || !e.closed.some(isGuardTab)) return;
+      if (!enabled() || style.hidden() || !e.closed.some(isGuardTab)) return;
       reopenPending = true;
       deps.log("restart guard: tab closed, opens again when the window is not focused");
       reopenIfDue();
@@ -232,5 +337,5 @@ export function activateRestartGuard(ctx: vscode.ExtensionContext, deps: GuardDe
     vscode.window.onDidChangeWindowState(reopenIfDue),
   );
   apply(true);
-  return { armed: () => enabled() && provider.live };
+  return { armed: () => enabled() && (provider.live || style.running) };
 }

@@ -73,11 +73,19 @@ vi.mock("vscode", () => {
       },
     },
     workspace: {
+      isTrusted: true,
       getConfiguration: () => ({ get: (key: string, def: unknown) => (env.config.has(key) ? env.config.get(key) : def) }),
       onDidChangeConfiguration: (listener: (e: any) => void) => {
         env.configListeners.push(listener);
         return { dispose() {} };
       },
+      onDidGrantWorkspaceTrust: () => ({ dispose() {} }),
+    },
+    // The hidden style's debug session has its own tests (restartGuardHidden.test.ts).
+    debug: {
+      registerDebugAdapterDescriptorFactory: () => ({ dispose() {} }),
+      onDidStartDebugSession: () => ({ dispose() {} }),
+      onDidTerminateDebugSession: () => ({ dispose() {} }),
     },
   };
 });

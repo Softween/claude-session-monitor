@@ -400,6 +400,12 @@ export interface ResetsEntry {
 export interface UsageFail {
   kind: "rate_limited" | "auth";
   httpStatus?: number;
+  until?: number; // rate_limited: epoch seconds its backoff ends
+}
+
+/** The marker as it stands at nowMs: a rate-limit marker whose backoff has ended counts as none. */
+export function liveUsageFail(f: UsageFail | undefined, nowMs: number): UsageFail | undefined {
+  return f?.kind === "rate_limited" && f.until !== undefined && f.until * 1000 <= nowMs ? undefined : f;
 }
 
 /** A status in the server's wire shape, so a stored file is read back through parseCedarEmber. */
@@ -472,7 +478,8 @@ const failText = (f: UsageFail): string => (f.kind === "rate_limited" ? "usage A
 
 /** The panel's view of one account: rows from its last known reading, and why its latest usage poll failed. */
 export function accountView(e: ResetsEntry | undefined, fail: UsageFail | undefined, nowMs: number): ResetsAccountView {
-  const failNote = fail ? failText(fail) : undefined;
+  const live = liveUsageFail(fail, nowMs);
+  const failNote = live ? failText(live) : undefined;
   if (!e) return { atLimit: false, state: "waiting", ts: null, note: ["waiting for the next usage reading", failNote].filter((n): n is string => !!n).join(" · "), kinds: [] };
   const s = e.status;
   const kinds: ResetsKindView[] = summarize(s, nowMs).map((r) => ({

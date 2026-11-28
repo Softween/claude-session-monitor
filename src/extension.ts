@@ -70,6 +70,7 @@ import {
   cliUserAgent,
   describeClaim,
   fmtUseBy,
+  liveUsageFail,
   parseCedarEmber,
   parseResetsFile,
   pickGrant,
@@ -1904,7 +1905,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // is spent only after a click and a modal confirm. Tokens are never refreshed here
   // and the active login is never written.
   const resetsByAccount = new Map<string, ResetsEntry>();
-  const usageFail = new Map<string, UsageFail>(); // accountId -> how its latest usage poll failed (a good poll clears it)
+  const usageFail = new Map<string, UsageFail>(); // accountId -> how its latest usage poll failed (a good poll clears it; a rate limit also ends with its backoff)
   const resetsLogged = new Map<string, string>(); // accountId -> last logged summary (a debug line only when it changes)
   const resetsRequestIds = new Map<string, string>(); // "<accountId>|<grantId>" -> request_id of a claim that came back unresolved
   let resetsClaiming = false;
@@ -2347,7 +2348,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     const inBackoff = !force && !!snap?.backoffUntil && now < snap.backoffUntil;
     if (inBackoff) {
       usageNote = RATE_LIMITED_NOTE;
-      if (activeId) usageFail.set(activeId, { kind: "rate_limited", httpStatus: 429 });
+      if (activeId) usageFail.set(activeId, { kind: "rate_limited", httpStatus: 429, until: snap?.backoffUntil });
     } else if (usageNote?.startsWith("usage API rate-limited")) {
       usageNote = null;
     }
@@ -2420,7 +2421,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         const b = nextUsageBackoffSec(r.retryAfterSec);
         writeOfficialSnapshot({ ...cur, attemptTs: nowSec, backoffUntil: nowSec + b, backoffSec: b });
         usageNote = RATE_LIMITED_NOTE;
-        if (activeId) usageFail.set(activeId, { kind: "rate_limited", httpStatus: 429 });
+        if (activeId) usageFail.set(activeId, { kind: "rate_limited", httpStatus: 429, until: nowSec + b });
         log(`usage backoff ${b}s`);
       } else if (force) {
         // Manual refresh with no token / network / gauges: say so honestly.
@@ -2552,8 +2553,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
         const freshEnough = !force && !!snap && nowSec - snap.ts < cadence;
         const attempted = !force && !!snap?.attemptTs && nowSec - snap.attemptTs < Math.min(60, cadence);
         const inBackoff = !force && !!snap?.backoffUntil && nowSec < snap.backoffUntil;
-        if (inBackoff && !usageFail.has(a.id)) {
-          usageFail.set(a.id, snap?.tokenStale ? { kind: "auth" } : { kind: "rate_limited", httpStatus: 429 }); // this or another window's poll failed
+        if (inBackoff && !liveUsageFail(usageFail.get(a.id), nowSec * 1000)) {
+          usageFail.set(a.id, snap?.tokenStale ? { kind: "auth" } : { kind: "rate_limited", httpStatus: 429, until: snap?.backoffUntil }); // this or another window's poll failed
           changed = true;
         }
         if (freshEnough || attempted || inBackoff) continue;
@@ -2602,7 +2603,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         } else if (r.status === 429) {
           const b = nextUsageBackoffSec(r.retryAfterSec);
           writeOfficialSnapshot({ ...cur2, attemptTs: now2, backoffUntil: now2 + b, backoffSec: b }, file);
-          usageFail.set(a.id, { kind: "rate_limited", httpStatus: 429 });
+          usageFail.set(a.id, { kind: "rate_limited", httpStatus: 429, until: now2 + b });
           changed = true;
         }
       }

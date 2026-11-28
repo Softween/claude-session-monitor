@@ -423,6 +423,21 @@ describe("accountView", () => {
       .toBe("not eligible (surface) · token rejected (HTTP 403)");
     expect(accountView({ ts: TS, status: status([FULL_TEAM], { at_limit: true }) }, undefined, NOW).atLimit).toBe(true);
   });
+  it("a rate-limit note only while its backoff runs", () => {
+    const running = { kind: "rate_limited" as const, httpStatus: 429, until: NOW / 1000 + 60 };
+    const ended = { kind: "rate_limited" as const, httpStatus: 429, until: NOW / 1000 - 3600 };
+    expect(accountView({ ts: TS, status: TEAM() }, running, NOW).note).toBe("usage API rate-limited");
+    expect(accountView({ ts: TS, status: TEAM() }, ended, NOW).note).toBeUndefined();
+    expect(accountView(undefined, ended, NOW).note).toBe("waiting for the next usage reading");
+    expect(accountView({ ts: TS, status: status([], { eligible: false, ineligible_reason: "surface" }) }, ended, NOW).note).toBe("not eligible (surface)");
+  });
+  it("liveUsageFail drops a rate-limit marker once its backoff ended, keeps the rest", () => {
+    const until = NOW / 1000;
+    expect(liveUsageFail({ kind: "rate_limited", httpStatus: 429, until }, NOW - 1)).toEqual({ kind: "rate_limited", httpStatus: 429, until });
+    expect(liveUsageFail({ kind: "rate_limited", httpStatus: 429, until }, NOW)).toBeUndefined();
+    expect(liveUsageFail({ kind: "auth", httpStatus: 401 }, NOW)).toEqual({ kind: "auth", httpStatus: 401 });
+    expect(liveUsageFail(undefined, NOW)).toBeUndefined();
+  });
   it("resetsTotal counts every account with a known reading; null until one has one", () => {
     expect(resetsTotal([undefined, undefined], NOW)).toBeNull();
     expect(resetsTotal([{ ts: TS, status: MAX() }, undefined, { ts: TS, status: TEAM() }], NOW)).toBe(6);
